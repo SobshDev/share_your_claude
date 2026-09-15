@@ -19,7 +19,8 @@ use subtle::ConstantTimeEq;
 use zeroize::{Zeroize, ZeroizeOnDrop};
 
 pub const CLIENT_ID: &str = "9d1c250a-e61b-44d9-88ed-5944d1962f5e";
-pub const REDIRECT_URI: &str = "http://127.0.0.1:54545/callback";
+// The OAuth client registers localhost; the equivalent loopback IP is not accepted.
+pub const REDIRECT_URI: &str = "http://localhost:54545/callback";
 pub const BETA: &str = "claude-code-20250219,oauth-2025-04-20";
 pub const SYSTEM: &str = "You are a Claude agent, built on Anthropic's Claude Agent SDK.";
 

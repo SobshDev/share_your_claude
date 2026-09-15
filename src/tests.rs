@@ -27,6 +27,7 @@ struct Mock {
     refreshes: AtomicUsize,
     disconnected: AtomicBool,
     captures: Mutex<Vec<(HeaderMap, Value)>>,
+    token_captures: Mutex<Vec<Value>>,
     refresh_error: AtomicBool,
 }
 async fn mock_message(
@@ -127,6 +128,7 @@ async fn mock_token(
     Json(body): Json<Value>,
 ) -> axum::response::Response {
     mock.refreshes.fetch_add(1, Ordering::SeqCst);
+    mock.token_captures.lock().await.push(body.clone());
     if mock.refresh_error.load(Ordering::SeqCst) {
         return (
             StatusCode::BAD_REQUEST,
@@ -766,6 +768,16 @@ async fn oauth_state_is_session_bound_and_consumed_once() {
     let url = url::Url::parse(started["authorize_url"].as_str().unwrap()).unwrap();
     let params: std::collections::HashMap<_, _> = url.query_pairs().collect();
     assert_eq!(params["code_challenge_method"], "S256");
+    assert_eq!(params["redirect_uri"], "http://localhost:54545/callback");
+    let unsupported = json!({"redirect_url":format!(
+        "http://127.0.0.1:54545/callback?code=abc&state={}", params["state"]
+    )});
+    assert_eq!(
+        h.admin("/admin/api/claude/complete", "POST", Some(unsupported))
+            .await
+            .status(),
+        400
+    );
     let wrong = json!({"redirect_url":format!("{}?code=abc&state=wrong",oauth::REDIRECT_URI)});
     assert_eq!(
         h.admin("/admin/api/claude/complete", "POST", Some(wrong))
@@ -782,6 +794,20 @@ async fn oauth_state_is_session_bound_and_consumed_once() {
             .status(),
         200
     );
+    {
+        let captures = h.mock.token_captures.lock().await;
+        assert_eq!(captures.len(), 1);
+        let exchange = &captures[0];
+        assert_eq!(exchange["redirect_uri"], "http://localhost:54545/callback");
+        assert_eq!(exchange["code"], "abc");
+        assert_eq!(exchange["state"], params["state"].as_ref());
+        use base64::Engine;
+        use sha2::Digest;
+        let challenge = base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(
+            sha2::Sha256::digest(exchange["code_verifier"].as_str().unwrap().as_bytes()),
+        );
+        assert_eq!(challenge, params["code_challenge"]);
+    }
     assert_eq!(
         h.admin("/admin/api/claude/complete", "POST", Some(good))
             .await

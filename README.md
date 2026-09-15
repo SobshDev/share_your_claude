@@ -57,7 +57,7 @@ For local Compose use, copy `.env.example` to `.env` and fill in the same direct
 ## First connection and friend setup
 
 1. Sign in with the owner password, open **Claude connection**, and click **Connect Claude**.
-2. Open the generated Claude authorization link in your browser. After authorization, copy the entire `http://127.0.0.1:54545/callback?code=…&state=…` address into the dashboard. The browser may show a connection error at that address; copying it still completes the flow. State is session-bound and expires after ten minutes.
+2. Open the generated Claude authorization link in your browser. After authorization, copy the entire `http://localhost:54545/callback?code=…&state=…` address into the dashboard. The browser may show a connection error at that address; copying it still completes the flow. Keep `localhost` exactly as generated: the OAuth client does not accept `127.0.0.1` as a substitute. State is session-bound and expires after ten minutes.
 3. Refresh the catalog. Review and enable the models you want to share. Discovery alone never enables a new model. Fable 5.1 stays blocked.
 4. Open **Friends & keys**, add a person, and create their key. Copy the key immediately: only its hash is stored, and it cannot be recovered later.
 5. Use **opencodex setup** beside the key to copy its provider configuration. Merge it into the friend’s opencodex configuration. Set `SHARED_CLAUDE_API_KEY` in the environment of the opencodex process, then restart that process. A background service must receive that environment variable too; alternatively put the issued router key in the local provider’s `apiKey` field and protect the configuration file.
@@ -107,7 +107,7 @@ The dashboard API uses session cookies, exact-origin checks, and `X-CSRF-Token` 
 | PUT | `/admin/api/models/{id}` | Review/enable or disable `{"enabled":true}` |
 | POST | `/admin/api/models/{id}/aliases` | Create explicit alias `{"alias":"shared-sonnet"}` |
 | POST | `/admin/api/claude/login` | Start PKCE flow; return authorization URL |
-| POST | `/admin/api/claude/complete` | `{"redirect_url":"http://127.0.0.1:54545/callback?…"}` |
+| POST | `/admin/api/claude/complete` | `{"redirect_url":"http://localhost:54545/callback?…"}` |
 | GET | `/admin/api/usage` | `group_by=person\|key\|model\|day`, optional RFC3339 `from`/`to`, `person_id`, `key_id` |
 | POST | `/admin/api/logout` | Delete current session |
 
