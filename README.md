@@ -108,10 +108,15 @@ The dashboard API uses session cookies, exact-origin checks, and `X-CSRF-Token` 
 | POST | `/admin/api/models/{id}/aliases` | Create explicit alias `{"alias":"shared-sonnet"}` |
 | POST | `/admin/api/claude/login` | Start PKCE flow; return authorization URL |
 | POST | `/admin/api/claude/complete` | `{"redirect_url":"http://localhost:54545/callback?…"}` |
-| GET | `/admin/api/usage` | `group_by=person\|key\|model\|day`, optional RFC3339 `from`/`to`, `person_id`, `key_id` |
+| GET | `/admin/api/usage` | `group_by=person\|key\|model\|day`, optional RFC3339 `from`/`to`, `person_id`, `key_id`, `model` |
+| GET | `/admin/api/analytics` | Totals, person/model/key/day breakdowns, and 50 requests per page; same filters as usage, plus `offset` |
 | POST | `/admin/api/logout` | Delete current session |
 
 Usage ranges are `[from,to)` in UTC; the API defaults to the last 30 days. The dashboard’s Through date is inclusive. Disabling a catalog model immediately blocks it for all keys without deleting historical grants. Explicit aliases cannot replace canonical model IDs.
+
+The usage overview supports all users or an individual user, a model filter, custom UTC dates, and 7/30/90-day shortcuts. It includes daily token/request/error charts, model and user share pies, token-category and outcome pies, a grouped ledger with selection totals, and paginated request history. Click a user in the ledger or share chart, or use **View usage** in Friends & keys, to inspect that person's activity across keys (including revoked keys).
+
+All charts and tables share the applied filters. Model reporting groups by the resolved routing model, falling back to the requested model for unresolved attempts; request history also shows a differing response model. Models routed excludes denied and unresolved requests. Completed percentage includes all message attempts in its denominator; average duration covers completed requests from start to finish, including streaming. Count-token estimates are excluded. Null token totals stay unknown; observed partial counts remain flagged. User/model share percentages describe the selected metric within this router, not subscription capacity or monetary cost.
 
 ## Accounting and failure behavior
 

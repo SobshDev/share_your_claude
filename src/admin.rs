@@ -6,7 +6,7 @@ use crate::{
 use askama::Template;
 use axum::{
     Json, Router,
-    extract::{DefaultBodyLimit, Path, Query, State},
+    extract::{DefaultBodyLimit, Path, State},
     http::{HeaderMap, StatusCode, header},
     middleware,
     response::{Html, IntoResponse, Redirect, Response},
@@ -33,7 +33,8 @@ pub fn routes(state: Arc<AppState>) -> Router<Arc<AppState>> {
         .route("/admin/api/models/{id}/aliases", post(add_alias))
         .route("/admin/api/claude/login", post(oauth::begin))
         .route("/admin/api/claude/complete", post(oauth::complete))
-        .route("/admin/api/usage", get(usage_report))
+        .route("/admin/api/usage", get(crate::analytics::usage_report))
+        .route("/admin/api/analytics", get(crate::analytics::report))
         .route_layer(middleware::from_fn_with_state(state, auth::require_admin));
     Router::new()
         .merge(protected)
@@ -47,6 +48,15 @@ pub fn routes(state: Arc<AppState>) -> Router<Arc<AppState>> {
                 (
                     [(header::CONTENT_TYPE, "text/javascript; charset=utf-8")],
                     include_str!("../static/app.js"),
+                )
+            }),
+        )
+        .route(
+            "/assets/analytics.js",
+            get(|| async {
+                (
+                    [(header::CONTENT_TYPE, "text/javascript; charset=utf-8")],
+                    include_str!("../static/analytics.js"),
                 )
             }),
         )
@@ -451,61 +461,4 @@ async fn add_alias(
         .await?;
     tx.commit().await?;
     Ok(StatusCode::CREATED)
-}
-
-#[derive(Deserialize, Default)]
-pub struct UsageQuery {
-    pub group_by: Option<String>,
-    pub from: Option<String>,
-    pub to: Option<String>,
-    pub person_id: Option<String>,
-    pub key_id: Option<String>,
-}
-fn timestamp(value: Option<&str>, default: chrono::DateTime<chrono::Utc>) -> Result<String> {
-    let date = match value {
-        Some(v) => chrono::DateTime::parse_from_rfc3339(v)
-            .map_err(|_| AppError::bad("Use RFC3339 timestamps for from and to"))?
-            .with_timezone(&chrono::Utc),
-        None => default,
-    };
-    Ok(date.to_rfc3339_opts(chrono::SecondsFormat::Millis, true))
-}
-pub async fn usage_report(
-    State(state): State<Arc<AppState>>,
-    Query(query): Query<UsageQuery>,
-) -> Result<Json<Value>> {
-    let group = query.group_by.as_deref().unwrap_or("person");
-    let (expr, label) = match group {
-        "person" => ("p.id", "p.name"),
-        "key" => ("k.id", "k.label"),
-        "model" => (
-            "COALESCE(u.resolved_model,u.requested_model)",
-            "COALESCE(u.resolved_model,u.requested_model)",
-        ),
-        "day" => ("substr(u.started_at,1,10)", "substr(u.started_at,1,10)"),
-        _ => return Err(AppError::bad("group_by must be person, key, model, or day")),
-    };
-    let now = chrono::Utc::now();
-    let from = timestamp(query.from.as_deref(), now - chrono::Duration::days(30))?;
-    let to = timestamp(query.to.as_deref(), now)?;
-    if from >= to {
-        return Err(AppError::bad("from must precede to"));
-    }
-    // Identifiers come only from the fixed match above. All user filters are bind parameters.
-    let sql = format!(
-        "SELECT {expr} AS id,{label} AS label,COUNT(*) AS requests,SUM(CASE WHEN u.outcome='denied' THEN 1 ELSE 0 END) AS denied_requests,SUM(CASE WHEN u.outcome IN ('upstream_error','interrupted') THEN 1 ELSE 0 END) AS errors,SUM(CASE WHEN u.usage_state IN ('partial','unknown') THEN 1 ELSE 0 END) AS incomplete_requests,SUM(u.input_tokens) AS input_tokens,SUM(u.cache_read_tokens) AS cache_read_tokens,SUM(u.cache_write_tokens) AS cache_write_tokens,SUM(u.output_tokens) AS output_tokens,SUM(CASE WHEN u.raw_usage IS NOT NULL THEN COALESCE(u.input_tokens,0)+COALESCE(u.cache_read_tokens,0)+COALESCE(u.cache_write_tokens,0)+COALESCE(u.output_tokens,0) END) AS observed_total_tokens FROM request_usage u JOIN api_key k ON k.id=u.key_id JOIN person p ON p.id=k.person_id WHERE u.endpoint='/v1/messages' AND u.started_at>=? AND u.started_at<? AND (? IS NULL OR p.id=?) AND (? IS NULL OR k.id=?) GROUP BY {expr} ORDER BY {label}"
-    );
-    let rows = sqlx::query(&sql)
-        .bind(&from)
-        .bind(&to)
-        .bind(&query.person_id)
-        .bind(&query.person_id)
-        .bind(&query.key_id)
-        .bind(&query.key_id)
-        .fetch_all(&state.db)
-        .await?;
-    let data:Vec<Value>=rows.iter().map(|r|json!({"id":r.get::<String,_>("id"),"label":r.get::<String,_>("label"),"requests":r.get::<i64,_>("requests"),"denied_requests":r.get::<i64,_>("denied_requests"),"errors":r.get::<i64,_>("errors"),"incomplete_requests":r.get::<i64,_>("incomplete_requests"),"input_tokens":r.get::<Option<i64>,_>("input_tokens"),"cache_read_tokens":r.get::<Option<i64>,_>("cache_read_tokens"),"cache_write_tokens":r.get::<Option<i64>,_>("cache_write_tokens"),"output_tokens":r.get::<Option<i64>,_>("output_tokens"),"observed_total_tokens":r.get::<Option<i64>,_>("observed_total_tokens")})).collect();
-    Ok(Json(
-        json!({"group_by":group,"from":from,"to":to,"data":data}),
-    ))
 }

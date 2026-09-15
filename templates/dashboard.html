@@ -5,6 +5,7 @@
     <meta name="viewport" content="width=device-width, initial-scale=1" />
     <title>Shared Router</title>
     <link rel="stylesheet" href="/assets/app.css" />
+    <script src="/assets/analytics.js" defer></script>
     <script src="/assets/app.js" defer></script>
   </head>
   <body>
@@ -38,21 +39,39 @@
             <button id="refresh-usage" class="secondary">Refresh usage</button>
           </header>
           <form id="usage-filter" class="filter-bar">
-            <label>From <input type="date" id="date-from" required /></label
-            ><label>Through <input type="date" id="date-to" required /></label>
-            <label
-              >Group by
-              <select id="group-by">
-                <option value="person">Person</option>
-                <option value="key">API key</option>
-                <option value="model">Model</option>
-                <option value="day">Day</option>
-              </select></label
-            >
-            <button type="submit" class="secondary">Apply</button>
+            <label>User<select id="usage-person"><option value="">All users</option></select></label>
+            <label>Model<select id="usage-model"><option value="">All models</option></select></label>
+            <label>From<input type="date" id="date-from" required /></label>
+            <label>Through<input type="date" id="date-to" required /></label>
+            <button type="submit" class="secondary">Apply filters</button>
+            <div class="date-presets" aria-label="Date shortcuts">
+              <button type="button" class="text-button" data-days="7">7 days</button>
+              <button type="button" class="text-button" data-days="30">30 days</button>
+              <button type="button" class="text-button" data-days="90">90 days</button>
+            </div>
           </form>
+          <p id="analytics-status" role="status">Loading usage…</p>
+          <div id="analytics-content" hidden>
+            <div class="report-heading scope-heading"><h2 id="scope-title">All users</h2><p id="scope-period"></p></div>
+            <dl id="usage-summary" class="usage-summary"></dl>
+            <p id="measurement-note" class="helper"></p>
+            <section class="trend-section" aria-labelledby="trend-title">
+              <div class="report-heading">
+                <div><h2 id="trend-title">Usage over time</h2><p>Daily totals · UTC</p></div>
+                <label>Chart metric<select id="chart-metric"><option value="observed_total_tokens">Observed tokens</option><option value="requests">Requests</option><option value="errors">Errors &amp; interruptions</option></select></label>
+              </div>
+              <div id="time-chart" class="time-chart"></div>
+              <details><summary>View daily values</summary><div class="table-wrap"><table><caption class="sr-only">Daily usage in UTC</caption><thead><tr><th scope="col">Day</th><th scope="col">Observed tokens</th><th scope="col">Requests</th><th scope="col">Errors</th><th scope="col">Incomplete</th></tr></thead><tbody id="daily-rows"></tbody></table></div></details>
+            </section>
+            <div class="chart-grid">
+              <section aria-labelledby="model-chart-title"><h2 id="model-chart-title">Model share</h2><p class="helper">Resolved model, or requested model when unresolved.</p><div id="model-chart" class="share-chart"></div></section>
+              <section aria-labelledby="person-chart-title"><h2 id="person-chart-title">User share</h2><p class="helper" id="person-chart-note">Select a user to explore their activity.</p><div id="person-chart" class="share-chart"></div></section>
+              <section aria-labelledby="token-chart-title"><h2 id="token-chart-title">Token breakdown</h2><p class="helper">Share of observed tokens by category.</p><div id="token-chart" class="share-chart"></div></section>
+              <section aria-labelledby="outcome-chart-title"><h2 id="outcome-chart-title">Request outcomes</h2><p class="helper">Includes denied and in-progress requests.</p><div id="outcome-chart" class="share-chart"></div></section>
+            </div>
           <div class="report-heading">
             <h2>Token ledger</h2>
+            <label>Group by<select id="group-by"><option value="person">User</option><option value="key">API key</option><option value="model">Model</option><option value="day">Day</option></select></label>
             <p id="report-caption">Loading your report…</p>
           </div>
           <div class="table-wrap">
@@ -75,8 +94,7 @@
           <div id="usage-empty" class="empty-state" hidden>
             <h3>No requests in this period</h3>
             <p>
-              Connect Claude, review the models, and issue a key to start
-              recording usage.
+              No message requests match these filters. Try a wider date range or choose another user.
             </p>
             <a href="#connection">Set up Claude</a>
           </div>
@@ -89,6 +107,12 @@
               Partial or unknown usage is flagged. These are observed tokens,
               not a percentage of your subscription limit. Dates use UTC.
             </p>
+          </div>
+          <section class="history-section" aria-labelledby="history-title">
+            <div class="report-heading"><h2 id="history-title">Request history</h2><p>Newest first · UTC · 50 per page</p></div>
+            <div class="table-wrap" tabindex="0" aria-label="Request history, scroll for all columns"><table><thead><tr><th scope="col">Started (UTC)</th><th scope="col">User / key</th><th scope="col">Model</th><th scope="col">Outcome / HTTP</th><th scope="col">Duration</th><th scope="col">Input</th><th scope="col">Cache read</th><th scope="col">Cache write</th><th scope="col">Output</th><th scope="col">Observed total</th><th scope="col">Measurement</th></tr></thead><tbody id="request-rows"></tbody></table></div>
+            <div class="history-pagination"><button id="history-prev" class="secondary" disabled>Previous</button><p id="history-caption" role="status"></p><button id="history-next" class="secondary" disabled>Next</button></div>
+          </section>
           </div>
         </section>
         <section id="page-keys" class="page" hidden>

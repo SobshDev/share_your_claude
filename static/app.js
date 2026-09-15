@@ -114,6 +114,7 @@ async function loadAccess() {
   ]);
   renderPeople();
   renderModels();
+  updateUsageFilters();
 }
 function renderPeople() {
   const select = $("key-person"),
@@ -140,6 +141,7 @@ function renderPeople() {
     const section = node("section", undefined, "friend");
     const heading = node("div", undefined, "friend-heading");
     heading.append(node("h3", person.name));
+    heading.append(button("View usage", () => selectUsagePerson(person.id), "text-button"));
     heading.append(
       button(
         "Rename",
@@ -336,69 +338,6 @@ function renderModels() {
       ),
     );
 }
-async function loadUsage() {
-  const from = new Date(`${$("date-from").value}T00:00:00Z`),
-    end = new Date(`${$("date-to").value}T00:00:00Z`);
-  end.setUTCDate(end.getUTCDate() + 1);
-  if (
-    Number.isNaN(from.getTime()) ||
-    Number.isNaN(end.getTime()) ||
-    from >= end
-  )
-    throw new Error("Choose a valid date range.");
-  const params = new URLSearchParams({
-    from: from.toISOString(),
-    to: end.toISOString(),
-    group_by: $("group-by").value,
-  });
-  const report = await api(`usage?${params}`);
-  $("group-heading").textContent = $("group-by").selectedOptions[0].textContent;
-  const rows = $("usage-rows");
-  rows.replaceChildren();
-  let incomplete = 0;
-  for (const entry of report.data) {
-    const row = node("tr");
-    row.append(node("td", entry.label));
-    for (const key of [
-      "input_tokens",
-      "cache_read_tokens",
-      "cache_write_tokens",
-      "output_tokens",
-      "observed_total_tokens",
-      "requests",
-    ])
-      row.append(node("td", number(entry[key])));
-    const status = node("td");
-    status.append(
-      node(
-        "span",
-        entry.incomplete_requests
-          ? `${entry.incomplete_requests} incomplete`
-          : entry.denied_requests === entry.requests
-            ? "Denied"
-            : entry.errors
-              ? "Errors reported"
-              : "Recorded",
-        entry.incomplete_requests || entry.errors ? "status warning" : "status",
-      ),
-    );
-    if (entry.denied_requests || entry.errors)
-      status.append(
-        node(
-          "span",
-          `${entry.denied_requests} denied · ${entry.errors} errors`,
-          "status-detail",
-        ),
-      );
-    row.append(status);
-    rows.append(row);
-    incomplete += entry.incomplete_requests;
-  }
-  $("usage-empty").hidden = report.data.length > 0;
-  $("report-caption").textContent = incomplete
-    ? `${incomplete} requests have partial or unknown usage`
-    : `Updated ${new Date().toLocaleTimeString([], { hour: "2-digit", minute: "2-digit" })}`;
-}
 async function initialize() {
   if ($("login-form")) {
     $("login-form").addEventListener("submit", async (event) => {
@@ -431,6 +370,7 @@ async function initialize() {
       location.assign("/admin/login");
     }, event.currentTarget),
   );
+  initializeAnalytics();
   formAction("usage-filter", loadUsage);
   $("refresh-usage").addEventListener("click", (event) =>
     run(loadUsage, event.currentTarget),
@@ -498,6 +438,7 @@ async function initialize() {
     }
   });
   await connection();
-  await Promise.all([loadAccess(), loadUsage()]);
+  await loadAccess();
+  await loadUsage();
 }
 initialize().catch((error) => notice(error.message, true));
