@@ -1,0 +1,8 @@
+.git
+target
+data
+backups
+secrets
+.env
+*.sqlite*
+node_modules

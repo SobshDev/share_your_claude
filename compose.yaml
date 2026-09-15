@@ -1,0 +1,30 @@
+services:
+  router:
+    build: .
+    image: shared-router:local
+    restart: unless-stopped
+    environment:
+      PUBLIC_ORIGIN: ${PUBLIC_ORIGIN:?Set PUBLIC_ORIGIN to your Dokploy HTTPS domain}
+      ENCRYPTION_KEY_FILE: /run/secrets/encryption_key
+      ADMIN_PASSWORD_HASH_FILE: /run/secrets/admin_password_hash
+      RUST_LOG: shared_router=info
+    secrets:
+      - encryption_key
+      - admin_password_hash
+    volumes:
+      - router_data:/data
+    expose:
+      - '8080'
+    read_only: true
+    tmpfs:
+      - /tmp:size=16m,noexec,nosuid
+    cap_drop: [ALL]
+    security_opt: [no-new-privileges:true]
+    stop_grace_period: 30s
+secrets:
+  encryption_key:
+    file: ${ENCRYPTION_KEY_SOURCE:-../files/encryption_key}
+  admin_password_hash:
+    file: ${ADMIN_PASSWORD_HASH_SOURCE:-../files/admin_password_hash}
+volumes:
+  router_data:

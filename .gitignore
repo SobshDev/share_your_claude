@@ -1,0 +1,7 @@
+/target/
+/data/
+/backups/
+/secrets/
+/.env
+*.sqlite*
+.DS_Store

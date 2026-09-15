@@ -1,0 +1,41 @@
+[package]
+name = "shared-router"
+version = "0.1.0"
+edition = "2024"
+rust-version = "1.88"
+license = "MIT"
+description = "A private Claude gateway with per-key model access and usage accounting"
+
+[dependencies]
+anyhow = "1"
+argon2 = "0.5"
+askama = "0.14"
+axum = { version = "0.8", features = ["macros"] }
+base64 = "0.22"
+bytes = "1"
+chacha20poly1305 = "0.10"
+chrono = { version = "0.4", features = ["serde"] }
+futures-util = "0.3"
+rand = "0.8"
+reqwest = { version = "0.12", default-features = false, features = ["rustls-tls", "json", "stream"] }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+sha2 = "0.10"
+sqlx = { version = "0.8", default-features = false, features = ["runtime-tokio", "sqlite", "migrate", "macros"] }
+subtle = "2"
+tokio = { version = "1", features = ["full"] }
+tokio-stream = "0.1"
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+url = "2"
+uuid = { version = "1", features = ["v4"] }
+zeroize = { version = "1", features = ["derive"] }
+
+[dev-dependencies]
+http-body-util = "0.1"
+tempfile = "3"
+tower = { version = "0.5", features = ["util"] }
+
+[profile.release]
+lto = "thin"
+strip = true

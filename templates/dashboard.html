@@ -1,0 +1,222 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <title>Shared Router</title>
+    <link rel="stylesheet" href="/assets/app.css" />
+    <script src="/assets/app.js" defer></script>
+  </head>
+  <body>
+    <a class="skip-link" href="#main">Skip to content</a>
+    <div class="app-shell">
+      <aside class="sidebar">
+        <a class="wordmark" href="#overview"
+          >Shared Router<span class="mark" aria-hidden="true"></span
+        ></a>
+        <nav aria-label="Dashboard">
+          <a href="#overview" data-page="overview">Usage overview</a
+          ><a href="#keys" data-page="keys">Friends &amp; keys</a
+          ><a href="#connection" data-page="connection">Claude connection</a>
+        </nav>
+        <div class="sidebar-bottom">
+          <p>
+            <span class="status-dot" aria-hidden="true"></span
+            ><span id="connection-label">Checking connection…</span>
+          </p>
+          <button id="signout" class="text-button">Sign out</button>
+        </div>
+      </aside>
+      <main id="main" tabindex="-1">
+        <div id="notice" class="notice" role="status" hidden></div>
+        <section id="page-overview" class="page">
+          <header class="page-header">
+            <div>
+              <h1>Usage overview</h1>
+              <p>See what each person uses, across all of their keys.</p>
+            </div>
+            <button id="refresh-usage" class="secondary">Refresh usage</button>
+          </header>
+          <form id="usage-filter" class="filter-bar">
+            <label>From <input type="date" id="date-from" required /></label
+            ><label>Through <input type="date" id="date-to" required /></label>
+            <label
+              >Group by
+              <select id="group-by">
+                <option value="person">Person</option>
+                <option value="key">API key</option>
+                <option value="model">Model</option>
+                <option value="day">Day</option>
+              </select></label
+            >
+            <button type="submit" class="secondary">Apply</button>
+          </form>
+          <div class="report-heading">
+            <h2>Token ledger</h2>
+            <p id="report-caption">Loading your report…</p>
+          </div>
+          <div class="table-wrap">
+            <table class="usage-table">
+              <thead>
+                <tr>
+                  <th scope="col" id="group-heading">Person</th>
+                  <th scope="col">Input</th>
+                  <th scope="col">Cache read</th>
+                  <th scope="col">Cache write</th>
+                  <th scope="col">Output</th>
+                  <th scope="col">Observed total</th>
+                  <th scope="col">Requests</th>
+                  <th scope="col">Status</th>
+                </tr>
+              </thead>
+              <tbody id="usage-rows"></tbody>
+            </table>
+          </div>
+          <div id="usage-empty" class="empty-state" hidden>
+            <h3>No requests in this period</h3>
+            <p>
+              Connect Claude, review the models, and issue a key to start
+              recording usage.
+            </p>
+            <a href="#connection">Set up Claude</a>
+          </div>
+          <div class="report-notes">
+            <p>
+              Input excludes cache reads and writes. Totals include all four
+              token categories.
+            </p>
+            <p>
+              Partial or unknown usage is flagged. These are observed tokens,
+              not a percentage of your subscription limit. Dates use UTC.
+            </p>
+          </div>
+        </section>
+        <section id="page-keys" class="page" hidden>
+          <header class="page-header">
+            <div>
+              <h1>Friends &amp; keys</h1>
+              <p>
+                One identity per friend. A separate key for each device or
+                workflow.
+              </p>
+            </div>
+          </header>
+          <div class="setup-forms">
+            <form id="person-form">
+              <h2>Add a friend</h2>
+              <label for="person-name">Name</label>
+              <div class="input-action">
+                <input
+                  id="person-name"
+                  required
+                  maxlength="100"
+                  placeholder="e.g. Alex"
+                /><button type="submit">Add friend</button>
+              </div>
+            </form>
+            <form id="key-form">
+              <h2>Issue an API key</h2>
+              <div class="form-row">
+                <label>Friend<select id="key-person" required></select></label
+                ><label
+                  >Key label<input
+                    id="key-label"
+                    required
+                    maxlength="100"
+                    placeholder="e.g. Laptop"
+                /></label>
+              </div>
+              <button id="issue-key" type="submit">Create key</button>
+              <p class="helper">
+                New keys receive every enabled, reviewed model. Fable 5.1 is
+                always excluded.
+              </p>
+            </form>
+          </div>
+          <div class="report-heading">
+            <h2>People with access</h2>
+            <p>Revoking a key keeps its usage history.</p>
+          </div>
+          <div id="people-list"></div>
+          <div id="people-empty" class="empty-state" hidden>
+            <h3>Start with your first friend</h3>
+            <p>
+              Add their name above, then create a key. Their Claude credentials
+              are never needed.
+            </p>
+          </div>
+        </section>
+        <section id="page-connection" class="page" hidden>
+          <header class="page-header">
+            <div>
+              <h1>Claude connection</h1>
+              <p>
+                Your credentials stay on this server. Friends receive router
+                keys only.
+              </p>
+            </div>
+          </header>
+          <div class="connection-panel">
+            <div>
+              <h2 id="connection-title">Checking your connection…</h2>
+              <p id="connection-detail"></p>
+            </div>
+            <button id="connect-claude">Connect Claude</button>
+          </div>
+          <form id="oauth-form" class="oauth-flow" hidden>
+            <h2>Complete your connection</h2>
+            <p>
+              <a id="authorize-link" target="_blank" rel="noreferrer"
+                >Open Claude sign-in</a
+              >
+              and authorize your account. When your browser reaches the
+              localhost callback, copy the entire URL from its address bar—even
+              if the page cannot load.
+            </p>
+            <label for="redirect-url">Full callback URL</label
+            ><input
+              id="redirect-url"
+              type="url"
+              autocomplete="off"
+              required
+              placeholder="http://127.0.0.1:54545/callback?code=…&amp;state=…"
+            /><button type="submit">Finish connection</button>
+            <p class="helper">
+              This link expires in 10 minutes. Start again if it expires.
+            </p>
+          </form>
+          <div class="report-heading model-heading">
+            <div>
+              <h2>Model catalog</h2>
+              <p>
+                Review models before making them available. New discoveries
+                start disabled.
+              </p>
+            </div>
+            <button id="refresh-models" class="secondary">
+              Refresh from Claude
+            </button>
+          </div>
+          <div id="model-list" class="model-list"></div>
+          <p class="helper">
+            Enabling a model includes it on future keys. Edit an existing key’s
+            access to add it there.
+          </p>
+        </section>
+        <footer>
+          Shared Router <span>Private access. Clear accounting.</span>
+        </footer>
+      </main>
+    </div>
+    <dialog id="output-dialog" aria-labelledby="output-title">
+      <div class="dialog-heading">
+        <h2 id="output-title">Your new API key</h2>
+        <button id="close-output" class="secondary">Close</button>
+      </div>
+      <p id="output-description"></p>
+      <pre id="output-content" tabindex="0"></pre>
+      <button id="copy-output">Copy</button>
+      <p id="copy-status" role="status"></p>
+    </dialog>
+  </body>
+</html>

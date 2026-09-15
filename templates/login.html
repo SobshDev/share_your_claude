@@ -1,0 +1,40 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <title>Sign in · Shared Router</title>
+    <link rel="stylesheet" href="/assets/app.css" />
+    <script src="/assets/app.js" defer></script>
+  </head>
+  <body class="login-page">
+    <main class="login-shell">
+      <a class="wordmark" href="/admin"
+        >Shared Router<span class="mark" aria-hidden="true"></span
+      ></a>
+      <h1>Your account.<br />Your access rules.</h1>
+      <p class="lede">
+        Sign in to manage your friends’ keys and see how your Claude usage is
+        shared.
+      </p>
+      <form id="login-form" class="login-form">
+        <label for="password">Owner password</label>
+        <input
+          id="password"
+          name="password"
+          type="password"
+          autocomplete="current-password"
+          required
+          maxlength="1024"
+          autofocus
+        />
+        <button type="submit">Sign in</button>
+        <p id="login-error" class="error" role="alert"></p>
+      </form>
+      <p class="footnote">
+        Friends connect through opencodex with their own API key. This dashboard
+        is for the account owner.
+      </p>
+    </main>
+  </body>
+</html>
