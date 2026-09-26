@@ -203,6 +203,8 @@ cargo test opencodex_adapter_smoke -- --ignored
 
 Production readiness still requires completing browser OAuth and one live allowed-model streaming/tool request on your deployed server. The offline suite proves the router contract, not Anthropic’s current account entitlement or OAuth availability.
 
+See [CONTRIBUTING.md](CONTRIBUTING.md) for the commit convention and the invariants every change must keep.
+
 ## Licenses
 
 Shared Router is MIT licensed. [THIRD_PARTY_NOTICES.md](THIRD_PARTY_NOTICES.md) covers bundled SQLite and adapted opencodex code, and [THIRD_PARTY_NOTICES_CRATES.md](THIRD_PARTY_NOTICES_CRATES.md) lists every Rust crate compiled into the Linux binary with its license text. Include both files when you distribute the binary or a Docker image built from it.
