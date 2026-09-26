@@ -322,25 +322,32 @@ async fn models(State(state): State<Arc<AppState>>) -> Result<Json<Value>> {
     Ok(Json(json!(rows.iter().map(|r|json!({"id":r.get::<String,_>("id"),"display_name":r.get::<String,_>("display_name"),"enabled":r.get::<bool,_>("enabled"),"reviewed_at":r.get::<Option<String>,_>("reviewed_at"),"blocked":policy::blocked(r.get("id"),r.get("model_group"))})).collect::<Vec<_>>())))
 }
 async fn refresh_models(State(state): State<Arc<AppState>>) -> Result<Json<Value>> {
-    let access = oauth::access(&state).await?;
+    let mut access = oauth::access(&state).await?;
+    let mut refreshed = false;
     let mut after: Option<String> = None;
     let mut candidates = Vec::new();
     let mut seen = std::collections::HashSet::new();
     let mut done = false;
     for _ in 0..20 {
-        let mut request = state
-            .client
-            .get(format!("{}/v1/models", state.upstream))
-            .headers(oauth::upstream_headers(&access)?)
-            .query(&[("limit", "100")]);
-        if let Some(ref cursor) = after {
-            request = request.query(&[("after_id", cursor)]);
-        }
-        let response = request.send().await.map_err(|_| AppError::upstream())?;
-        if matches!(response.status().as_u16(), 401 | 403) {
-            oauth::mark_reauth(&state, access.generation).await?;
-            return Err(AppError::reauth());
-        }
+        let response = loop {
+            let response = models_page(&state, &access, after.as_deref()).await?;
+            match response.status() {
+                // Listing models is idempotent, so the page is fetched again with new tokens.
+                StatusCode::UNAUTHORIZED if !refreshed => {
+                    access = oauth::force_refresh(&state, access.generation).await?;
+                    refreshed = true;
+                }
+                StatusCode::UNAUTHORIZED => return reject_credential(&state, &access).await,
+                StatusCode::FORBIDDEN => {
+                    // Most 403s concern permissions, not the owner's token.
+                    if proxy::upstream_error_type(response).await == Some("authentication_error") {
+                        return reject_credential(&state, &access).await;
+                    }
+                    return Err(AppError::forbidden("Claude did not allow listing models"));
+                }
+                _ => break response,
+            }
+        };
         if !response.status().is_success() {
             return Err(AppError::upstream());
         }
@@ -416,6 +423,30 @@ async fn refresh_models(State(state): State<Arc<AppState>>) -> Result<Json<Value
     Ok(Json(
         json!({"discovered":candidates.len(),"message":"Review new models before granting access"}),
     ))
+}
+
+/// Requests one page of the upstream model catalog.
+async fn models_page(
+    state: &AppState,
+    access: &oauth::Access,
+    after: Option<&str>,
+) -> Result<reqwest::Response> {
+    let mut request = state
+        .client
+        .get(format!("{}/v1/models", state.upstream))
+        .headers(oauth::upstream_headers(access)?)
+        .query(&[("limit", "100")]);
+    if let Some(cursor) = after {
+        request = request.query(&[("after_id", cursor)]);
+    }
+    request.send().await.map_err(|_| AppError::upstream())
+}
+
+/// Upstream rejected tokens that were just refreshed, or reported an authentication error:
+/// only a new login can help.
+async fn reject_credential<T>(state: &AppState, access: &oauth::Access) -> Result<T> {
+    oauth::mark_reauth(state, access.generation).await?;
+    Err(AppError::reauth())
 }
 #[derive(Deserialize)]
 #[serde(deny_unknown_fields)]
