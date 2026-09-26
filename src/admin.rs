@@ -93,11 +93,28 @@ async fn dashboard(State(state): State<Arc<AppState>>, headers: HeaderMap) -> Re
     }
     match Dashboard.render() {
         Ok(html) => Html(html).into_response(),
-        Err(_) => AppError::internal().into_response(),
+        Err(_) => page_error(),
     }
 }
-async fn login_page() -> Result<Html<String>> {
-    Ok(Html(LoginPage.render().map_err(|_| AppError::internal())?))
+async fn login_page() -> Response {
+    match LoginPage.render() {
+        Ok(html) => Html(html).into_response(),
+        Err(_) => page_error(),
+    }
+}
+/// A minimal HTML 500 page for browser routes, which should not show a JSON error.
+fn page_error() -> Response {
+    tracing::error!("dashboard template failed to render");
+    (
+        StatusCode::INTERNAL_SERVER_ERROR,
+        Html(
+            "<!doctype html><html lang=\"en\"><head><meta charset=\"utf-8\" />\
+             <title>Shared Router</title></head><body><h1>Something went wrong</h1>\
+             <p>The dashboard could not be displayed. Reload the page, or check the router \
+             logs if this keeps happening.</p></body></html>",
+        ),
+    )
+        .into_response()
 }
 pub async fn ready(State(state): State<Arc<AppState>>) -> Result<&'static str> {
     sqlx::query("SELECT 1").execute(&state.db).await?;
