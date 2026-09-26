@@ -110,7 +110,7 @@ Friend endpoints accept `x-api-key: sr_…` or `Authorization: Bearer sr_…`. C
 | POST | `/v1/messages/count_tokens` | Estimate; excluded from consumed-token reports |
 | GET | `/v1/models` | Permitted reviewed model catalog |
 
-No batch, arbitrary forward-proxy, Files, Managed Agents, or provider-management routes are exposed to friends. Unreviewed request fields, beta headers, server tool types, and fallback/advisor routing are rejected. Custom client tools, images, thinking, and cache controls are supported. Incoming credentials are replaced with the owner’s upstream token. Inference requests are never automatically replayed, including after 429 or network errors.
+No batch, arbitrary forward-proxy, Files, Managed Agents, or provider-management routes are exposed to friends. Unreviewed request fields, beta headers, server tool types, and fallback/advisor routing are rejected. Custom client tools, images, thinking, and cache controls are supported. Incoming credentials are replaced with the owner’s upstream token. Inference requests are never automatically replayed, including after 429s, network errors, or an upstream 401.
 
 At most 8 upstream requests run at once across all keys. The router does not queue: a request beyond that limit is answered immediately with `429 rate_limit_error` ("The router is busy"), and a streaming response holds its slot until the stream ends. See [docs/architecture.md](docs/architecture.md) for the module map and the full request flow.
 
@@ -180,7 +180,7 @@ Prompts, completions, raw error bodies, API keys, and OAuth tokens are not logge
 
 Report suspected vulnerabilities privately as described in [SECURITY.md](SECURITY.md), never in a public issue.
 
-Terminal refresh failures mark the account as needing reconnection. Transient failures return an error without falling back to billed API access. The OAuth compatibility behavior is based on opencodex 2.49.0; live provider requirements can change. Model routing is restricted to the reviewed schema rather than passing new provider features through automatically.
+When Claude rejects the owner's access token with a 401, the router refreshes the token once. A token count is then sent again with the new token. A `/v1/messages` request is not replayed: its client gets a retryable `503 api_error` ("The router renewed its Claude session. Retry the request") and sends it again itself. The account is marked as needing reconnection only when the refresh itself is rejected (400, 401, or 403 from the token endpoint), when a resent token count is still refused with 401, when an upstream 403 has type `authentication_error`, or when the stored credential cannot be decrypted. Any other 403 concerns that one request, such as a model the account cannot use, and is returned as `permission_error` without touching the connection. A transient refresh failure backs off for 30 seconds and keeps using the current token while it is still valid; the router never falls back to billed API access. The OAuth compatibility behavior is based on opencodex 2.49.0; live provider requirements can change. Model routing is restricted to the reviewed schema rather than passing new provider features through automatically.
 
 ## Backup and recovery
 

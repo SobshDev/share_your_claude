@@ -46,10 +46,15 @@ sequenceDiagram
     P->>O: access()
     O->>O: lock, decrypt, refresh if expiring within 5 minutes
     O-->>P: access token, or 503 reconnect Claude
-    P->>Up: one POST, never retried or replayed
-    alt Upstream error status
+    P->>Up: one POST (a /v1/messages request is never replayed)
+    alt Upstream 401
+        Up-->>P: 401
+        P->>O: force_refresh, once
+        O-->>P: new token, or 503 reconnect Claude if the refresh is rejected
+        P-->>C: 503 "retry the request" (only count_tokens is resent with the new token)
+    else Other upstream error status
         Up-->>P: 4xx/5xx
-        P-->>C: sanitized error (401/403 also mark needs_reauth)
+        P-->>C: sanitized error (a 403 authentication_error marks needs_reauth)
     else Streaming (stream: true)
         loop Each SSE event
             Up-->>P: event
@@ -72,10 +77,11 @@ The steps in order:
 3. **Policy.** `policy::validate` enforces the request field allowlists (see the README's accepted request surface). `policy::resolve` maps the requested ID or explicit alias to a reviewed, enabled model granted to this unrevoked key and rejects Fable 5.1. Caller `anthropic-beta` values must all be on the allowlist in `proxy.rs`. Any failure finishes the row as `denied`.
 4. **Rewrite.** `ToolMap::prepare` renames custom tools and matching `tool_use` blocks to stable hashed `custom_` names and prepends the required system block. Server tools keep their names.
 5. **Admission.** A process-wide semaphore allows 8 concurrent upstream requests across all keys. The router does not queue: request 9 gets an immediate `429 rate_limit_error` ("The router is busy"). A streaming response holds its permit until the stream ends.
-6. **Credential.** `oauth::access` holds the OAuth mutex, decrypts the stored tokens, and refreshes them when they expire within 5 minutes. A generation counter guards the write. A refresh rejected with 400, 401, or 403 marks the credential `needs_reauth`, and requests get `503` until the owner reconnects.
-7. **Upstream call.** The router sends one POST with the owner's token and fixed client headers. Incoming credentials are never forwarded. The HTTP client has retries and redirects disabled, and no code path replays a `/v1/messages` request, including after 429s or network errors.
-8. **Response.** Error statuses return a fixed message with the upstream status (redirects become 502), and `retry-after` is passed through. Upstream 401 or 403 marks the credential `needs_reauth`. Successful responses are checked against the resolved model; a mismatch becomes 502.
-9. **Accounting.** Streaming usage is checkpointed before each usage-bearing event is forwarded. Cumulative counters replace earlier values. The row is finished once as `completed`, `upstream_error`, or `interrupted`. Only the four allowlisted numeric token fields are stored.
+6. **Credential.** `oauth::access` decrypts the stored tokens. A token that expires more than 5 minutes from now is used without locking; otherwise one caller at a time refreshes it under the refresh lock, and a generation counter guards the write. A refresh rejected with 400, 401, or 403 marks the credential `needs_reauth`, and requests get `503` until the owner reconnects. A transient refresh failure starts a 30-second backoff, during which the current token is used while it is still valid. A credential that cannot be decrypted is also marked `needs_reauth`.
+7. **Upstream call.** The router sends one POST with the owner's token and fixed client headers. Incoming credentials are never forwarded. The HTTP client has retries and redirects disabled, and no code path replays a `/v1/messages` request, including after 429s, network errors, or a 401.
+8. **Upstream 401.** `oauth::force_refresh` refreshes the token once; if another request has already replaced that token generation, it reuses the newer token instead. A token count is sent again with the new token. A `/v1/messages` request is finished as `upstream_error` and its client gets a retryable `503 api_error` ("The router renewed its Claude session. Retry the request"). Only a rejected refresh, or a second 401 for the resent token count, marks the credential `needs_reauth`.
+9. **Response.** Other error statuses return a fixed message with the upstream status and its matching Anthropic error type (redirects become 502), and `retry-after` is passed through. A 403 marks the credential `needs_reauth` only when its `error.type` is `authentication_error`; the body is read up to 64 KiB and never logged or returned. Successful responses are checked against the resolved model; a mismatch becomes 502.
+10. **Accounting.** Streaming usage is checkpointed before each usage-bearing event is forwarded. Cumulative counters replace earlier values. The row is finished once as `completed`, `upstream_error`, or `interrupted`. Only the four allowlisted numeric token fields are stored.
 
 `/v1/messages/count_tokens` follows the same path with `counting` set: `max_tokens` is optional, streaming is refused, and usage is recorded as `not_applicable`, which keeps it out of consumed-token reports. `/v1/models` authenticates the key and lists its granted, reviewed, enabled models, filtering out Fable 5.1.
 

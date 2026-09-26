@@ -118,7 +118,17 @@ Each dashboard session is bound to the `ADMIN_PASSWORD_HASH` it was issued under
 
 Router logs never contain prompts, tokens, or SQL values. Read them with `docker logs "$router_container"` (or `docker compose logs router`).
 
-**Claude needs reconnection (`needs_reauth`).** Friends get 503 with "The owner must reconnect Claude in the dashboard". The router sets this state when a token refresh is rejected with 400, 401, or 403, and when Claude answers a proxied request with 401 or 403. It never falls back to other billing. Sign in, open **Claude connection**, and click **Connect Claude**. Restoring an older backup can cause this too, because its refresh token may already have been used.
+**Claude needs reconnection (`needs_reauth`).** Friends get 503 `authentication_error` with "The owner must reconnect Claude in the dashboard". A single upstream 401 does not cause this: the router first refreshes the token once. It sets the state when:
+
+- the refresh itself is rejected with 400, 401, or 403, usually because the refresh token was revoked or already used;
+- a token count sent again with a just-refreshed token is still refused with 401;
+- Claude answers a proxied request with 403 of type `authentication_error` (other 403s affect only that request);
+- the stored credential cannot be decrypted, usually because `ENCRYPTION_KEY` changed;
+- the model catalog refresh (**Refresh from Claude** in the dashboard) gets any 401 or 403 from Claude.
+
+It never falls back to other billing. Sign in, open **Claude connection**, and click **Connect Claude**. Restoring an older backup can cause this too, because its refresh token may already have been used.
+
+**Friends get 503 "The router renewed its Claude session. Retry the request".** Claude rejected the access token, and the router refreshed it. The router never sends a `/v1/messages` request twice, so the client must retry; the next attempt uses the new token. If this repeats for every request, check the logs for refresh failures.
 
 **Every friend request fails with 500 while the dashboard shows connected.** The stored tokens cannot be decrypted, almost always because `ENCRYPTION_KEY` changed. Restore the original key and redeploy, or connect Claude again to re-encrypt with the current key.
 
