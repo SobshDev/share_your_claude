@@ -240,6 +240,52 @@ pub async fn access(state: &AppState) -> Result<Access> {
     })
 }
 
+/// Refreshes the owner's tokens after upstream rejected the access token of `generation`.
+/// When another request already replaced that generation, returns the newer tokens without
+/// refreshing again. The credential is marked for reconnection only when the refresh itself
+/// is rejected.
+pub async fn force_refresh(state: &AppState, generation: i64) -> Result<Access> {
+    let _guard = state.oauth.lock().await;
+    let row = sqlx::query("SELECT * FROM claude_credential WHERE id=1")
+        .fetch_optional(&state.db)
+        .await?
+        .ok_or_else(AppError::reauth)?;
+    if row.get::<String, _>("state") != "connected" {
+        return Err(AppError::reauth());
+    }
+    let current: i64 = row.get("generation");
+    let tokens = decrypt(
+        &state.config.encryption_key,
+        &row.get::<Vec<u8>, _>("encrypted_tokens"),
+    )?;
+    if current != generation {
+        return Ok(Access {
+            tokens,
+            generation: current,
+        });
+    }
+    let result = exchange(state, json!({"grant_type":"refresh_token","client_id":CLIENT_ID,"refresh_token":tokens.refresh_token}), Some(&tokens.refresh_token)).await;
+    let (tokens, expires) = match result {
+        Ok(value) => value,
+        Err(error) => {
+            if error.0 == axum::http::StatusCode::SERVICE_UNAVAILABLE {
+                mark_reauth(state, generation).await?;
+            }
+            return Err(error);
+        }
+    };
+    let encrypted = encrypt(&state.config.encryption_key, &tokens)?;
+    let changed = sqlx::query("UPDATE claude_credential SET encrypted_tokens=?,expires_at=?,generation=generation+1 WHERE id=1 AND generation=?")
+        .bind(encrypted).bind(expires).bind(generation).execute(&state.db).await?.rows_affected();
+    if changed != 1 {
+        return Err(AppError::reauth());
+    }
+    Ok(Access {
+        tokens,
+        generation: generation + 1,
+    })
+}
+
 pub async fn mark_reauth(state: &AppState, generation: i64) -> Result<()> {
     sqlx::query("UPDATE claude_credential SET state='needs_reauth' WHERE id=1 AND generation=?")
         .bind(generation)

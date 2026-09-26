@@ -556,3 +556,88 @@ async fn a_client_that_stops_reading_is_interrupted_not_an_upstream_error() {
     assert_eq!(row, ("interrupted".into(), "partial".into()));
     drop(response);
 }
+
+async fn credential(h: &Harness) -> (String, i64) {
+    sqlx::query_as("SELECT state,generation FROM claude_credential")
+        .fetch_one(&h.state.db)
+        .await
+        .unwrap()
+}
+
+#[tokio::test]
+async fn an_upstream_401_refreshes_once_and_never_replays_messages() {
+    let h = Harness::new().await;
+    let response = h
+        .request("/v1/messages", &h.key, message("expired-token", false))
+        .await;
+    assert_eq!(response.status(), 503);
+    let body = json_body(response).await;
+    assert_eq!(body["error"]["type"], "api_error");
+    assert!(!body.to_string().contains("owner-secret"));
+    // The message was sent once; the refresh left the credential connected.
+    assert_eq!(h.mock.requests.load(Ordering::SeqCst), 1);
+    assert_eq!(h.mock.refreshes.load(Ordering::SeqCst), 1);
+    assert_eq!(credential(&h).await, ("connected".into(), 2));
+    let response = h
+        .request("/v1/messages", &h.key, message("expired-token", false))
+        .await;
+    assert_eq!(response.status(), 200);
+    assert_eq!(h.mock.requests.load(Ordering::SeqCst), 2);
+    assert_eq!(h.mock.refreshes.load(Ordering::SeqCst), 1);
+}
+
+#[tokio::test]
+async fn an_upstream_401_on_count_tokens_is_retried_after_refresh() {
+    let h = Harness::new().await;
+    let mut body = count_body();
+    body["messages"][0]["content"] = "expired-token".into();
+    let response = h.request("/v1/messages/count_tokens", &h.key, body).await;
+    assert_eq!(response.status(), 200);
+    assert_eq!(json_body(response).await["input_tokens"], 123);
+    assert_eq!(h.mock.refreshes.load(Ordering::SeqCst), 1);
+    assert_eq!(credential(&h).await, ("connected".into(), 2));
+}
+
+#[tokio::test]
+async fn a_rejected_refresh_after_a_401_requires_reconnect() {
+    let h = Harness::new().await;
+    h.mock.refresh_error.store(true, Ordering::SeqCst);
+    let response = h
+        .request("/v1/messages", &h.key, message("expired-token", false))
+        .await;
+    assert_eq!(response.status(), 503);
+    let body = json_body(response).await;
+    assert_eq!(body["error"]["type"], "authentication_error");
+    assert!(!body.to_string().contains("owner-secret"));
+    assert!(!body.to_string().contains("must not leak"));
+    assert_eq!(credential(&h).await, ("needs_reauth".into(), 1));
+    assert_eq!(h.mock.requests.load(Ordering::SeqCst), 1);
+}
+
+#[tokio::test]
+async fn upstream_403s_disconnect_only_for_authentication_errors() {
+    let h = Harness::new().await;
+    let response = h
+        .request("/v1/messages", &h.key, message("status-403", false))
+        .await;
+    assert_eq!(response.status(), 403);
+    let body = json_body(response).await;
+    assert_eq!(body["error"]["type"], "permission_error");
+    assert!(!body.to_string().contains("secret upstream text"));
+    assert_eq!(credential(&h).await, ("connected".into(), 1));
+    let response = h
+        .request("/v1/messages", &h.key, message("hello", false))
+        .await;
+    assert_eq!(response.status(), 200);
+    assert_eq!(h.mock.requests.load(Ordering::SeqCst), 2);
+
+    let response = h
+        .request("/v1/messages", &h.key, message("forbidden-auth", false))
+        .await;
+    assert_eq!(response.status(), 503);
+    let body = json_body(response).await;
+    assert_eq!(body["error"]["type"], "authentication_error");
+    assert!(!body.to_string().contains("owner-secret"));
+    assert_eq!(credential(&h).await, ("needs_reauth".into(), 1));
+    assert_eq!(h.mock.refreshes.load(Ordering::SeqCst), 0);
+}

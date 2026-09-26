@@ -2,6 +2,8 @@
 //! and the OAuth token endpoint.
 //!
 //! The text of the first user message selects a scenario: `error` (429), `unauthorized` (401),
+//! `expired-token` (401 until the router sends a refreshed token, also for `count_tokens`),
+//! `forbidden-auth` (403 `authentication_error`),
 //! `redirect` (307), `status-NNN` (that status with an Anthropic error envelope),
 //! `disconnect` (stream that waits for the client to hang up), `no-final-usage`,
 //! `stream-error` (an `overloaded_error` event), `truncated`, `missing` (no usage), and
@@ -32,7 +34,7 @@ pub(super) async fn spawn_upstream()
         .route("/v1/messages", post(mock_message))
         .route(
             "/v1/messages/count_tokens",
-            post(|| async { Json(json!({"input_tokens":123})) }),
+            post(mock_count_tokens),
         )
         .route("/v1/oauth/token", post(mock_token))
         .route(
@@ -54,11 +56,17 @@ async fn mock_message(
     Json(body): Json<Value>,
 ) -> Response {
     mock.requests.fetch_add(1, Ordering::SeqCst);
-    mock.captures.lock().await.push((headers, body.clone()));
+    mock.captures
+        .lock()
+        .await
+        .push((headers.clone(), body.clone()));
     let content = body
         .pointer("/messages/0/content")
         .and_then(Value::as_str)
         .unwrap_or("hello");
+    if let Some(rejected) = token_rejection(&headers, content) {
+        return rejected;
+    }
     if content == "error" {
         return (
             StatusCode::TOO_MANY_REQUESTS,
@@ -71,6 +79,15 @@ async fn mock_message(
         return (
             StatusCode::UNAUTHORIZED,
             Json(json!({"error":{"message":"owner-secret"}})),
+        )
+            .into_response();
+    }
+    if content == "forbidden-auth" {
+        return (
+            StatusCode::FORBIDDEN,
+            Json(
+                json!({"type":"error","error":{"type":"authentication_error","message":"owner-secret"}}),
+            ),
         )
             .into_response();
     }
@@ -155,6 +172,32 @@ async fn mock_message(
             json!([{"type":"tool_use","id":"tool_1","name":name,"input":{"name":"do not alter"}}]);
     }
     Json(response).into_response()
+}
+
+/// The `expired-token` scenario: 401 until the router sends the token from a refresh.
+fn token_rejection(headers: &HeaderMap, content: &str) -> Option<Response> {
+    (content == "expired-token" && headers["authorization"] != "Bearer refreshed-access").then(
+        || {
+            (
+                StatusCode::UNAUTHORIZED,
+                Json(
+                    json!({"type":"error","error":{"type":"authentication_error","message":"owner-secret"}}),
+                ),
+            )
+                .into_response()
+        },
+    )
+}
+
+async fn mock_count_tokens(headers: HeaderMap, Json(body): Json<Value>) -> Response {
+    let content = body
+        .pointer("/messages/0/content")
+        .and_then(Value::as_str)
+        .unwrap_or("hello");
+    if let Some(rejected) = token_rejection(&headers, content) {
+        return rejected;
+    }
+    Json(json!({"input_tokens":123})).into_response()
 }
 
 async fn mock_token(State(mock): State<Arc<Mock>>, Json(body): Json<Value>) -> Response {

@@ -25,6 +25,8 @@ use tokio_stream::wrappers::ReceiverStream;
 pub const MAX_REQUEST_BODY_BYTES: usize = 32 * 1024 * 1024;
 /// Largest non-streaming upstream reply the router buffers.
 const MAX_RESPONSE_BODY_BYTES: usize = 32 * 1024 * 1024;
+/// Largest upstream error body read to learn its error type.
+const MAX_ERROR_BODY_BYTES: usize = 64 * 1024;
 /// Largest server-sent event buffered from upstream before the stream counts as malformed.
 pub const MAX_SSE_EVENT_BYTES: usize = 4 * 1024 * 1024;
 /// Longest model identifier the router accepts and records.
@@ -209,16 +211,24 @@ async fn forward(
             return Ok(response);
         }
     };
-    let access = match oauth::access(&state).await {
+    let mut access = match oauth::access(&state).await {
         Ok(v) => v,
         Err(e) => return fail(&mut guard, "upstream_error", e.0.as_u16(), true, e).await,
     };
     let streaming = !counting && admitted.body.get("stream") == Some(&Value::Bool(true));
-    let response = match send_upstream(&state, endpoint, &access, &admitted, streaming).await {
+    let mut response = match send_upstream(&state, endpoint, &access, &admitted, streaming).await {
         Ok(r) => r,
         Err(e) => return fail(&mut guard, "upstream_error", e.0.as_u16(), false, e).await,
     };
     record_upstream(&state, &id, &response).await?;
+    if response.status() == StatusCode::UNAUTHORIZED {
+        (response, access) =
+            match retry_unauthorized(&state, endpoint, &access, &admitted, counting).await {
+                Ok(v) => v,
+                Err(e) => return fail(&mut guard, "upstream_error", e.0.as_u16(), true, e).await,
+            };
+        record_upstream(&state, &id, &response).await?;
+    }
     if !response.status().is_success() {
         return handle_error_status(&state, &access, response, &mut guard).await;
     }
@@ -370,6 +380,36 @@ async fn record_upstream(state: &AppState, id: &str, response: &reqwest::Respons
     Ok(())
 }
 
+/// Handles an upstream 401 by refreshing the owner's token once. Token counts are idempotent
+/// and are retried with the new token. Messages are never replayed, so their client gets a
+/// retryable 503 and sends the request again itself.
+async fn retry_unauthorized(
+    state: &AppState,
+    endpoint: &str,
+    access: &oauth::Access,
+    admitted: &Admitted,
+    counting: bool,
+) -> Result<(reqwest::Response, oauth::Access)> {
+    let fresh = oauth::force_refresh(state, access.generation).await?;
+    if !counting {
+        return Err(AppError(
+            StatusCode::SERVICE_UNAVAILABLE,
+            "api_error",
+            "The router renewed its Claude session. Retry the request",
+        ));
+    }
+    let response = send_upstream(state, endpoint, &fresh, admitted, false).await?;
+    Ok((response, fresh))
+}
+
+/// Returns the `error.type` of an upstream error body, read up to a small bound. The body's
+/// text is never logged or returned.
+async fn upstream_error_type(response: reqwest::Response) -> Option<&'static str> {
+    let body = limited_body(response, MAX_ERROR_BODY_BYTES).await.ok()?;
+    let value: Value = serde_json::from_slice(&body).ok()?;
+    error::known_error_type(value.pointer("/error/type")?.as_str()?)
+}
+
 async fn handle_error_status(
     state: &AppState,
     access: &oauth::Access,
@@ -377,8 +417,27 @@ async fn handle_error_status(
     guard: &mut RequestGuard,
 ) -> Result<Response> {
     let status = response.status();
-    if matches!(status.as_u16(), 401 | 403) {
+    let retry_after = response.headers().get(header::RETRY_AFTER).cloned();
+    let credential_rejected = match status {
+        // Still rejected with a token refreshed moments ago: only a new login can help, and
+        // marking it stops every later request from refreshing again.
+        StatusCode::UNAUTHORIZED => true,
+        // Most 403s concern one request, such as a model the account cannot use.
+        StatusCode::FORBIDDEN => {
+            upstream_error_type(response).await == Some("authentication_error")
+        }
+        _ => false,
+    };
+    if credential_rejected {
         oauth::mark_reauth(state, access.generation).await?;
+        return fail(
+            guard,
+            "upstream_error",
+            status.as_u16(),
+            true,
+            AppError::reauth(),
+        )
+        .await;
     }
     guard
         .finish("upstream_error", Some(status.as_u16()), true)
@@ -394,8 +453,8 @@ async fn handle_error_status(
         "Claude rejected the request. Check the model, connection, or retry later",
     )
     .into_response();
-    if let Some(retry) = response.headers().get("retry-after") {
-        result.headers_mut().insert("retry-after", retry.clone());
+    if let Some(retry) = retry_after {
+        result.headers_mut().insert(header::RETRY_AFTER, retry);
     }
     Ok(result)
 }
