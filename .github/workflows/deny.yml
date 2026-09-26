@@ -1,0 +1,23 @@
+name: Dependency audit
+on:
+  push:
+    branches: [main]
+  pull_request:
+  schedule:
+    # Weekly, so new advisories surface even when no code changes.
+    - cron: "17 6 * * 1"
+  workflow_dispatch:
+permissions:
+  contents: read
+concurrency:
+  group: deny-${{ github.ref }}
+  cancel-in-progress: true
+jobs:
+  cargo-deny:
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+      - uses: EmbarkStudios/cargo-deny-action@v2 # TODO pin SHA (Dependabot)
+        with:
+          command: check advisories licenses bans sources
