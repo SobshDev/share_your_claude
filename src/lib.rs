@@ -48,10 +48,10 @@ pub struct AppState {
 impl AppState {
     pub fn new(config: config::Config, db: sqlx::SqlitePool) -> anyhow::Result<Arc<Self>> {
         Ok(Arc::new(Self {
+            oauth: Mutex::new(oauth::OAuthState::new(config.trusted_proxy_hops)),
             config,
             db,
             client: config::http_client()?,
-            oauth: Mutex::new(oauth::OAuthState::default()),
             admission: Arc::new(Semaphore::new(GLOBAL_CONCURRENCY)),
             count_admission: Arc::new(Semaphore::new(COUNT_TOKENS_CONCURRENCY)),
             key_admission: std::sync::Mutex::new(HashMap::new()),

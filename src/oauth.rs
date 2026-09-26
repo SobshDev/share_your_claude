@@ -42,12 +42,13 @@ pub struct OAuthState {
     /// Admin sign-in throttling (kept here so it shares `AppState`'s existing lock).
     pub(crate) login: auth::LoginLimiter,
 }
-impl Default for OAuthState {
-    fn default() -> Self {
+impl OAuthState {
+    /// `trusted_proxy_hops` configures the admin login limiter; see [`auth::LoginLimiter`].
+    pub fn new(trusted_proxy_hops: usize) -> Self {
         Self {
             pending: None,
             refresh: Arc::default(),
-            login: auth::LoginLimiter::from_env(),
+            login: auth::LoginLimiter::new(trusted_proxy_hops),
         }
     }
 }

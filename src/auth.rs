@@ -227,12 +227,6 @@ impl Window {
     }
 }
 
-impl Default for LoginLimiter {
-    fn default() -> Self {
-        Self::new(0)
-    }
-}
-
 impl LoginLimiter {
     pub const WINDOW_SECS: i64 = 60;
     pub const CLIENT_FAILURES: u32 = 5;
@@ -245,19 +239,6 @@ impl LoginLimiter {
             clients: HashMap::new(),
             global: Window::default(),
         }
-    }
-
-    /// Reads `TRUSTED_PROXY_HOPS` (default 0). An invalid value is ignored with a warning,
-    /// which falls back to the socket peer address.
-    pub fn from_env() -> Self {
-        let hops = match std::env::var("TRUSTED_PROXY_HOPS") {
-            Err(_) => 0,
-            Ok(value) => value.trim().parse::<usize>().unwrap_or_else(|_| {
-                tracing::warn!("TRUSTED_PROXY_HOPS must be a non-negative integer; using 0");
-                0
-            }),
-        };
-        Self::new(hops)
     }
 
     /// The rate-limit key for a request.

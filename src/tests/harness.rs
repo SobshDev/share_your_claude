@@ -46,6 +46,7 @@ impl Harness {
             password_hash: password_hash(),
             encryption_key: zeroize::Zeroizing::new([7; 32]),
             secure_cookie: false,
+            trusted_proxy_hops: 0,
         };
         let mut state = AppState::new(config, pool).unwrap();
         {
@@ -275,6 +276,7 @@ impl Harness {
             password_hash: current.password_hash.clone(),
             encryption_key: zeroize::Zeroizing::new(*current.encryption_key),
             secure_cookie: current.secure_cookie,
+            trusted_proxy_hops: current.trusted_proxy_hops,
         };
         let mut state = AppState::new(config, self.state.db.clone()).unwrap();
         {
