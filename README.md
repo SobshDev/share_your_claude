@@ -52,7 +52,9 @@ The router runs as UID 10001 with a read-only root filesystem and a persistent `
 
 For local Compose use, copy `.env.example` to `.env` and fill in the same direct values. Preserve single quotes around the password hash in `.env`; when exporting it in a shell, quote it there as well.
 
-`GET /healthz` checks the process; `GET /readyz` checks SQLite. Readiness does not require an active Claude login, so initial setup can be completed through the dashboard.
+`GET /healthz` checks the process; `GET /readyz` checks SQLite. Readiness does not require an active Claude login, so initial setup can be completed through the dashboard. The image's health check runs `shared-router healthcheck`, which requests `/readyz` on the configured port and exits nonzero when the router is not ready.
+
+On SIGTERM the router reports `/readyz` as 503, lets open requests finish for up to 20 seconds, records any still open as `interrupted`, and then spends up to 5 seconds closing the database. `compose.yaml` sets `stop_grace_period: 30s` to cover this; keep it at 30 seconds or more so Docker does not kill the process first.
 
 ### Releases and upgrades
 

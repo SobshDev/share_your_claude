@@ -17,7 +17,7 @@ echo "$router_volume"
 
 Each command must print exactly one name. If several Compose projects define a service called `router`, add `--filter label=com.docker.compose.project=<project>` to the first command. `docker compose ls` and `docker volume ls | grep router_data` list the candidates.
 
-The runtime image contains only the router binary, `ca-certificates`, and `curl`. It has no shell tools for SQLite, so offline database work below uses a short-lived `debian:bookworm-slim` container with the volume mounted. The router runs as UID 10001, and every file it opens must belong to that user.
+The runtime image contains only the router binary and `ca-certificates`. It has no `curl` and no SQLite shell, so readiness checks below use the binary's `healthcheck` command, and offline database work uses a short-lived `debian:bookworm-slim` container with the volume mounted. The router runs as UID 10001, and every file it opens must belong to that user.
 
 ## Back up
 
@@ -54,7 +54,7 @@ From a Compose directory that uses the same project name, `bash scripts/backup.s
 
    ```bash
    docker start "$router_container"
-   docker exec "$router_container" curl -fsS http://127.0.0.1:8080/readyz
+   docker exec "$router_container" shared-router healthcheck && echo ready
    ```
 
    The last command prints `ready`. Sign in to the dashboard and check that **Friends & keys** shows the people and keys from the backup.
