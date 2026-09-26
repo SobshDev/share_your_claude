@@ -98,7 +98,7 @@ pub fn validate(body: &Value, counting: bool) -> Result<()> {
         .get("model")
         .and_then(Value::as_str)
         .ok_or_else(|| AppError::bad("model is required"))?;
-    if model.is_empty() || model.len() > 200 {
+    if model.is_empty() || model.len() > crate::proxy::MAX_MODEL_ID_BYTES {
         return Err(AppError::bad("Invalid model identifier"));
     }
     if !object.get("messages").is_some_and(Value::is_array) {
