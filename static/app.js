@@ -254,6 +254,23 @@ function renderPeople() {
               label.append(input, node("span", model.display_name));
               options.append(label);
             }
+            // Grants for disabled models are kept by the server and return
+            // when the model is enabled again; show them without submitting.
+            for (const model of models.filter(
+              (m) => !m.enabled && !m.blocked && key.models.includes(m.id),
+            )) {
+              const label = node("label", undefined, "check-label"),
+                input = node("input");
+              input.type = "checkbox";
+              input.value = model.id;
+              input.checked = true;
+              input.disabled = true;
+              label.append(
+                input,
+                node("span", `${model.display_name} (disabled in catalog)`),
+              );
+              options.append(label);
+            }
             if (!options.children.length)
               options.append(
                 node(
@@ -274,7 +291,7 @@ function renderPeople() {
               run(async () => {
                 await api(`keys/${key.id}/models`, "PUT", {
                   models: Array.from(
-                    options.querySelectorAll("input:checked"),
+                    options.querySelectorAll("input:checked:enabled"),
                     (input) => input.value,
                   ),
                 });
@@ -371,7 +388,7 @@ function renderModels() {
             notice(
               model.enabled
                 ? "Model disabled for all keys."
-                : "Model enabled. Add it to existing keys through Edit access.",
+                : "Model enabled. Keys that had access before it was disabled can use it again; add it to other keys through Edit access.",
             );
           },
         ),
