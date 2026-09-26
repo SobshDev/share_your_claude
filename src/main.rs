@@ -157,6 +157,8 @@ async fn serve() -> anyhow::Result<()> {
     let app = shared_router::app(state)
         .layer(middleware::from_fn_with_state(draining.clone(), readiness));
     let (stopping, mut stop_requested) = tokio::sync::watch::channel(false);
+    // Connect info lets the login limiter tell direct clients apart by peer address.
+    let app = app.into_make_service_with_connect_info::<std::net::SocketAddr>();
     let server = axum::serve(listener, app).with_graceful_shutdown(async move {
         shutdown().await;
         draining.store(true, Ordering::SeqCst);
