@@ -1,8 +1,17 @@
+# Must stay a superset of the secret and data patterns in .gitignore.
 .git
 target
 data
 backups
 secrets
-.env
-*.sqlite*
-node_modules
+**/.env
+**/.env.*
+!.env.example
+**/*.pem
+**/*.key
+**/*.sqlite*
+**/.DS_Store
+**/node_modules
+.idea
+.vscode
+**/*.swp

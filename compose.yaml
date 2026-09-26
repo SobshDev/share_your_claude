@@ -7,7 +7,7 @@ services:
       PUBLIC_ORIGIN: ${PUBLIC_ORIGIN:?Set PUBLIC_ORIGIN to your Dokploy HTTPS domain}
       ENCRYPTION_KEY: ${ENCRYPTION_KEY:?Set ENCRYPTION_KEY to a base64-encoded 32-byte key}
       ADMIN_PASSWORD_HASH: ${ADMIN_PASSWORD_HASH:?Set ADMIN_PASSWORD_HASH to your Argon2id password hash}
-      RUST_LOG: shared_router=info
+      RUST_LOG: ${RUST_LOG:-shared_router=info}
     volumes:
       - router_data:/data
     expose:
@@ -18,5 +18,12 @@ services:
     cap_drop: [ALL]
     security_opt: [no-new-privileges:true]
     stop_grace_period: 30s
+    mem_limit: 512m
+    pids_limit: 256
+    logging:
+      driver: json-file
+      options:
+        max-size: '10m'
+        max-file: '5'
 volumes:
   router_data:
