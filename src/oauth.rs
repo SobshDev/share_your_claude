@@ -487,6 +487,54 @@ pub async fn access(state: &AppState) -> Result<Access> {
     }
 }
 
+/// Refreshes the owner's tokens after upstream rejected the access token of `generation`.
+/// When another request already replaced that generation, returns the newer tokens without
+/// refreshing again. The credential is marked for reconnection only when the refresh itself
+/// is rejected.
+pub async fn force_refresh(state: &AppState, generation: i64) -> Result<Access> {
+    let refresh = state.oauth.lock().await.refresh.clone();
+    let mut refresh = refresh.lock().await;
+    let stored = load(state).await?;
+    if stored.generation != generation {
+        return Ok(stored.into());
+    }
+    let request = TokenRequest {
+        grant_type: "refresh_token",
+        refresh_token: Some(&stored.tokens.refresh_token),
+        ..TokenRequest::default()
+    };
+    let (tokens, expires) =
+        match exchange(state, &request, Some(&stored.tokens.refresh_token)).await {
+            Ok(value) => value,
+            Err(ExchangeError::Rejected) => {
+                mark_reauth(state, generation).await?;
+                return Err(AppError::reauth());
+            }
+            Err(ExchangeError::Failed) => {
+                refresh.last_failure = Some(db::epoch());
+                return Err(AppError::upstream());
+            }
+        };
+    refresh.last_failure = None;
+    let encrypted = encrypt(&state.config.encryption_key, &tokens)?;
+    match persist(state, generation, &encrypted, expires).await {
+        Ok(true) => Ok(Access {
+            tokens,
+            generation: generation + 1,
+        }),
+        Ok(false) => Ok(load(state).await?.into()),
+        Err(_) => {
+            tracing::error!("refreshed Claude credential could not be saved; retrying on next use");
+            refresh.unsaved = Some(Unsaved {
+                generation,
+                encrypted,
+                expires,
+            });
+            Ok(Access { tokens, generation })
+        }
+    }
+}
+
 pub async fn mark_reauth(state: &AppState, generation: i64) -> Result<()> {
     sqlx::query("UPDATE claude_credential SET state='needs_reauth' WHERE id=1 AND generation=?")
         .bind(generation)

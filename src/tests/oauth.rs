@@ -140,19 +140,21 @@ async fn stale_auth_failures_do_not_invalidate_a_new_login() {
         .await
         .unwrap();
     assert_eq!(state, "connected");
+    // An upstream 401 refreshes the current generation once; messages are not replayed.
     assert_eq!(
         h.request("/v1/messages", &h.key, message("unauthorized", false))
             .await
             .status(),
-        401
+        503
     );
+    assert_eq!(h.mock.refreshes.load(Ordering::SeqCst), 1);
     assert_eq!(
         h.request("/v1/messages", &h.key, message("hello", false))
             .await
             .status(),
-        503
+        200
     );
-    assert_eq!(h.mock.requests.load(Ordering::SeqCst), 1);
+    assert_eq!(h.mock.requests.load(Ordering::SeqCst), 2);
 }
 
 /// How the token endpoint of a [`TokenMock`] answers.
@@ -285,7 +287,7 @@ async fn credential(h: &Harness) -> (String, i64, oauth::Tokens) {
 /// The bearer token of the latest `/v1/messages` call the fake upstream received.
 async fn last_bearer(h: &Harness) -> String {
     let captures = h.mock.captures.lock().await;
-    captures.last().unwrap().0["authorization"]
+    captures.last().unwrap().headers["authorization"]
         .to_str()
         .unwrap()
         .to_owned()
@@ -296,13 +298,13 @@ async fn transient_refresh_failure_stays_connected_and_backs_off() {
     let h = Harness::new().await;
     let (mock, state, router) = with_token_mock(&h, Reply::Unavailable).await;
     expire_at(&h, 0).await;
-    let (a, b, c, d) = tokio::join!(
-        ask(&router, &h.key),
+    // Three concurrent requests: the per-key admission limit allows three at a time.
+    let (a, b, c) = tokio::join!(
         ask(&router, &h.key),
         ask(&router, &h.key),
         ask(&router, &h.key)
     );
-    for response in [a, b, c, d] {
+    for response in [a, b, c] {
         assert_eq!(response.status(), 502);
     }
     assert_eq!(mock.calls(), 1, "one token call within the backoff window");

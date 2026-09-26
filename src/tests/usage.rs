@@ -102,6 +102,30 @@ fn usage_merges_snapshots_and_rejects_invalid_values() {
     assert_eq!(u.state(true), "partial");
 }
 
+#[test]
+fn null_usage_counters_are_unreported_not_invalid() {
+    let mut u = usage::Usage::default();
+    u.merge(Some(
+        &json!({"input_tokens":10,"output_tokens":0,"cache_read_input_tokens":4}),
+    ));
+    u.merge(Some(&json!({
+        "input_tokens":null,
+        "output_tokens":7,
+        "cache_read_input_tokens":null,
+        "cache_creation_input_tokens":null
+    })));
+    assert_eq!(u.get("input_tokens"), Some(10));
+    assert_eq!(u.get("cache_read_input_tokens"), Some(4));
+    assert_eq!(u.get("cache_creation_input_tokens"), None);
+    assert_eq!(u.state(true), "complete");
+    for invalid in [json!({"output_tokens":"8"}), json!({"output_tokens":1.5})] {
+        let mut u = usage::Usage::default();
+        u.merge(Some(&json!({"input_tokens":10,"output_tokens":0})));
+        u.merge(Some(&invalid));
+        assert_eq!(u.state(true), "partial");
+    }
+}
+
 #[tokio::test]
 async fn missing_final_usage_never_appears_complete() {
     let h = Harness::new().await;
@@ -115,4 +139,77 @@ async fn missing_final_usage_never_appears_complete() {
         .unwrap();
     assert_eq!(row.get::<String, _>("outcome"), "completed");
     assert_eq!(row.get::<String, _>("usage_state"), "partial");
+}
+
+#[tokio::test]
+async fn cancelling_before_upstream_headers_records_an_interrupted_request() {
+    let h = Harness::new().await;
+    let mut request = Box::pin(h.request("/v1/messages", &h.key, message("slow", false)));
+    tokio::select! {
+        _ = &mut request => panic!("the slow scenario answered"),
+        _ = async {
+            while h.mock.requests.load(Ordering::SeqCst) == 0 {
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        } => {}
+    }
+    // Dropping the in-flight request drops its RequestGuard, which finalizes the row.
+    drop(request);
+    let row = tokio::time::timeout(Duration::from_secs(3), async {
+        loop {
+            let row: (String, Option<i64>, String) =
+                sqlx::query_as("SELECT outcome,http_status,usage_state FROM request_usage")
+                    .fetch_one(&h.state.db)
+                    .await
+                    .unwrap();
+            if row.0 != "in_progress" {
+                break row;
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+    })
+    .await
+    .unwrap();
+    assert_eq!(row, ("interrupted".into(), None, "unknown".into()));
+}
+
+#[tokio::test]
+async fn complete_usage_fills_missing_cache_counters_and_counts_are_not_applicable() {
+    let h = Harness::new().await;
+    for (path, body) in [
+        ("/v1/messages", message("no-cache", false)),
+        (
+            "/v1/messages/count_tokens",
+            json!({"model":MODEL,"messages":[]}),
+        ),
+    ] {
+        assert_eq!(h.request(path, &h.key, body).await.status(), 200);
+    }
+    type Row = (String, String, String, Option<i64>, Option<i64>);
+    let rows: Vec<Row> = sqlx::query_as(
+        "SELECT endpoint,outcome,usage_state,cache_read_tokens,cache_write_tokens \
+         FROM request_usage ORDER BY endpoint",
+    )
+    .fetch_all(&h.state.db)
+    .await
+    .unwrap();
+    assert_eq!(
+        rows,
+        [
+            (
+                "/v1/messages".into(),
+                "completed".into(),
+                "complete".into(),
+                Some(0),
+                Some(0)
+            ),
+            (
+                "/v1/messages/count_tokens".into(),
+                "completed".into(),
+                "not_applicable".into(),
+                None,
+                None
+            ),
+        ]
+    );
 }

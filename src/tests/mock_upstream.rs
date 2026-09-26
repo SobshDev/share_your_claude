@@ -1,26 +1,66 @@
 //! Fake Anthropic upstream serving `/v1/messages`, `/v1/messages/count_tokens`, `/v1/models`,
-//! and the OAuth token endpoint.
+//! and the OAuth token endpoint. Replies follow Anthropic's wire format: error envelopes with an
+//! `error.type`, complete stream event shapes, and a `request-id` header on every response.
 //!
 //! The text of the first user message selects a scenario: `error` (429), `unauthorized` (401),
-//! `redirect` (307), `disconnect` (stream that waits for the client to hang up),
-//! `no-final-usage`, `stream-error`, `truncated`, `missing` (no usage), and `wrong-model`
-//! (serves `claude-fable-5-1`). Anything else succeeds.
+//! `expired-token` (401 until the router sends a refreshed token, also for `count_tokens`),
+//! `forbidden-auth` (403 `authentication_error`),
+//! `redirect` (307), `status-NNN` (that status with an Anthropic error envelope),
+//! `disconnect` (stream that waits for the client to hang up), `no-final-usage`,
+//! `stream-error` (an `overloaded_error` event), `truncated`, `missing` (no usage),
+//! `no-cache` (usage without cache counters), `wrong-model` (serves `claude-fable-5-1`),
+//! `slow` (never answers in time), `not-json`, `not-message`, and `oversized-reply`
+//! (one byte over the router's reply limit). Streams also accept the malformed scenarios listed
+//! in [`malformed_stream`] and `stream-not-sse` (a JSON reply). `count_tokens` accepts
+//! `expired-token` and `bad-count`. Anything else succeeds.
 use super::*;
+use axum::{
+    extract::Query,
+    http::{HeaderValue, Uri},
+};
+use std::collections::HashMap;
+
+/// Request id the fake upstream sends with every response.
+pub(super) const REQUEST_ID: &str = "req_011CMockUpstreamRequest";
+
+/// One call to a fake API route.
+pub(super) struct Capture {
+    /// Path and query.
+    pub(super) uri: String,
+    pub(super) headers: HeaderMap,
+    /// JSON body, or null for a GET.
+    pub(super) body: Value,
+}
 
 #[derive(Default)]
 pub(super) struct Mock {
-    /// Calls to `/v1/messages`.
+    /// Calls to the API routes: messages, count_tokens, and models.
     pub(super) requests: AtomicUsize,
     /// Calls to the token endpoint (refreshes and code exchanges).
     pub(super) refreshes: AtomicUsize,
     /// Set once the router drops a `disconnect` stream.
     pub(super) disconnected: AtomicBool,
-    /// Headers and body of every `/v1/messages` call.
-    pub(super) captures: Mutex<Vec<(HeaderMap, Value)>>,
+    /// Every API route call, in order.
+    pub(super) captures: Mutex<Vec<Capture>>,
     /// Body of every token endpoint call.
     pub(super) token_captures: Mutex<Vec<Value>>,
     /// Makes the token endpoint answer `invalid_grant`.
     pub(super) refresh_error: AtomicBool,
+    /// When nonzero, the largest models page served, whatever the client's `limit`.
+    pub(super) models_page_size: AtomicUsize,
+    /// Makes every models page report the same `last_id`, so pagination never advances.
+    pub(super) models_repeat_cursor: AtomicBool,
+}
+
+impl Mock {
+    async fn record(&self, uri: &Uri, headers: &HeaderMap, body: &Value) {
+        self.requests.fetch_add(1, Ordering::SeqCst);
+        self.captures.lock().await.push(Capture {
+            uri: uri.to_string(),
+            headers: headers.clone(),
+            body: body.clone(),
+        });
+    }
 }
 
 /// Serves the fake upstream on an ephemeral loopback port.
@@ -29,17 +69,14 @@ pub(super) async fn spawn_upstream()
     let mock = Arc::new(Mock::default());
     let service = Router::new()
         .route("/v1/messages", post(mock_message))
-        .route(
-            "/v1/messages/count_tokens",
-            post(|| async { Json(json!({"input_tokens":123})) }),
-        )
+        .route("/v1/messages/count_tokens", post(mock_count_tokens))
+        .route("/v1/models", get(mock_models))
         .route("/v1/oauth/token", post(mock_token))
-        .route(
-            "/v1/models",
-            get(|| async {
-                Json(json!({"data":[{"id":MODEL,"display_name":"Claude Sonnet 4.6"},{"id":"claude-opus-5","display_name":"Claude Opus 5"},{"id":"claude-fable-5-1","display_name":"Claude Fable 5.1"}],"has_more":false}))
-            }),
-        )
+        .layer(middleware::map_response(|mut response: Response| async {
+            let id = HeaderValue::from_static(REQUEST_ID);
+            response.headers_mut().insert("request-id", id);
+            response
+        }))
         .with_state(mock.clone());
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
     let address = listener.local_addr().unwrap();
@@ -47,89 +84,98 @@ pub(super) async fn spawn_upstream()
     (mock, address, server)
 }
 
+/// An Anthropic error reply. Its message stands in for provider text the router must not relay.
+fn error(status: u16, kind: &str, message: &str) -> Response {
+    (
+        StatusCode::from_u16(status).unwrap(),
+        Json(json!({"type":"error","error":{"type":kind,"message":message}})),
+    )
+        .into_response()
+}
+
+/// The scenario selected by the first user message.
+fn scenario(body: &Value) -> &str {
+    body.pointer("/messages/0/content")
+        .and_then(Value::as_str)
+        .unwrap_or("hello")
+}
+
+/// The `expired-token` scenario: 401 until the router sends the token from a refresh.
+fn token_rejection(headers: &HeaderMap, content: &str) -> Option<Response> {
+    (content == "expired-token" && headers["authorization"] != "Bearer refreshed-access")
+        .then(|| error(401, "authentication_error", "owner-secret"))
+}
+
 async fn mock_message(
     State(mock): State<Arc<Mock>>,
+    uri: Uri,
     headers: HeaderMap,
     Json(body): Json<Value>,
 ) -> Response {
-    mock.requests.fetch_add(1, Ordering::SeqCst);
-    mock.captures.lock().await.push((headers, body.clone()));
-    let content = body
-        .pointer("/messages/0/content")
-        .and_then(Value::as_str)
-        .unwrap_or("hello");
-    if content == "error" {
-        return (
-            StatusCode::TOO_MANY_REQUESTS,
-            [("retry-after", "20")],
-            Json(json!({"error":{"message":"sensitive provider echo"}})),
-        )
-            .into_response();
+    mock.record(&uri, &headers, &body).await;
+    let content = scenario(&body);
+    if let Some(rejected) = token_rejection(&headers, content) {
+        return rejected;
     }
-    if content == "unauthorized" {
-        return (
-            StatusCode::UNAUTHORIZED,
-            Json(json!({"error":{"message":"owner-secret"}})),
-        )
-            .into_response();
-    }
-    if content == "redirect" {
-        return (
-            StatusCode::TEMPORARY_REDIRECT,
-            [("location", "http://127.0.0.1:9/should-not-follow")],
-        )
-            .into_response();
-    }
-    if body["stream"] == true {
-        let prefix = format!(
-            "event: message_start\r\ndata: {}\r\n\r\n",
-            json!({"type":"message_start","message":{"id":"msg_test","type":"message","role":"assistant","model":MODEL,"content":[],"usage":{"input_tokens":10,"output_tokens":0,"cache_read_input_tokens":20,"cache_creation_input_tokens":30}}})
-        );
-        if content == "disconnect" {
-            let (tx, rx) =
-                tokio::sync::mpsc::channel::<std::result::Result<bytes::Bytes, std::io::Error>>(1);
-            tokio::spawn(async move {
-                let _ = tx.send(Ok(prefix.into())).await;
-                tx.closed().await;
-                mock.disconnected.store(true, Ordering::SeqCst);
-            });
+    match content {
+        "error" => {
+            let mut response = error(429, "rate_limit_error", "sensitive provider echo");
+            let retry = HeaderValue::from_static("20");
+            response.headers_mut().insert("retry-after", retry);
+            return response;
+        }
+        "unauthorized" => return error(401, "authentication_error", "owner-secret"),
+        "forbidden-auth" => return error(403, "authentication_error", "owner-secret"),
+        "redirect" => {
             return (
-                [("content-type", "text/event-stream")],
-                Body::from_stream(tokio_stream::wrappers::ReceiverStream::new(rx)),
+                StatusCode::TEMPORARY_REDIRECT,
+                [("location", "http://127.0.0.1:9/should-not-follow")],
             )
                 .into_response();
         }
-        let mut stream = prefix;
-        stream.push_str("event: ping\ndata: {\"type\":\"ping\"}\n\n");
-        stream.push_str("event: future_event\ndata: {\"type\":\"future_event\",\"value\":1}\n\n");
-        if let Some(name) = body.pointer("/tools/0/name") {
-            stream.push_str(&format!("event: content_block_start\ndata: {}\n\n",json!({"type":"content_block_start","index":0,"content_block":{"type":"tool_use","id":"tool_1","name":name,"input":{}}})));
-            stream.push_str("event: content_block_delta\ndata: {\"type\":\"content_block_delta\",\"index\":0,\"delta\":{\"type\":\"input_json_delta\",\"partial_json\":\"{}\"}}\n\n");
-            stream.push_str("event: content_block_stop\ndata: {\"type\":\"content_block_stop\",\"index\":0}\n\n");
+        "slow" => tokio::time::sleep(Duration::from_secs(30)).await,
+        "not-json" => {
+            return ([("content-type", "application/json")], "{\"type\":").into_response();
         }
-        if content != "no-final-usage" {
-            stream.push_str("event: message_delta\ndata: {\"type\":\"message_delta\",\"usage\":{\"output_tokens\":3}}\n\n");
-            stream.push_str("event: message_delta\ndata: {\"type\":\"message_delta\",\"usage\":{\"output_tokens\":7}}\n\n");
+        "not-message" => {
+            return Json(json!({"type":"completion","completion":"hi"})).into_response();
         }
-        if content == "stream-error" {
-            stream.push_str("event: error\ndata: {\"type\":\"error\",\"error\":{\"message\":\"secret upstream text\"}}\n\n");
-        } else if content != "truncated" {
-            stream.push_str("event: message_stop\ndata: {\"type\":\"message_stop\"}\n\n");
+        "oversized-reply" => {
+            let mut reply = vec![b' '; crate::proxy::MAX_RESPONSE_BODY_BYTES];
+            reply.push(b'{');
+            return ([("content-type", "application/json")], reply).into_response();
         }
-        let chunks: Vec<_> = stream
-            .as_bytes()
-            .chunks(7)
-            .map(|s| Ok::<_, std::io::Error>(bytes::Bytes::copy_from_slice(s)))
-            .collect();
-        return (
-            [("content-type", "text/event-stream")],
-            Body::from_stream(futures_util::stream::iter(chunks)),
-        )
-            .into_response();
+        _ => (),
     }
-    let mut response = json!({"id":"msg_test","type":"message","role":"assistant","model":MODEL,"content":[{"type":"text","text":"hello"}],"usage":{"input_tokens":10,"output_tokens":7,"cache_read_input_tokens":20,"cache_creation_input_tokens":30}});
+    if let Some(status) = content.strip_prefix("status-") {
+        let status: u16 = status.parse().unwrap();
+        let kind = match status {
+            400 => "invalid_request_error",
+            403 => "permission_error",
+            404 => "not_found_error",
+            529 => "overloaded_error",
+            _ => "api_error",
+        };
+        return error(status, kind, "secret upstream text");
+    }
+    if body["stream"] == true {
+        return stream_reply(mock, content, &body);
+    }
+    let mut response = json!({
+        "id": "msg_test",
+        "type": "message",
+        "role": "assistant",
+        "model": MODEL,
+        "content": [{"type":"text","text":"hello"}],
+        "stop_reason": "end_turn",
+        "stop_sequence": null,
+        "usage": {"input_tokens":10,"output_tokens":7,"cache_read_input_tokens":20,"cache_creation_input_tokens":30},
+    });
     if content == "missing" {
         response.as_object_mut().unwrap().remove("usage");
+    }
+    if content == "no-cache" {
+        response["usage"] = json!({"input_tokens":10,"output_tokens":7});
     }
     if content == "wrong-model" {
         response["model"] = "claude-fable-5-1".into();
@@ -137,8 +183,222 @@ async fn mock_message(
     if let Some(name) = body.pointer("/tools/0/name") {
         response["content"] =
             json!([{"type":"tool_use","id":"tool_1","name":name,"input":{"name":"do not alter"}}]);
+        response["stop_reason"] = "tool_use".into();
     }
     Json(response).into_response()
+}
+
+/// One server-sent event named after its payload's `type`.
+fn event(payload: Value) -> String {
+    format!(
+        "event: {}\ndata: {payload}\n\n",
+        payload["type"].as_str().unwrap()
+    )
+}
+
+fn stream_reply(mock: Arc<Mock>, content: &str, body: &Value) -> Response {
+    if content == "stream-not-sse" {
+        return Json(json!({"type":"message"})).into_response();
+    }
+    let start = json!({"type":"message_start","message":{
+        "id": "msg_test",
+        "type": "message",
+        "role": "assistant",
+        "model": if content == "wrong-model" { "claude-fable-5-1" } else { MODEL },
+        "content": [],
+        "stop_reason": null,
+        "stop_sequence": null,
+        "usage": {"input_tokens":10,"output_tokens":0,"cache_read_input_tokens":20,"cache_creation_input_tokens":30},
+    }});
+    // CRLF framing on the first event exercises the router's SSE line-ending handling.
+    let prefix = format!("event: message_start\r\ndata: {start}\r\n\r\n");
+    if let Some(chunks) = malformed_stream(content, &prefix) {
+        return (
+            [("content-type", "text/event-stream")],
+            Body::from_stream(futures_util::stream::iter(chunks)),
+        )
+            .into_response();
+    }
+    if content == "stream-reset" {
+        // The error comes after the headers and first event, so upstream fails mid-stream.
+        let first = futures_util::stream::iter([Ok(bytes::Bytes::from(prefix))]);
+        let reset = futures_util::stream::once(async {
+            tokio::time::sleep(Duration::from_millis(50)).await;
+            Err(std::io::Error::other("connection reset"))
+        });
+        return (
+            [("content-type", "text/event-stream")],
+            Body::from_stream(first.chain(reset)),
+        )
+            .into_response();
+    }
+    if content == "disconnect" {
+        let (tx, rx) =
+            tokio::sync::mpsc::channel::<std::result::Result<bytes::Bytes, std::io::Error>>(1);
+        tokio::spawn(async move {
+            let _ = tx.send(Ok(prefix.into())).await;
+            tx.closed().await;
+            mock.disconnected.store(true, Ordering::SeqCst);
+        });
+        return (
+            [("content-type", "text/event-stream")],
+            Body::from_stream(tokio_stream::wrappers::ReceiverStream::new(rx)),
+        )
+            .into_response();
+    }
+    let mut stream = prefix;
+    stream.push_str(&event(json!({"type":"ping"})));
+    stream.push_str(&event(json!({"type":"future_event","value":1})));
+    let tool = body.pointer("/tools/0/name");
+    let (block, delta, stop_reason) = match tool {
+        Some(name) => (
+            json!({"type":"tool_use","id":"tool_1","name":name,"input":{}}),
+            json!({"type":"input_json_delta","partial_json":"{}"}),
+            "tool_use",
+        ),
+        None => (
+            json!({"type":"text","text":""}),
+            json!({"type":"text_delta","text":"hello"}),
+            "end_turn",
+        ),
+    };
+    stream.push_str(&event(
+        json!({"type":"content_block_start","index":0,"content_block":block}),
+    ));
+    stream.push_str(&event(
+        json!({"type":"content_block_delta","index":0,"delta":delta}),
+    ));
+    stream.push_str(&event(json!({"type":"content_block_stop","index":0})));
+    if content != "no-final-usage" {
+        // Output counts are cumulative: the router must keep the last one, not add them up.
+        stream.push_str(&event(json!({"type":"message_delta",
+            "delta":{"stop_reason":null,"stop_sequence":null},"usage":{"output_tokens":3}})));
+        stream.push_str(&event(json!({"type":"message_delta",
+            "delta":{"stop_reason":stop_reason,"stop_sequence":null},"usage":{"output_tokens":7}})));
+    }
+    if content == "stream-error" {
+        stream.push_str(&event(json!({"type":"error",
+            "error":{"type":"overloaded_error","message":"secret upstream text"}})));
+    } else if content != "truncated" {
+        stream.push_str(&event(json!({"type":"message_stop"})));
+    }
+    let chunks: Vec<_> = stream
+        .as_bytes()
+        .chunks(7)
+        .map(|s| Ok::<_, std::io::Error>(bytes::Bytes::copy_from_slice(s)))
+        .collect();
+    (
+        [("content-type", "text/event-stream")],
+        Body::from_stream(futures_util::stream::iter(chunks)),
+    )
+        .into_response()
+}
+
+/// Stream chunks for the scenarios whose upstream stream breaks the protocol, each after a valid
+/// `message_start` unless named otherwise: `stream-duplicate-start`, `stream-delta-first` and
+/// `stream-stop-first` (no start), `stream-mismatch` (event name differs from payload type),
+/// `stream-no-payload` (required event without JSON), `stream-fallback` (a fallback content
+/// block), `stream-oversized` (an event larger than the router's limit), and `stream-bad-utf8`.
+/// `stream-reset` (a connection error after the first event) is served by [`stream_reply`].
+fn malformed_stream(
+    content: &str,
+    prefix: &str,
+) -> Option<Vec<std::result::Result<bytes::Bytes, std::io::Error>>> {
+    let delta = event(json!({"type":"message_delta",
+        "delta":{"stop_reason":"end_turn","stop_sequence":null},"usage":{"output_tokens":1}}));
+    let bytes: Vec<u8> = match content {
+        "stream-duplicate-start" => [prefix, prefix].concat().into(),
+        "stream-delta-first" => delta.into(),
+        "stream-stop-first" => event(json!({"type":"message_stop"})).into(),
+        "stream-mismatch" => {
+            format!("{prefix}event: message_stop\ndata: {{\"type\":\"message_delta\"}}\n\n").into()
+        }
+        "stream-no-payload" => format!("{prefix}event: message_delta\ndata: not json\n\n").into(),
+        "stream-fallback" => [
+            prefix.to_owned(),
+            event(json!({"type":"content_block_start","index":0,
+                "content_block":{"type":"fallback","model":"claude-fable-5-1"}})),
+        ]
+        .concat()
+        .into(),
+        "stream-oversized" => {
+            let data = "x".repeat(crate::proxy::MAX_SSE_EVENT_BYTES);
+            format!("{prefix}event: ping\ndata: {data}").into()
+        }
+        "stream-bad-utf8" => [prefix.as_bytes(), b"event: ping\ndata: \xff\n\n"].concat(),
+        _ => return None,
+    };
+    Some(
+        bytes
+            .chunks(64 * 1024)
+            .map(|s| Ok(bytes::Bytes::copy_from_slice(s)))
+            .collect(),
+    )
+}
+
+async fn mock_count_tokens(
+    State(mock): State<Arc<Mock>>,
+    uri: Uri,
+    headers: HeaderMap,
+    Json(body): Json<Value>,
+) -> Response {
+    mock.record(&uri, &headers, &body).await;
+    if let Some(rejected) = token_rejection(&headers, scenario(&body)) {
+        return rejected;
+    }
+    if scenario(&body) == "bad-count" {
+        return Json(json!({"input_tokens":-1})).into_response();
+    }
+    Json(json!({"input_tokens":123})).into_response()
+}
+
+/// Lists three models, one page at a time, honouring `limit` and `after_id`.
+async fn mock_models(
+    State(mock): State<Arc<Mock>>,
+    uri: Uri,
+    headers: HeaderMap,
+    Query(query): Query<HashMap<String, String>>,
+) -> Response {
+    mock.record(&uri, &headers, &Value::Null).await;
+    let models = [
+        (MODEL, "Claude Sonnet 4.6"),
+        ("claude-opus-5", "Claude Opus 5"),
+        ("claude-fable-5-1", "Claude Fable 5.1"),
+    ];
+    let limit = query
+        .get("limit")
+        .and_then(|v| v.parse().ok())
+        .unwrap_or(20);
+    let page_size = match mock.models_page_size.load(Ordering::SeqCst) {
+        0 => limit,
+        size => size.min(limit),
+    };
+    let start = query.get("after_id").map_or(0, |after| {
+        models
+            .iter()
+            .position(|(id, _)| id == after)
+            .map_or(models.len(), |i| i + 1)
+    });
+    let page: Vec<Value> = models[start..]
+        .iter()
+        .take(page_size)
+        .map(|(id, name)| {
+            json!({"type":"model","id":id,"display_name":name,"created_at":"2026-01-01T00:00:00Z"})
+        })
+        .collect();
+    let mut has_more = start + page.len() < models.len();
+    let mut last_id = page.last().map(|m| m["id"].clone());
+    if mock.models_repeat_cursor.load(Ordering::SeqCst) {
+        has_more = true;
+        last_id = Some(models[0].0.into());
+    }
+    Json(json!({
+        "data": page,
+        "first_id": page.first().map(|m| &m["id"]),
+        "last_id": last_id,
+        "has_more": has_more,
+    }))
+    .into_response()
 }
 
 async fn mock_token(State(mock): State<Arc<Mock>>, Json(body): Json<Value>) -> Response {

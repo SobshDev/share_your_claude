@@ -229,7 +229,7 @@ async fn owner_workflow_through_the_admin_api() {
     body["model"] = "team/sonnet_latest".into();
     assert_eq!(h.request("/v1/messages", &secret, body).await.status(), 200);
     assert_eq!(
-        h.mock.captures.lock().await.last().unwrap().1["model"],
+        h.mock.captures.lock().await.last().unwrap().body["model"],
         MODEL
     );
     // The client configuration lists granted, enabled models and never the secret.
