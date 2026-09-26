@@ -421,3 +421,89 @@ async fn rejected_authorization_code_keeps_the_credential() {
     assert_eq!(before, after);
     assert_eq!(credential(&h).await.0, "connected");
 }
+
+/// Collects formatted log output of the current thread.
+#[derive(Clone, Default)]
+struct Logs(Arc<std::sync::Mutex<Vec<u8>>>);
+impl std::io::Write for Logs {
+    fn write(&mut self, bytes: &[u8]) -> std::io::Result<usize> {
+        self.0.lock().unwrap().extend_from_slice(bytes);
+        Ok(bytes.len())
+    }
+    fn flush(&mut self) -> std::io::Result<()> {
+        Ok(())
+    }
+}
+impl<'a> tracing_subscriber::fmt::MakeWriter<'a> for Logs {
+    type Writer = Logs;
+    fn make_writer(&'a self) -> Logs {
+        self.clone()
+    }
+}
+
+#[tokio::test]
+async fn unreadable_credential_requires_reconnect_and_reconnecting_restores_it() {
+    let logs = Logs::default();
+    let _logging = tracing::subscriber::set_default(
+        tracing_subscriber::fmt()
+            .with_writer(logs.clone())
+            .with_ansi(false)
+            .finish(),
+    );
+    let h = Harness::new().await;
+    let stored: Vec<u8> = sqlx::query_scalar("SELECT encrypted_tokens FROM claude_credential")
+        .fetch_one(&h.state.db)
+        .await
+        .unwrap();
+    // The credential was stored under the harness key; this router runs with another one.
+    let (mock, base) = TokenMock::spawn(Reply::Rotate).await;
+    let (state, router) = h.variant(|state| {
+        state.config.encryption_key = zeroize::Zeroizing::new([8; 32]);
+        state.token_endpoint = format!("{base}/v1/oauth/token");
+    });
+    let response = ask(&router, &h.key).await;
+    assert_eq!(response.status(), 503);
+    assert_eq!(
+        json_body(response).await["error"]["type"],
+        "authentication_error"
+    );
+    let session = sign_in(&router).await;
+    let me = json_body(admin_as(&router, &session, "GET", "/admin/api/me", None).await).await;
+    assert_eq!(me["claude"]["state"], "needs_reauth");
+    assert_eq!(h.mock.requests.load(Ordering::SeqCst), 0);
+
+    let output = String::from_utf8(logs.0.lock().unwrap().clone()).unwrap();
+    assert!(output.contains("stored Claude credential cannot be decrypted; reconnect required"));
+    for secret in ["owner-access-must-not-leak", "owner-refresh"] {
+        assert!(!output.contains(secret));
+    }
+    use base64::Engine;
+    for encoding in [
+        base64::engine::general_purpose::STANDARD.encode(&stored),
+        base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(&stored),
+    ] {
+        assert!(!output.contains(&encoding[..16]));
+    }
+
+    let redirect = start_connection(&router, &session, "abc").await;
+    assert_eq!(
+        admin_as(
+            &router,
+            &session,
+            "POST",
+            "/admin/api/claude/complete",
+            Some(redirect)
+        )
+        .await
+        .status(),
+        200
+    );
+    assert_eq!(mock.calls(), 1);
+    assert_eq!(ask(&router, &h.key).await.status(), 200);
+    assert_eq!(last_bearer(&h).await, "Bearer refreshed-access");
+    let encrypted: Vec<u8> = sqlx::query_scalar("SELECT encrypted_tokens FROM claude_credential")
+        .fetch_one(&h.state.db)
+        .await
+        .unwrap();
+    assert!(oauth::decrypt(&state.config.encryption_key, &encrypted).is_ok());
+}

@@ -336,10 +336,15 @@ async fn load(state: &AppState) -> Result<Stored> {
         return Err(AppError::reauth());
     }
     let generation: i64 = row.get("generation");
-    let tokens = decrypt(
+    let Ok(tokens) = decrypt(
         &state.config.encryption_key,
         &row.get::<Vec<u8>, _>("encrypted_tokens"),
-    )?;
+    ) else {
+        // ENCRYPTION_KEY changed or the row is damaged. Only reconnecting can recover.
+        tracing::error!("stored Claude credential cannot be decrypted; reconnect required");
+        mark_reauth(state, generation).await?;
+        return Err(AppError::reauth());
+    };
     Ok(Stored {
         tokens,
         generation,
