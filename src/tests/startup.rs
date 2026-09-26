@@ -143,3 +143,131 @@ async fn shutdown_records_open_requests_with_their_checkpoint() {
     assert_eq!(outcome, "completed");
     pool.close().await;
 }
+
+/// Creates a database file at `path` with only the migrations up to `version` applied, as an
+/// older release would have left it. Returns a pool so the caller can add data for that schema.
+async fn database_at(path: &Path, version: i64) -> sqlx::SqlitePool {
+    let source = Path::new(env!("CARGO_MANIFEST_DIR")).join("migrations");
+    let older = tempfile::tempdir().unwrap();
+    for entry in std::fs::read_dir(&source).unwrap() {
+        let entry = entry.unwrap();
+        let name = entry.file_name().into_string().unwrap();
+        let number: i64 = name.split('_').next().unwrap().parse().unwrap();
+        if number <= version {
+            std::fs::copy(entry.path(), older.path().join(&name)).unwrap();
+        }
+    }
+    let migrator = sqlx::migrate::Migrator::new(older.path()).await.unwrap();
+    assert_eq!(migrator.iter().last().unwrap().version, version);
+    let options = sqlx::sqlite::SqliteConnectOptions::new()
+        .filename(path)
+        .create_if_missing(true)
+        .foreign_keys(true);
+    let pool = sqlx::SqlitePool::connect_with(options).await.unwrap();
+    migrator.run(&pool).await.unwrap();
+    pool
+}
+
+/// Startup against a database from the first release: every later migration applies, data is
+/// kept, requests left open by a crash are recovered, and expired sessions are removed.
+/// Later migrations extend this test by asserting their own schema changes below.
+#[tokio::test]
+async fn startup_upgrades_an_initial_database_and_recovers_it() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("router.sqlite");
+    let old = database_at(&path, 1).await;
+    for sql in [
+        "INSERT INTO person(id,name,created_at) VALUES('p','Alex','2026-01-01T00:00:00.000Z')",
+        "INSERT INTO api_key(id,person_id,label,prefix,secret_hash,created_at) VALUES('k','p','Laptop','sr_test',x'00','2026-01-01T00:00:00.000Z')",
+        "INSERT INTO request_usage(id,key_id,endpoint,requested_model,started_at,outcome,usage_state,input_tokens,output_tokens,raw_usage) VALUES('counted','k','/v1/messages','claude-sonnet-4-6','2026-01-01T00:00:01.000Z','in_progress','complete',12,3,'{\"input_tokens\":12,\"output_tokens\":3}')",
+        "INSERT INTO request_usage(id,key_id,endpoint,requested_model,started_at,outcome) VALUES('uncounted','k','/v1/messages','claude-sonnet-4-6','2026-01-01T00:00:02.000Z','in_progress')",
+        "INSERT INTO request_usage(id,key_id,endpoint,requested_model,started_at,finished_at,outcome,usage_state) VALUES('done','k','/v1/messages','claude-sonnet-4-6','2026-01-01T00:00:03.000Z','2026-01-01T00:00:04.000Z','completed','unknown')",
+    ] {
+        sqlx::query(sql).execute(&old).await.unwrap();
+    }
+    for (hash, expires_at) in [
+        (&b"expired"[..], db::epoch() - 1),
+        (b"current", db::epoch() + 3600),
+    ] {
+        sqlx::query(
+            "INSERT INTO admin_session(token_hash,csrf_token,expires_at) VALUES(?,'csrf',?)",
+        )
+        .bind(hash)
+        .bind(expires_at)
+        .execute(&old)
+        .await
+        .unwrap();
+    }
+    old.close().await;
+
+    let pool = db::connect(&url(&path)).await.unwrap();
+
+    let applied: Vec<i64> =
+        sqlx::query_scalar("SELECT version FROM _sqlx_migrations WHERE success ORDER BY version")
+            .fetch_all(&pool)
+            .await
+            .unwrap();
+    let embedded: Vec<i64> = sqlx::migrate!().iter().map(|m| m.version).collect();
+    assert_eq!(applied, embedded);
+    let index = |name: &'static str| {
+        sqlx::query_scalar::<_, i64>(
+            "SELECT COUNT(*) FROM sqlite_master WHERE type='index' AND name=?",
+        )
+        .bind(name)
+        .fetch_one(&pool)
+    };
+    // 0002
+    assert_eq!(index("usage_endpoint_time").await.unwrap(), 1);
+
+    let name: String = sqlx::query_scalar("SELECT name FROM person WHERE id='p'")
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+    assert_eq!(name, "Alex");
+    let rows = sqlx::query("SELECT * FROM request_usage ORDER BY started_at")
+        .fetch_all(&pool)
+        .await
+        .unwrap();
+    let summary: Vec<_> = rows
+        .iter()
+        .map(|row| {
+            (
+                row.get::<String, _>("id"),
+                row.get::<String, _>("outcome"),
+                row.get::<String, _>("usage_state"),
+                row.get::<Option<i64>, _>("input_tokens"),
+                row.get::<Option<String>, _>("finished_at"),
+            )
+        })
+        .collect();
+    let row = |id: &str, outcome: &str, state: &str, input: Option<i64>, finished: Option<&str>| {
+        (
+            id.to_owned(),
+            outcome.to_owned(),
+            state.to_owned(),
+            input,
+            finished.map(str::to_owned),
+        )
+    };
+    assert_eq!(
+        summary,
+        [
+            // The stop time of a crashed process is unknown, so recovery leaves it empty.
+            row("counted", "interrupted", "partial", Some(12), None),
+            row("uncounted", "interrupted", "unknown", None, None),
+            row(
+                "done",
+                "completed",
+                "unknown",
+                None,
+                Some("2026-01-01T00:00:04.000Z")
+            ),
+        ]
+    );
+    let sessions: Vec<Vec<u8>> = sqlx::query_scalar("SELECT token_hash FROM admin_session")
+        .fetch_all(&pool)
+        .await
+        .unwrap();
+    assert_eq!(sessions, [b"current".to_vec()]);
+    pool.close().await;
+}
