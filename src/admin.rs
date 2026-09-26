@@ -276,7 +276,9 @@ async fn set_grants(
             ));
         }
     }
-    sqlx::query("DELETE FROM key_model_grant WHERE key_id=?")
+    // The form lists only enabled models, so only their grants are replaced. Grants for
+    // disabled models stay and take effect again when the model is re-enabled.
+    sqlx::query("DELETE FROM key_model_grant WHERE key_id=? AND model_id IN (SELECT id FROM model WHERE enabled=1 AND reviewed_at IS NOT NULL)")
         .bind(&id)
         .execute(&mut *tx)
         .await?;
