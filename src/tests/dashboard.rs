@@ -101,7 +101,8 @@ fn referenced_assets(template: &str) -> Vec<String> {
             let value = &template[index + attribute.len()..];
             let value = &value[..value.find('"').unwrap()];
             if value.starts_with("/assets/") {
-                assets.push(value.to_owned());
+                // Drop the `?v={{ asset_version }}` template expression.
+                assets.push(value.split('?').next().unwrap().to_owned());
             }
         }
     }

@@ -11,9 +11,10 @@ pub mod usage;
 
 use axum::{
     Router,
-    extract::DefaultBodyLimit,
+    extract::{DefaultBodyLimit, Request, State},
     http::{HeaderValue, header},
-    middleware,
+    middleware::{self, Next},
+    response::Response,
     routing::{get, post},
 };
 use std::{collections::HashMap, sync::Arc};
@@ -108,16 +109,36 @@ pub fn app(state: Arc<AppState>) -> Router {
         .fallback(|| async { error::AppError::not_found("Not found") })
         .layer(DefaultBodyLimit::max(DEFAULT_BODY_LIMIT_BYTES))
         .layer(middleware::from_fn(error::envelope_rejections))
-        .layer(middleware::from_fn(|req: axum::extract::Request, next: middleware::Next| async move {
-            let mut response = next.run(req).await;
-            let h = response.headers_mut();
-            h.insert(header::CACHE_CONTROL, HeaderValue::from_static("no-store"));
-            h.insert("x-content-type-options", HeaderValue::from_static("nosniff"));
-            h.insert("referrer-policy", HeaderValue::from_static("no-referrer"));
-            h.insert("content-security-policy", HeaderValue::from_static("default-src 'none'; script-src 'self'; style-src 'self'; img-src 'self'; connect-src 'self'; form-action 'self'; frame-ancestors 'none'; base-uri 'none'"));
-            response
-        }))
+        .layer(middleware::from_fn_with_state(
+            state.clone(),
+            security_headers,
+        ))
         .with_state(state)
+}
+
+/// Adds the router's default response headers. A handler may set its own value first, as the
+/// versioned assets do for `Cache-Control`. HSTS is sent only when `PUBLIC_ORIGIN` is HTTPS.
+async fn security_headers(
+    State(state): State<Arc<AppState>>,
+    request: Request,
+    next: Next,
+) -> Response {
+    let mut response = next.run(request).await;
+    let h = response.headers_mut();
+    let mut default = |name: header::HeaderName, value: &'static str| {
+        h.entry(name).or_insert(HeaderValue::from_static(value));
+    };
+    default(header::CACHE_CONTROL, "no-store");
+    default(header::X_CONTENT_TYPE_OPTIONS, "nosniff");
+    default(header::REFERRER_POLICY, "no-referrer");
+    default(
+        header::CONTENT_SECURITY_POLICY,
+        "default-src 'none'; script-src 'self'; style-src 'self'; img-src 'self'; connect-src 'self'; form-action 'self'; frame-ancestors 'none'; base-uri 'none'",
+    );
+    if state.config.secure_cookie {
+        default(header::STRICT_TRANSPORT_SECURITY, "max-age=31536000");
+    }
+    response
 }
 
 #[cfg(test)]

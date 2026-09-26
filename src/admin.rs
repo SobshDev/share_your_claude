@@ -6,7 +6,7 @@ use crate::{
 use askama::Template;
 use axum::{
     Json, Router,
-    extract::{Path, State},
+    extract::{Path, RawQuery, State},
     http::{HeaderMap, StatusCode, header},
     middleware,
     response::{Html, IntoResponse, Redirect, Response},
@@ -19,6 +19,57 @@ use std::{collections::HashMap, sync::Arc};
 
 /// Upper bound for each upstream catalog page request, including its body.
 pub const CATALOG_REQUEST_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(30);
+
+const JS: &str = "text/javascript; charset=utf-8";
+const CSS: &str = "text/css; charset=utf-8";
+/// Static dashboard assets embedded in the binary: path, content type, and contents.
+const ASSETS: [(&str, &str, &str); 4] = [
+    ("/assets/app.js", JS, include_str!("../static/app.js")),
+    ("/assets/common.js", JS, include_str!("../static/common.js")),
+    (
+        "/assets/analytics.js",
+        JS,
+        include_str!("../static/analytics.js"),
+    ),
+    ("/assets/app.css", CSS, include_str!("../static/app.css")),
+];
+/// Cache policy of an asset requested with the current [`ASSET_VERSION`].
+const VERSIONED_ASSET_CACHE: &str = "public, max-age=31536000, immutable";
+
+/// Content hash of every embedded asset. Templates add it to asset URLs as `?v=`, so any
+/// change to an asset gives the pages new URLs and browsers never run stale scripts.
+pub static ASSET_VERSION: std::sync::LazyLock<String> = std::sync::LazyLock::new(|| {
+    use sha2::{Digest, Sha256};
+    let mut hasher = Sha256::new();
+    for (path, _, body) in ASSETS {
+        hasher.update(path.as_bytes());
+        hasher.update((body.len() as u64).to_le_bytes());
+        hasher.update(body.as_bytes());
+    }
+    hasher.finalize()[..8]
+        .iter()
+        .map(|byte| format!("{byte:02x}"))
+        .collect()
+});
+
+/// Serves an embedded asset. Only a URL carrying the current version may be cached for good;
+/// any other request, such as a module imported by relative path, must be revalidated.
+fn asset(query: Option<&str>, content_type: &'static str, body: &'static str) -> Response {
+    let versioned = query.and_then(|q| q.strip_prefix("v=")) == Some(ASSET_VERSION.as_str());
+    let cache = if versioned {
+        VERSIONED_ASSET_CACHE
+    } else {
+        "no-cache"
+    };
+    (
+        [
+            (header::CONTENT_TYPE, content_type),
+            (header::CACHE_CONTROL, cache),
+        ],
+        body,
+    )
+        .into_response()
+}
 
 pub fn routes(state: Arc<AppState>) -> Router<Arc<AppState>> {
     let protected = Router::new()
@@ -39,68 +90,52 @@ pub fn routes(state: Arc<AppState>) -> Router<Arc<AppState>> {
         .route("/admin/api/usage", get(crate::analytics::usage_report))
         .route("/admin/api/analytics", get(crate::analytics::report))
         .route_layer(middleware::from_fn_with_state(state, auth::require_admin));
-    Router::new()
+    let router = Router::new()
         .merge(protected)
         .route("/", get(|| async { Redirect::to("/admin") }))
         .route("/admin", get(dashboard))
         .route("/admin/login", get(login_page))
-        .route("/admin/api/login", post(auth::login))
-        .route(
-            "/assets/app.js",
-            get(|| async {
-                (
-                    [(header::CONTENT_TYPE, "text/javascript; charset=utf-8")],
-                    include_str!("../static/app.js"),
-                )
-            }),
-        )
-        .route(
-            "/assets/common.js",
-            get(|| async {
-                (
-                    [(header::CONTENT_TYPE, "text/javascript; charset=utf-8")],
-                    include_str!("../static/common.js"),
-                )
-            }),
-        )
-        .route(
-            "/assets/analytics.js",
-            get(|| async {
-                (
-                    [(header::CONTENT_TYPE, "text/javascript; charset=utf-8")],
-                    include_str!("../static/analytics.js"),
-                )
-            }),
-        )
-        .route(
-            "/assets/app.css",
-            get(|| async {
-                (
-                    [(header::CONTENT_TYPE, "text/css; charset=utf-8")],
-                    include_str!("../static/app.css"),
-                )
-            }),
-        )
+        .route("/admin/api/login", post(auth::login));
+    ASSETS
+        .iter()
+        .fold(router, |router, &(path, content_type, body)| {
+            router.route(
+                path,
+                get(move |RawQuery(query): RawQuery| async move {
+                    asset(query.as_deref(), content_type, body)
+                }),
+            )
+        })
 }
 
 #[derive(Template)]
 #[template(path = "dashboard.html")]
-struct Dashboard;
+struct Dashboard {
+    asset_version: &'static str,
+}
 #[derive(Template)]
 #[template(path = "login.html")]
-struct LoginPage;
+struct LoginPage {
+    asset_version: &'static str,
+}
 
 async fn dashboard(State(state): State<Arc<AppState>>, headers: HeaderMap) -> Response {
     if auth::session(&headers, &state).await.is_err() {
         return Redirect::to("/admin/login").into_response();
     }
-    match Dashboard.render() {
+    let page = Dashboard {
+        asset_version: &ASSET_VERSION,
+    };
+    match page.render() {
         Ok(html) => Html(html).into_response(),
         Err(_) => page_error(),
     }
 }
 async fn login_page() -> Response {
-    match LoginPage.render() {
+    let page = LoginPage {
+        asset_version: &ASSET_VERSION,
+    };
+    match page.render() {
         Ok(html) => Html(html).into_response(),
         Err(_) => page_error(),
     }

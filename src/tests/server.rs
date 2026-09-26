@@ -305,3 +305,58 @@ async fn rejections_name_the_part_of_the_request_that_was_invalid() {
         "Invalid JSON request body"
     );
 }
+fn cache_control(response: &Response) -> &str {
+    response.headers()["cache-control"].to_str().unwrap()
+}
+
+#[tokio::test]
+async fn versioned_assets_are_cacheable_and_pages_are_not() {
+    let h = Harness::new().await;
+    let version = crate::admin::ASSET_VERSION.as_str();
+    let login = h.get("/admin/login", &[]).await;
+    assert_eq!(cache_control(&login), "no-store");
+    let html = text_body(login).await;
+    for asset in ["/assets/app.js", "/assets/app.css"] {
+        assert!(html.contains(&format!("{asset}?v={version}\"")), "{html}");
+        let versioned = h.get(&format!("{asset}?v={version}"), &[]).await;
+        assert_eq!(versioned.status(), 200);
+        assert_eq!(
+            cache_control(&versioned),
+            "public, max-age=31536000, immutable"
+        );
+        // The CSP and other defaults still apply to assets.
+        assert_eq!(versioned.headers()["x-content-type-options"], "nosniff");
+        for stale in [asset.to_owned(), format!("{asset}?v=old")] {
+            assert_eq!(
+                cache_control(&h.get(&stale, &[]).await),
+                "no-cache",
+                "{stale}"
+            );
+        }
+    }
+    let cookie = h.session().await.cookie.clone();
+    let dashboard = h.get("/admin", &[("cookie", cookie.as_str())]).await;
+    assert_eq!(cache_control(&dashboard), "no-store");
+    assert!(
+        text_body(dashboard)
+            .await
+            .contains(&format!("app.js?v={version}"))
+    );
+    let api = h.admin("/admin/api/me", "GET", None).await;
+    assert_eq!(cache_control(&api), "no-store");
+    assert!(!api.headers().contains_key("strict-transport-security"));
+}
+
+#[tokio::test]
+async fn https_deployments_send_hsts() {
+    let h = Harness::new().await;
+    let (_, router) = h.variant(|state| state.config.secure_cookie = true);
+    for path in ["/healthz", "/admin/login", "/assets/app.css"] {
+        let response = send_to(&router, "GET", path, &[], Body::empty()).await;
+        assert_eq!(
+            response.headers()["strict-transport-security"],
+            "max-age=31536000",
+            "{path}"
+        );
+    }
+}
