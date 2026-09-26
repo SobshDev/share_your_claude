@@ -112,8 +112,8 @@ impl AppError {
             "The owner must reconnect Claude in the dashboard",
         )
     }
-    pub fn not_found() -> Self {
-        Self(StatusCode::NOT_FOUND, "not_found_error", "Not found")
+    pub fn not_found(message: &'static str) -> Self {
+        Self(StatusCode::NOT_FOUND, "not_found_error", message)
     }
 }
 

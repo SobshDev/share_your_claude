@@ -116,9 +116,6 @@ fn valid_label(value: &str) -> Result<String> {
     }
     Ok(value.to_owned())
 }
-fn not_found(message: &'static str) -> AppError {
-    AppError(StatusCode::NOT_FOUND, "not_found_error", message)
-}
 /// Rejects keys that do not exist or were revoked.
 async fn require_active_key<'e>(db: impl sqlx::SqliteExecutor<'e>, id: &str) -> Result<()> {
     let active: i64 =
@@ -164,7 +161,7 @@ async fn rename_person(
         .await?
         .rows_affected();
     if n == 0 {
-        return Err(not_found("Friend not found"));
+        return Err(AppError::not_found("Friend not found"));
     }
     Ok(StatusCode::NO_CONTENT)
 }
@@ -254,7 +251,7 @@ async fn revoke_key(
         .await?
         .rows_affected();
     if n == 0 {
-        return Err(not_found("Key not found"));
+        return Err(AppError::not_found("Key not found"));
     }
     Ok(StatusCode::NO_CONTENT)
 }

@@ -229,7 +229,7 @@ pub async fn complete(
                 ExchangeError::Failed => AppError::upstream(),
             })?;
     let encrypted = encrypt(&state.config.encryption_key, &tokens)?;
-    sqlx::query("INSERT INTO claude_credential VALUES(1,?,?,1,'connected') ON CONFLICT(id) DO UPDATE SET encrypted_tokens=excluded.encrypted_tokens,expires_at=excluded.expires_at,generation=generation+1,state='connected'")
+    sqlx::query("INSERT INTO claude_credential(id,encrypted_tokens,expires_at,generation,state) VALUES(1,?,?,1,'connected') ON CONFLICT(id) DO UPDATE SET encrypted_tokens=excluded.encrypted_tokens,expires_at=excluded.expires_at,generation=generation+1,state='connected'")
         .bind(encrypted).bind(expires).execute(&state.db).await?;
     Ok(Json(json!({"state":"connected"})))
 }

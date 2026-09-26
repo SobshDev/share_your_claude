@@ -83,7 +83,7 @@ pub fn app(state: Arc<AppState>) -> Router {
         .route("/readyz", get(admin::ready))
         .merge(friend_api)
         .merge(admin::routes(state.clone()))
-        .fallback(|| async { error::AppError::not_found() })
+        .fallback(|| async { error::AppError::not_found("Not found") })
         .layer(DefaultBodyLimit::max(DEFAULT_BODY_LIMIT_BYTES))
         .layer(middleware::from_fn(error::envelope_rejections))
         .layer(middleware::from_fn(|req: axum::extract::Request, next: middleware::Next| async move {

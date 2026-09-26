@@ -25,6 +25,8 @@ use subtle::ConstantTimeEq;
 
 /// `api_key.last_used_at` is refreshed at most once per this many seconds.
 const LAST_USED_RESOLUTION_SECS: i64 = 60;
+/// Lifetime of an admin session, in the database and in the cookie.
+const SESSION_TTL_SECS: i64 = 43200;
 
 pub fn random_secret() -> String {
     let mut bytes = [0; 32];
@@ -106,6 +108,20 @@ pub fn cookie_name(state: &AppState) -> &'static str {
     } else {
         "router_session"
     }
+}
+
+/// The `Set-Cookie` value that stores `value` as the admin session for `max_age` seconds.
+/// An empty value with `max_age` 0 clears the cookie.
+fn session_cookie(state: &AppState, value: &str, max_age: i64) -> String {
+    let secure = if state.config.secure_cookie {
+        "; Secure"
+    } else {
+        ""
+    };
+    format!(
+        "{}={value}; Path=/; HttpOnly; SameSite=Strict; Max-Age={max_age}{secure}",
+        cookie_name(state)
+    )
 }
 
 pub fn session_token(headers: &HeaderMap, state: &AppState) -> Result<String> {
@@ -369,20 +385,12 @@ pub async fn login(
     )
     .bind(hash(&token))
     .bind(&csrf)
-    .bind(db::epoch() + 43200)
+    .bind(db::epoch() + SESSION_TTL_SECS)
     .bind(&fingerprint)
     .execute(&mut *tx)
     .await?;
     tx.commit().await?;
-    let secure = if state.config.secure_cookie {
-        "; Secure"
-    } else {
-        ""
-    };
-    let cookie = format!(
-        "{}={token}; Path=/; HttpOnly; SameSite=Strict; Max-Age=43200{secure}",
-        cookie_name(&state)
-    );
+    let cookie = session_cookie(&state, &token, SESSION_TTL_SECS);
     Ok((
         [(header::SET_COOKIE, cookie)],
         Json(json!({"csrf_token":csrf})),
@@ -396,15 +404,7 @@ pub async fn logout(State(state): State<Arc<AppState>>, headers: HeaderMap) -> R
         .bind(hash(&token))
         .execute(&state.db)
         .await?;
-    let secure = if state.config.secure_cookie {
-        "; Secure"
-    } else {
-        ""
-    };
-    let cookie = format!(
-        "{}=; Path=/; HttpOnly; SameSite=Strict; Max-Age=0{secure}",
-        cookie_name(&state)
-    );
+    let cookie = session_cookie(&state, "", 0);
     Ok(([(header::SET_COOKIE, cookie)], StatusCode::NO_CONTENT).into_response())
 }
 
