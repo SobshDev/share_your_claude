@@ -54,7 +54,7 @@ pub fn app(state: Arc<AppState>) -> Router {
         .route("/v1/messages/count_tokens", post(proxy::count_tokens))
         .route("/v1/models", get(proxy::models))
         .merge(admin::routes(state.clone()))
-        .layer(DefaultBodyLimit::max(32 * 1024 * 1024))
+        .layer(DefaultBodyLimit::max(proxy::MAX_REQUEST_BODY_BYTES))
         .layer(middleware::from_fn(|req: axum::extract::Request, next: middleware::Next| async move {
             let mut response = next.run(req).await;
             let h = response.headers_mut();
