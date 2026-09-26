@@ -296,24 +296,49 @@ function renderPeople() {
             );
           }),
         );
-        actions.append(
-          button(
-            "Revoke",
-            async (control) => {
-              if (control.dataset.confirm !== "yes") {
-                control.dataset.confirm = "yes";
-                control.textContent = "Confirm revoke";
-                return;
-              }
-              await api(`keys/${key.id}`, "DELETE");
-              await loadAccess();
-              notice(
-                "Key revoked. Existing requests can finish; new requests are blocked.",
-              );
-            },
-            "secondary danger",
-          ),
+        // Revocation cannot be undone, so it needs a deliberate second click.
+        let revokeTimer;
+        const prompt = () =>
+          notice(
+            `Press “Confirm revoke” to revoke ${key.label}. This cannot be undone.`,
+          );
+        const disarm = (control) => {
+          clearTimeout(revokeTimer);
+          delete control.dataset.confirm;
+          delete control.dataset.armedAt;
+          control.textContent = "Revoke";
+        };
+        const revoke = button(
+          "Revoke",
+          async (control) => {
+            if (control.dataset.confirm !== "yes") {
+              control.dataset.confirm = "yes";
+              control.dataset.armedAt = String(Date.now());
+              control.textContent = "Confirm revoke";
+              revokeTimer = setTimeout(() => disarm(control), 5000);
+              prompt();
+              return;
+            }
+            // The second click of a double-click is not a confirmation.
+            if (Date.now() - Number(control.dataset.armedAt) < 600) {
+              prompt();
+              return;
+            }
+            disarm(control);
+            await api(`keys/${key.id}`, "DELETE");
+            await loadAccess();
+            notice(
+              "Key revoked. Existing requests can finish; new requests are blocked.",
+            );
+          },
+          "secondary danger",
         );
+        // run() disables the button while busy, which can blur it; ignore that.
+        revoke.addEventListener("blur", () => {
+          if (!revoke.disabled && revoke.dataset.confirm === "yes")
+            disarm(revoke);
+        });
+        actions.append(revoke);
       }
       row.append(identity, meta, actions);
       section.append(row);
