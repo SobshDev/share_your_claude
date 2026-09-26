@@ -5,6 +5,9 @@ edition = "2024"
 rust-version = "1.88"
 license = "MIT"
 description = "A private Claude gateway with per-key model access and usage accounting"
+repository = "https://github.com/SobshDev/shared_router"
+readme = "README.md"
+publish = false
 
 [dependencies]
 anyhow = "1"
