@@ -17,7 +17,7 @@ use axum::{
     routing::{get, post},
 };
 use std::{collections::HashMap, sync::Arc};
-use tokio::sync::{Mutex, Semaphore};
+use tokio::sync::{Mutex, Semaphore, watch};
 
 /// Body limit for routes that do not declare their own.
 const DEFAULT_BODY_LIMIT_BYTES: usize = 64 * 1024;
@@ -29,6 +29,17 @@ pub const PER_KEY_CONCURRENCY: usize = 3;
 /// Token counts use their own small pool so they never wait behind long streams.
 pub const COUNT_TOKENS_CONCURRENCY: usize = 4;
 
+/// Where the server is in its lifecycle. `main` advances it on a shutdown signal.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Phase {
+    /// Accepting and serving requests.
+    Serving,
+    /// A shutdown signal arrived: `/readyz` reports 503 while open requests finish.
+    Draining,
+    /// The drain period is over: open streams record their outcome as interrupted and end.
+    Stopping,
+}
+
 pub struct AppState {
     pub config: config::Config,
     pub db: sqlx::SqlitePool,
@@ -38,6 +49,8 @@ pub struct AppState {
     pub count_admission: Arc<Semaphore>,
     /// Per-key admission, keyed by key id. Idle entries are pruned on use.
     pub key_admission: std::sync::Mutex<HashMap<String, Arc<Semaphore>>>,
+    /// Lifecycle phase. Subscribe to wait for a change; `main` sends the transitions.
+    pub phase: watch::Sender<Phase>,
     // Only tests inside this crate can replace destinations. No environment/config overrides.
     pub(crate) upstream: String,
     pub(crate) token_endpoint: String,
@@ -57,11 +70,17 @@ impl AppState {
             admission: Arc::new(Semaphore::new(GLOBAL_CONCURRENCY)),
             count_admission: Arc::new(Semaphore::new(COUNT_TOKENS_CONCURRENCY)),
             key_admission: std::sync::Mutex::new(HashMap::new()),
+            phase: watch::Sender::new(Phase::Serving),
             upstream: "https://api.anthropic.com".into(),
             token_endpoint: "https://api.anthropic.com/v1/oauth/token".into(),
             client_send_timeout: proxy::CLIENT_SEND_TIMEOUT,
             max_stream_duration: proxy::MAX_STREAM_DURATION,
         }))
+    }
+
+    /// The current lifecycle phase.
+    pub fn phase(&self) -> Phase {
+        *self.phase.borrow()
     }
 }
 

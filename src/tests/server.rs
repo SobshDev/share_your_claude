@@ -141,3 +141,51 @@ async fn a_stream_past_the_duration_limit_ends_with_a_timeout_error() {
     .await
     .unwrap();
 }
+#[tokio::test]
+async fn readiness_fails_once_shutdown_begins() {
+    let h = Harness::new().await;
+    assert_eq!(h.get("/readyz", &[]).await.status(), 200);
+    h.state.phase.send_replace(crate::Phase::Draining);
+    let response = h.get("/readyz", &[]).await;
+    assert_eq!(response.status(), 503);
+    assert_eq!(
+        json_body(response).await["error"]["type"],
+        "overloaded_error"
+    );
+    // Open requests still complete while draining.
+    let response = h
+        .request("/v1/messages", &h.key, message("hello", false))
+        .await;
+    assert_eq!(response.status(), 200);
+}
+
+#[tokio::test]
+async fn stopping_interrupts_open_streams_and_keeps_their_usage() {
+    let h = Harness::new().await;
+    let response = h
+        .request("/v1/messages", &h.key, message("disconnect", true))
+        .await;
+    assert_eq!(response.status(), 200);
+    let mut body = response.into_body().into_data_stream();
+    let first = body.next().await.unwrap().unwrap();
+    assert!(String::from_utf8_lossy(&first).contains("message_start"));
+    h.state.phase.send_replace(crate::Phase::Stopping);
+    let mut rest = String::new();
+    tokio::time::timeout(Duration::from_secs(5), async {
+        while let Some(chunk) = body.next().await {
+            rest.push_str(&String::from_utf8_lossy(&chunk.unwrap()));
+        }
+    })
+    .await
+    .unwrap();
+    assert!(rest.contains("event: error"), "{rest}");
+    assert_eq!(settled(&h).await, ("interrupted".into(), Some(200)));
+    let (usage, input, finished): (String, Option<i64>, Option<String>) =
+        sqlx::query_as("SELECT usage_state,input_tokens,finished_at FROM request_usage")
+            .fetch_one(&h.state.db)
+            .await
+            .unwrap();
+    assert_eq!(usage, "partial");
+    assert!(input.is_some());
+    assert!(finished.is_some());
+}

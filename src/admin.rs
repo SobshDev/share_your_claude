@@ -120,6 +120,14 @@ fn page_error() -> Response {
         .into_response()
 }
 pub async fn ready(State(state): State<Arc<AppState>>) -> Result<&'static str> {
+    // Load balancers stop routing here once shutdown has begun.
+    if state.phase() != crate::Phase::Serving {
+        return Err(AppError(
+            StatusCode::SERVICE_UNAVAILABLE,
+            "overloaded_error",
+            "The router is shutting down",
+        ));
+    }
     sqlx::query("SELECT 1").execute(&state.db).await?;
     Ok("ready")
 }

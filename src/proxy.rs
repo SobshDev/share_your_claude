@@ -511,6 +511,7 @@ async fn open_stream(
                 return;
             }
             Err(StreamError::TooLong) => ("timeout_error", "interrupted", 200),
+            Err(StreamError::Shutdown) => ("api_error", "interrupted", 200),
             Err(StreamError::Upstream(kind)) => (kind, "upstream_error", 200),
             Err(StreamError::Internal) => ("api_error", "interrupted", 500),
         };
@@ -610,6 +611,8 @@ enum StreamError {
     ClientStalled,
     /// The stream ran longer than [`MAX_STREAM_DURATION`].
     TooLong,
+    /// The server is stopping after its drain period.
+    Shutdown,
     /// The router itself failed, for example while writing a usage checkpoint.
     Internal,
 }
@@ -639,10 +642,16 @@ async fn stream_response(
     let mut progress = StreamProgress::default();
     let deadline = tokio::time::sleep(state.max_stream_duration);
     tokio::pin!(deadline);
+    let mut phase = state.phase.subscribe();
     loop {
         let chunk = tokio::select! {
             _ = tx.closed() => { guard.finish("interrupted",Some(200),false).await?; return Ok(()); }
             () = &mut deadline => return Err(StreamError::TooLong),
+            true = async { phase.wait_for(|p| *p == crate::Phase::Stopping).await.is_ok() } => {
+                // Keep the counts seen so far before the stream is recorded as interrupted.
+                progress.usage.checkpoint(&state.db, id, false).await?;
+                return Err(StreamError::Shutdown);
+            }
             chunk = stream.next() => chunk,
         };
         let Some(chunk) = chunk else {
