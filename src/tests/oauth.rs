@@ -2,7 +2,7 @@
 use super::*;
 use crate::oauth;
 
-#[tokio::test]
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn concurrent_requests_refresh_once_and_persist_rotation() {
     let h = Harness::new().await;
     sqlx::query("UPDATE claude_credential SET expires_at=0")
@@ -160,15 +160,19 @@ async fn stale_auth_failures_do_not_invalidate_a_new_login() {
 enum Reply {
     /// New access token and rotated refresh token.
     Rotate,
+    /// New access token without a refresh token.
+    NoRefreshToken,
     /// `invalid_grant` (400).
     Rejected,
     /// 503.
     Unavailable,
+    /// A reply with this `expires_in`.
+    ExpiresIn(i64),
     /// Waits for one `release` permit, then rotates.
     Hold,
 }
 
-/// A token endpoint with selectable replies.
+/// A token endpoint with selectable replies, plus a `/v1/models` that always answers 401.
 struct TokenMock {
     reply: std::sync::Mutex<Reply>,
     calls: AtomicUsize,
@@ -184,6 +188,10 @@ impl TokenMock {
         });
         let service = Router::new()
             .route("/v1/oauth/token", post(token_reply))
+            .route(
+                "/v1/models",
+                get(|| async { (StatusCode::UNAUTHORIZED, Json(json!({"error":{}}))) }),
+            )
             .with_state(mock.clone());
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
         let address = listener.local_addr().unwrap();
@@ -216,12 +224,16 @@ async fn token_reply(State(mock): State<Arc<TokenMock>>, Json(body): Json<Value>
     };
     match reply {
         Reply::Rotate => success(3600),
+        Reply::NoRefreshToken => {
+            Json(json!({"access_token":"refreshed-access","expires_in":3600})).into_response()
+        }
         Reply::Rejected => (
             StatusCode::BAD_REQUEST,
             Json(json!({"error":"invalid_grant"})),
         )
             .into_response(),
         Reply::Unavailable => StatusCode::SERVICE_UNAVAILABLE.into_response(),
+        Reply::ExpiresIn(expires_in) => success(expires_in),
         Reply::Hold => {
             mock.release.acquire().await.unwrap().forget();
             success(3600)
@@ -317,6 +329,69 @@ async fn transient_refresh_failure_keeps_using_an_unexpired_token() {
     }
     assert_eq!(mock.calls(), 1);
     assert_eq!(credential(&h).await.0, "connected");
+}
+
+#[tokio::test]
+async fn refresh_without_a_new_refresh_token_keeps_the_previous_one() {
+    let h = Harness::new().await;
+    let (mock, _, router) = with_token_mock(&h, Reply::NoRefreshToken).await;
+    expire_at(&h, 0).await;
+    assert_eq!(ask(&router, &h.key).await.status(), 200);
+    assert_eq!(mock.calls(), 1);
+    let (status, generation, tokens) = credential(&h).await;
+    assert_eq!((status.as_str(), generation), ("connected", 2));
+    assert_eq!(tokens.access_token, "refreshed-access");
+    assert_eq!(tokens.refresh_token, "owner-refresh");
+}
+
+#[tokio::test]
+async fn refresh_rejects_an_invalid_expires_in() {
+    let h = Harness::new().await;
+    expire_at(&h, 0).await;
+    for expires_in in [0, -60, 31_536_001] {
+        let (mock, _, router) = with_token_mock(&h, Reply::ExpiresIn(expires_in)).await;
+        assert_eq!(ask(&router, &h.key).await.status(), 502, "{expires_in}");
+        assert_eq!(mock.calls(), 1);
+        let (status, generation, tokens) = credential(&h).await;
+        assert_eq!((status.as_str(), generation), ("connected", 1));
+        assert_eq!(tokens.access_token, "owner-access-must-not-leak");
+    }
+}
+
+#[tokio::test]
+async fn refresh_does_not_overwrite_a_credential_replaced_meanwhile() {
+    let h = Harness::new().await;
+    let (mock, _, router) = with_token_mock(&h, Reply::Hold).await;
+    expire_at(&h, 0).await;
+    let request = tokio::spawn({
+        let router = router.clone();
+        let key = h.key.clone();
+        async move { ask(&router, &key).await.status() }
+    });
+    mock.wait_for_calls(1).await;
+    // The owner reconnects while the refresh is in flight.
+    let replacement = oauth::encrypt(
+        &h.state.config.encryption_key,
+        &oauth::Tokens {
+            access_token: "reconnected-access".into(),
+            refresh_token: "reconnected-refresh".into(),
+        },
+    )
+    .unwrap();
+    sqlx::query(
+        "UPDATE claude_credential SET encrypted_tokens=?,expires_at=?,generation=generation+1",
+    )
+    .bind(replacement)
+    .bind(db::epoch() + 3600)
+    .execute(&h.state.db)
+    .await
+    .unwrap();
+    mock.release.add_permits(1);
+    assert_eq!(request.await.unwrap(), 200);
+    assert_eq!(last_bearer(&h).await, "Bearer reconnected-access");
+    let (status, generation, tokens) = credential(&h).await;
+    assert_eq!((status.as_str(), generation), ("connected", 2));
+    assert_eq!(tokens.refresh_token, "reconnected-refresh");
 }
 
 #[tokio::test]
@@ -420,6 +495,17 @@ async fn rejected_authorization_code_keeps_the_credential() {
             .unwrap();
     assert_eq!(before, after);
     assert_eq!(credential(&h).await.0, "connected");
+}
+
+#[tokio::test]
+async fn catalog_refresh_unauthorized_requires_reconnect() {
+    let h = Harness::new().await;
+    let (_, base) = TokenMock::spawn(Reply::Rotate).await;
+    let (_, router) = h.variant(|state| state.upstream = base);
+    let session = sign_in(&router).await;
+    let response = admin_as(&router, &session, "POST", "/admin/api/models/refresh", None).await;
+    assert_eq!(response.status(), 503);
+    assert_eq!(credential(&h).await.0, "needs_reauth");
 }
 
 /// Collects formatted log output of the current thread.
