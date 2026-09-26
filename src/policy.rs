@@ -7,8 +7,51 @@ use serde_json::{Value, json};
 use sha2::{Digest, Sha256};
 use std::collections::{HashMap, HashSet};
 
+/// Catalog group of every Fable 5.1 variant. Also used by the seed migration.
+pub const FABLE_GROUP: &str = "fable-5.1";
+/// Token sequence that identifies Fable 5.1 in any spelling of an id, alias, group, or name.
+const FABLE_TOKENS: [&str; 3] = ["fable", "5", "1"];
+/// Denial returned whenever a request or admin action would expose Fable 5.1.
+pub const FABLE_RESERVED: &str = "Fable 5.1 is reserved for the owner";
+
+/// Whether a model id, alias, group, or display name refers to Fable 5.1.
+///
+/// Names are lowercased and split into runs of ASCII letters or digits, so separators such
+/// as `.`, `_`, `@`, `/`, and whitespace are equivalent, and so are letter-digit boundaries
+/// (`fable5.1`). Only a whole `fable 5 1` sequence matches: `claude-fable-5-10` does not.
+pub fn names_fable(name: &str) -> bool {
+    let lower = name.to_ascii_lowercase();
+    let mut tokens = Vec::new();
+    for part in lower.split(|c: char| !c.is_ascii_alphanumeric()) {
+        // `part` is ASCII, so byte offsets are character boundaries.
+        let mut start = 0;
+        for (i, pair) in part.as_bytes().windows(2).enumerate() {
+            if pair[0].is_ascii_digit() != pair[1].is_ascii_digit() {
+                tokens.push(&part[start..=i]);
+                start = i + 1;
+            }
+        }
+        if start < part.len() {
+            tokens.push(&part[start..]);
+        }
+    }
+    tokens
+        .windows(FABLE_TOKENS.len())
+        .any(|w| w == FABLE_TOKENS)
+}
+
+/// The single rule that keeps Fable 5.1 away from friend keys.
 pub fn blocked(id: &str, group: &str) -> bool {
-    group == "fable-5.1" || id == "claude-fable-5-1" || id.starts_with("claude-fable-5-1-")
+    names_fable(id) || names_fable(group)
+}
+
+/// Catalog group for a model discovered upstream.
+pub fn catalog_group(id: &str, display_name: &str) -> &'static str {
+    if blocked(id, "") || names_fable(display_name) {
+        FABLE_GROUP
+    } else {
+        "claude"
+    }
 }
 
 pub async fn resolve(state: &AppState, key_id: &str, requested: &str) -> Result<String> {
@@ -19,7 +62,7 @@ pub async fn resolve(state: &AppState, key_id: &str, requested: &str) -> Result<
     let id: String = row.get("id");
     let group: String = row.get("model_group");
     if blocked(&id, &group) {
-        return Err(AppError::forbidden("Fable 5.1 is reserved for the owner"));
+        return Err(AppError::forbidden(FABLE_RESERVED));
     }
     Ok(id)
 }

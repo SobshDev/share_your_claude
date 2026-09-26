@@ -15,7 +15,7 @@ use axum::{
 use serde::Deserialize;
 use serde_json::{Value, json};
 use sqlx::Row;
-use std::sync::Arc;
+use std::{collections::HashMap, sync::Arc};
 
 pub fn routes(state: Arc<AppState>) -> Router<Arc<AppState>> {
     let protected = Router::new()
@@ -108,6 +108,21 @@ fn valid_label(value: &str) -> Result<String> {
     }
     Ok(value.to_owned())
 }
+fn not_found(message: &'static str) -> AppError {
+    AppError(StatusCode::NOT_FOUND, "not_found_error", message)
+}
+/// Rejects keys that do not exist or were revoked.
+async fn require_active_key<'e>(db: impl sqlx::SqliteExecutor<'e>, id: &str) -> Result<()> {
+    let active: i64 =
+        sqlx::query_scalar("SELECT count(*) FROM api_key WHERE id=? AND revoked_at IS NULL")
+            .bind(id)
+            .fetch_one(db)
+            .await?;
+    if active == 0 {
+        return Err(AppError::bad("Choose an active key"));
+    }
+    Ok(())
+}
 async fn people(State(state): State<Arc<AppState>>) -> Result<Json<Value>> {
     let rows = sqlx::query("SELECT * FROM person ORDER BY created_at")
         .fetch_all(&state.db)
@@ -120,7 +135,7 @@ async fn create_person(
 ) -> Result<(StatusCode, Json<Value>)> {
     let name = valid_label(&input.name)?;
     let id = db::id();
-    sqlx::query("INSERT INTO person VALUES(?,?,?)")
+    sqlx::query("INSERT INTO person(id,name,created_at) VALUES(?,?,?)")
         .bind(&id)
         .bind(&name)
         .bind(db::now())
@@ -141,28 +156,27 @@ async fn rename_person(
         .await?
         .rows_affected();
     if n == 0 {
-        return Err(AppError(
-            StatusCode::NOT_FOUND,
-            "not_found_error",
-            "Friend not found",
-        ));
+        return Err(not_found("Friend not found"));
     }
     Ok(StatusCode::NO_CONTENT)
 }
 
 async fn keys(State(state): State<Arc<AppState>>) -> Result<Json<Value>> {
     let rows=sqlx::query("SELECT k.*,p.name FROM api_key k JOIN person p ON p.id=k.person_id ORDER BY k.created_at DESC").fetch_all(&state.db).await?;
-    let mut result = Vec::new();
-    for r in rows {
-        let id: String = r.get("id");
-        let grants: Vec<String> = sqlx::query_scalar(
-            "SELECT model_id FROM key_model_grant WHERE key_id=? ORDER BY model_id",
-        )
-        .bind(&id)
-        .fetch_all(&state.db)
-        .await?;
-        result.push(json!({"id":id,"person_id":r.get::<String,_>("person_id"),"person_name":r.get::<String,_>("name"),"label":r.get::<String,_>("label"),"prefix":r.get::<String,_>("prefix"),"created_at":r.get::<String,_>("created_at"),"last_used_at":r.get::<Option<String>,_>("last_used_at"),"revoked_at":r.get::<Option<String>,_>("revoked_at"),"models":grants}));
+    let mut grants: HashMap<String, Vec<String>> = HashMap::new();
+    for (key, model) in sqlx::query_as::<_, (String, String)>(
+        "SELECT key_id,model_id FROM key_model_grant ORDER BY key_id,model_id",
+    )
+    .fetch_all(&state.db)
+    .await?
+    {
+        grants.entry(key).or_default().push(model);
     }
+    let result: Vec<Value> = rows.iter().map(|r| {
+        let id: String = r.get("id");
+        let models = grants.remove(&id).unwrap_or_default();
+        json!({"id":id,"person_id":r.get::<String,_>("person_id"),"person_name":r.get::<String,_>("name"),"label":r.get::<String,_>("label"),"prefix":r.get::<String,_>("prefix"),"created_at":r.get::<String,_>("created_at"),"last_used_at":r.get::<Option<String>,_>("last_used_at"),"revoked_at":r.get::<Option<String>,_>("revoked_at"),"models":models})
+    }).collect();
     Ok(Json(json!(result)))
 }
 #[derive(Deserialize)]
@@ -199,8 +213,21 @@ async fn create_key(
     .bind(db::now())
     .execute(&mut *tx)
     .await?;
-    sqlx::query("INSERT INTO key_model_grant SELECT ?,id FROM model WHERE enabled=1 AND reviewed_at IS NOT NULL AND model_group!='fable-5.1' AND id!='claude-fable-5-1' AND id NOT LIKE 'claude-fable-5-1-%'")
-        .bind(&id).execute(&mut *tx).await?;
+    let enabled =
+        sqlx::query("SELECT id,model_group FROM model WHERE enabled=1 AND reviewed_at IS NOT NULL")
+            .fetch_all(&mut *tx)
+            .await?;
+    for row in &enabled {
+        let model: &str = row.get("id");
+        if policy::blocked(model, row.get("model_group")) {
+            continue;
+        }
+        sqlx::query("INSERT INTO key_model_grant(key_id,model_id) VALUES(?,?)")
+            .bind(&id)
+            .bind(model)
+            .execute(&mut *tx)
+            .await?;
+    }
     tx.commit().await?;
     Ok((
         StatusCode::CREATED,
@@ -218,11 +245,7 @@ async fn revoke_key(
         .await?
         .rows_affected();
     if n == 0 {
-        return Err(AppError(
-            StatusCode::NOT_FOUND,
-            "not_found_error",
-            "Key not found",
-        ));
+        return Err(not_found("Key not found"));
     }
     Ok(StatusCode::NO_CONTENT)
 }
@@ -240,16 +263,7 @@ async fn set_grants(
         return Err(AppError::bad("Too many models"));
     }
     let mut tx = state.db.begin().await?;
-    if sqlx::query_scalar::<_, i64>(
-        "SELECT count(*) FROM api_key WHERE id=? AND revoked_at IS NULL",
-    )
-    .bind(&id)
-    .fetch_one(&mut *tx)
-    .await?
-        == 0
-    {
-        return Err(AppError::bad("Choose an active key"));
-    }
+    require_active_key(&mut *tx, &id).await?;
     for model in &input.models {
         let group: Option<String> = sqlx::query_scalar(
             "SELECT model_group FROM model WHERE id=? AND enabled=1 AND reviewed_at IS NOT NULL",
@@ -263,12 +277,14 @@ async fn set_grants(
             ));
         }
     }
-    sqlx::query("DELETE FROM key_model_grant WHERE key_id=?")
+    // The form lists only enabled models, so only their grants are replaced. Grants for
+    // disabled models stay and take effect again when the model is re-enabled.
+    sqlx::query("DELETE FROM key_model_grant WHERE key_id=? AND model_id IN (SELECT id FROM model WHERE enabled=1 AND reviewed_at IS NOT NULL)")
         .bind(&id)
         .execute(&mut *tx)
         .await?;
     for model in input.models {
-        sqlx::query("INSERT OR IGNORE INTO key_model_grant VALUES(?,?)")
+        sqlx::query("INSERT OR IGNORE INTO key_model_grant(key_id,model_id) VALUES(?,?)")
             .bind(&id)
             .bind(model)
             .execute(&mut *tx)
@@ -281,16 +297,7 @@ async fn client_config(
     State(state): State<Arc<AppState>>,
     Path(id): Path<String>,
 ) -> Result<Json<Value>> {
-    if sqlx::query_scalar::<_, i64>(
-        "SELECT count(*) FROM api_key WHERE id=? AND revoked_at IS NULL",
-    )
-    .bind(&id)
-    .fetch_one(&state.db)
-    .await?
-        == 0
-    {
-        return Err(AppError::bad("Choose an active key"));
-    }
+    require_active_key(&state.db, &id).await?;
     let rows=sqlx::query("SELECT m.id,m.model_group FROM model m JOIN key_model_grant g ON m.id=g.model_id WHERE g.key_id=? AND m.enabled=1 AND m.reviewed_at IS NOT NULL ORDER BY m.id").bind(&id).fetch_all(&state.db).await?;
     let models: Vec<String> = rows
         .iter()
@@ -343,11 +350,15 @@ async fn refresh_models(State(state): State<Arc<AppState>>) -> Result<Json<Value
                 .get("id")
                 .and_then(Value::as_str)
                 .ok_or_else(AppError::upstream)?;
+            // Variant spellings (`.`, `_`, `@`, uppercase) are kept so that policy can file
+            // them under the blocked group instead of silently dropping them.
             if id.len() > 150
-                || !id.starts_with("claude-")
+                || !id
+                    .get(..7)
+                    .is_some_and(|p| p.eq_ignore_ascii_case("claude-"))
                 || !id
                     .bytes()
-                    .all(|c| c.is_ascii_lowercase() || c.is_ascii_digit() || c == b'-')
+                    .all(|c| c.is_ascii_alphanumeric() || b"-._@".contains(&c))
             {
                 continue;
             }
@@ -380,13 +391,20 @@ async fn refresh_models(State(state): State<Arc<AppState>>) -> Result<Json<Value
     }
     let mut tx = state.db.begin().await?;
     for (id, name) in &candidates {
-        let group = if policy::blocked(id, "") {
-            "fable-5.1"
+        let group = policy::catalog_group(id, name);
+        // An existing row keeps its reviewed group unless policy now blocks the model; then it
+        // moves to the blocked group and is disabled.
+        let sql = if group == policy::FABLE_GROUP {
+            "INSERT INTO model(id,display_name,model_group) VALUES(?,?,?) ON CONFLICT(id) DO UPDATE SET display_name=excluded.display_name,model_group=excluded.model_group,enabled=0"
         } else {
-            "claude"
+            "INSERT INTO model(id,display_name,model_group) VALUES(?,?,?) ON CONFLICT(id) DO UPDATE SET display_name=excluded.display_name"
         };
-        sqlx::query("INSERT INTO model(id,display_name,model_group) VALUES(?,?,?) ON CONFLICT(id) DO UPDATE SET display_name=excluded.display_name")
-            .bind(id).bind(name).bind(group).execute(&mut *tx).await?;
+        sqlx::query(sql)
+            .bind(id)
+            .bind(name)
+            .bind(group)
+            .execute(&mut *tx)
+            .await?;
     }
     tx.commit().await?;
     Ok(Json(
@@ -410,7 +428,7 @@ async fn review_model(
     let group =
         group.ok_or_else(|| AppError::bad("Refresh the catalog to discover this model first"))?;
     if input.enabled && policy::blocked(&id, &group) {
-        return Err(AppError::forbidden("Fable 5.1 is reserved for the owner"));
+        return Err(AppError::forbidden(policy::FABLE_RESERVED));
     }
     sqlx::query("UPDATE model SET enabled=?,reviewed_at=? WHERE id=?")
         .bind(input.enabled)
@@ -454,7 +472,7 @@ async fn add_alias(
     if occupied != 0 {
         return Err(AppError::bad("That alias is already in use"));
     }
-    sqlx::query("INSERT INTO model_alias VALUES(?,?)")
+    sqlx::query("INSERT INTO model_alias(alias,model_id) VALUES(?,?)")
         .bind(alias)
         .bind(id)
         .execute(&mut *tx)
