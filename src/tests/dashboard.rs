@@ -65,6 +65,11 @@ async fn assets_are_served_with_their_content_types() {
     for (path, content_type, body) in [
         ("/assets/app.js", JS, include_str!("../../static/app.js")),
         (
+            "/assets/common.js",
+            JS,
+            include_str!("../../static/common.js"),
+        ),
+        (
             "/assets/analytics.js",
             JS,
             include_str!("../../static/analytics.js"),

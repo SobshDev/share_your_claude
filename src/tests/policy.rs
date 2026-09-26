@@ -139,7 +139,7 @@ async fn catalog_refresh_files_every_fable_spelling_under_the_blocked_group() {
             .execute(&h.state.db)
             .await
             .unwrap();
-        grant(&h.state, &h.key_id, id).await;
+        force_grant(&h, id).await;
         let mut body = message("hello", false);
         body["model"] = id.into();
         let r = h.request("/v1/messages", &h.key, body).await;
@@ -168,7 +168,7 @@ async fn policy_blocks_before_upstream_and_models_are_filtered() {
         .execute(&h.state.db)
         .await
         .unwrap();
-    grant(&h.state, &h.key_id, "claude-fable-5-1").await;
+    force_grant(&h, "claude-fable-5-1").await;
     sqlx::query(
         "INSERT INTO model_alias(alias,model_id) VALUES('fable-latest','claude-fable-5-1')",
     )
@@ -234,6 +234,16 @@ fn builtin_tools_keep_their_names_through_history() {
 /// Enabled, reviewed, granted Fable rows, one per `blocked` branch, each with an alias:
 /// the exact id, a dated id filed under an ordinary group, and an ordinary id in the Fable
 /// group. Returns every name a friend could send.
+/// Grants a model even if it is Fable, by dropping the guard triggers from migration 0005 to
+/// simulate an older or tampered database. The router must still refuse the model.
+async fn force_grant(h: &Harness, model: &str) {
+    sqlx::query("DROP TRIGGER IF EXISTS key_model_grant_no_fable_insert")
+        .execute(&h.state.db)
+        .await
+        .unwrap();
+    grant(&h.state, &h.key_id, model).await;
+}
+
 async fn force_fable_rows(h: &Harness) -> Vec<&'static str> {
     for (id, group) in [
         ("claude-fable-5-1", policy::FABLE_GROUP),
@@ -248,7 +258,7 @@ async fn force_fable_rows(h: &Harness) -> Vec<&'static str> {
             .execute(&h.state.db)
             .await
             .unwrap();
-        grant(&h.state, &h.key_id, id).await;
+        force_grant(h, id).await;
         sqlx::query("INSERT INTO model_alias(alias,model_id) VALUES(?,?)")
             .bind(format!("{id}-alias"))
             .bind(id)

@@ -52,6 +52,15 @@ pub fn routes(state: Arc<AppState>) -> Router<Arc<AppState>> {
             }),
         )
         .route(
+            "/assets/common.js",
+            get(|| async {
+                (
+                    [(header::CONTENT_TYPE, "text/javascript; charset=utf-8")],
+                    include_str!("../static/common.js"),
+                )
+            }),
+        )
+        .route(
             "/assets/analytics.js",
             get(|| async {
                 (
