@@ -1,3 +1,4 @@
+use anyhow::Context;
 use argon2::{Argon2, PasswordHasher, password_hash::SaltString};
 use axum::{
     body::Body,
@@ -8,10 +9,15 @@ use axum::{
 };
 use base64::{Engine, engine::general_purpose::STANDARD};
 use rand::{RngCore, rngs::OsRng};
-use shared_router::{AppState, config::Config, db};
+use shared_router::{
+    AppState,
+    config::{self, Config},
+    db,
+};
 use std::{
     future::IntoFuture,
-    io::{self, Read},
+    io::{self, IsTerminal, Read},
+    net::{IpAddr, Ipv4Addr, Ipv6Addr},
     sync::{
         Arc,
         atomic::{AtomicBool, Ordering},
@@ -25,6 +31,20 @@ use std::{
 const DRAIN_PERIOD: Duration = Duration::from_secs(20);
 /// Upper bound for closing the database pool once serving has stopped.
 const CLOSE_TIMEOUT: Duration = Duration::from_secs(5);
+/// Upper bound for the `healthcheck` command's readiness request.
+const HEALTHCHECK_TIMEOUT: Duration = Duration::from_secs(5);
+
+const USAGE: &str = "\
+Usage: shared-router [COMMAND]
+
+Commands:
+  serve          Run the router (the default when no command is given)
+  generate-key   Print a new random ENCRYPTION_KEY
+  hash-password  Read a password from standard input and print its ADMIN_PASSWORD_HASH
+  backup PATH    Write a consistent copy of the database to a new file at PATH
+  healthcheck    Exit 0 if the local router reports ready, 1 otherwise
+  help           Print this help (also -h, --help)
+";
 
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
@@ -34,43 +54,99 @@ async fn main() -> anyhow::Result<()> {
                 .unwrap_or_else(|_| "shared_router=info".into()),
         )
         .init();
-    match std::env::args().nth(1).as_deref() {
-        Some("generate-key") => {
-            let mut key = zeroize::Zeroizing::new([0u8; 32]);
-            OsRng.fill_bytes(key.as_mut());
-            println!("{}", STANDARD.encode(*key));
-            return Ok(());
+    let args: Option<Vec<String>> = std::env::args_os()
+        .skip(1)
+        .map(|arg| arg.into_string().ok())
+        .collect();
+    let args = args.unwrap_or_default();
+    match args
+        .iter()
+        .map(String::as_str)
+        .collect::<Vec<_>>()
+        .as_slice()
+    {
+        [] | ["serve"] => serve().await,
+        ["generate-key"] => {
+            generate_key();
+            Ok(())
         }
-        Some("hash-password") => {
-            let mut password = zeroize::Zeroizing::new(String::new());
-            io::stdin().read_to_string(&mut password)?;
-            let password = password.trim_end_matches(['\r', '\n']);
-            anyhow::ensure!(
-                password.len() >= 12 && password.len() <= 1024,
-                "Use a password of 12–1024 bytes"
-            );
-            let hash = Argon2::default()
-                .hash_password(password.as_bytes(), &SaltString::generate(&mut OsRng))
-                .map_err(|_| anyhow::anyhow!("Could not hash password"))?
-                .to_string();
-            println!("{hash}");
-            return Ok(());
+        ["hash-password"] => hash_password(),
+        ["backup", destination] if !destination.starts_with('-') => backup(destination).await,
+        ["healthcheck"] => healthcheck().await,
+        ["help" | "-h" | "--help"] => {
+            print!("{USAGE}");
+            Ok(())
         }
-        Some("backup") => {
-            let destination = std::env::args().nth(2).ok_or_else(|| {
-                anyhow::anyhow!("usage: shared-router backup /path/to/new-backup.sqlite")
-            })?;
-            let url = std::env::var("DATABASE_URL")
-                .unwrap_or_else(|_| shared_router::config::DEFAULT_DATABASE_URL.into());
-            db::backup(&url, std::path::Path::new(&destination)).await?;
-            println!("Database backup created");
-            return Ok(());
+        _ => {
+            eprint!("{USAGE}");
+            std::process::exit(2);
         }
-        None | Some("serve") => (),
-        _ => anyhow::bail!(
-            "usage: shared-router [serve | generate-key | hash-password | backup PATH]"
-        ),
     }
+}
+
+fn generate_key() {
+    let mut key = zeroize::Zeroizing::new([0u8; 32]);
+    OsRng.fill_bytes(key.as_mut());
+    println!("{}", STANDARD.encode(*key));
+}
+
+fn hash_password() -> anyhow::Result<()> {
+    // Reading from a terminal would echo the password, so only piped input is accepted.
+    anyhow::ensure!(
+        !io::stdin().is_terminal(),
+        "hash-password reads the password from standard input and does not accept typed input, \
+         which would be echoed. Pipe it in instead, for example: \
+         printf '%s' \"$router_password\" | shared-router hash-password"
+    );
+    let mut password = zeroize::Zeroizing::new(String::new());
+    io::stdin().read_to_string(&mut password)?;
+    let password = password.trim_end_matches(['\r', '\n']);
+    anyhow::ensure!(
+        password.len() >= 12 && password.len() <= 1024,
+        "Use a password of 12–1024 bytes"
+    );
+    let hash = Argon2::default()
+        .hash_password(password.as_bytes(), &SaltString::generate(&mut OsRng))
+        .map_err(|_| anyhow::anyhow!("Could not hash password"))?
+        .to_string();
+    println!("{hash}");
+    Ok(())
+}
+
+async fn backup(destination: &str) -> anyhow::Result<()> {
+    let url = std::env::var("DATABASE_URL").unwrap_or_else(|_| config::DEFAULT_DATABASE_URL.into());
+    db::backup(&url, std::path::Path::new(destination)).await?;
+    println!("Database backup created");
+    Ok(())
+}
+
+/// Container health probe: requests `/readyz` from the router on its configured port.
+async fn healthcheck() -> anyhow::Result<()> {
+    let mut address = config::bind_address(std::env::var("BIND_ADDRESS").ok())?;
+    if address.ip().is_unspecified() {
+        let loopback: IpAddr = if address.is_ipv4() {
+            Ipv4Addr::LOCALHOST.into()
+        } else {
+            Ipv6Addr::LOCALHOST.into()
+        };
+        address.set_ip(loopback);
+    }
+    let client = reqwest::Client::builder()
+        .no_proxy()
+        .redirect(reqwest::redirect::Policy::none())
+        .timeout(HEALTHCHECK_TIMEOUT)
+        .build()?;
+    let status = client
+        .get(format!("http://{address}/readyz"))
+        .send()
+        .await
+        .with_context(|| format!("Could not reach the router at {address}"))?
+        .status();
+    anyhow::ensure!(status.is_success(), "The router is not ready ({status})");
+    Ok(())
+}
+
+async fn serve() -> anyhow::Result<()> {
     let config = Config::from_env()?;
     let pool = db::connect(&config.database_url).await?;
     let address = config.bind;
