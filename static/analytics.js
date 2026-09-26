@@ -1,4 +1,4 @@
-"use strict";
+import { $, api, button, node, number, run, state } from "./common.js";
 let analyticsReport = null;
 let analyticsParams = null;
 let analyticsVersion = 0;
@@ -17,20 +17,33 @@ function populateFilter(id, entries, placeholder) {
   }
   if ([...select.options].some((option) => option.value === previous)) select.value = previous;
 }
-function updateUsageFilters() {
+export function updateUsageFilters() {
+  const { people, models } = state;
   populateFilter("usage-person", people.map((p) => ({ id: p.id, label: p.name })), "All users");
   // Retain historical/unresolved models discovered in reports, even if absent from the catalog.
   const known = new Map([...$("usage-model").options].filter((o) => o.value).map((o) => [o.value, o.textContent]));
   for (const model of models) known.set(model.id, model.display_name);
   populateFilter("usage-model", [...known].map(([id, label]) => ({ id, label })), "All models");
 }
-async function selectUsagePerson(id) {
+export async function selectUsagePerson(id) {
   $("usage-person").value = id;
   location.hash = "overview";
   await loadUsage();
+  $("scope-title").focus({ preventScroll: true });
   $("scope-title").scrollIntoView({ block: "start" });
 }
-function initializeAnalytics() {
+// Keep focus on the pagination controls; move it only when the pressed one
+// becomes disabled at the first or last page.
+function pageHistory(control, offset) {
+  const hadFocus = document.activeElement === control;
+  return run(async () => {
+    await loadUsage(offset());
+    if (!hadFocus || !control.disabled) return;
+    const other = $(control.id === "history-next" ? "history-prev" : "history-next");
+    (other.disabled ? $("history-title") : other).focus();
+  });
+}
+export function initializeAnalytics() {
   let chartWidth = 0;
   new ResizeObserver(([entry]) => {
     const width = Math.round(entry.contentRect.width);
@@ -41,8 +54,8 @@ function initializeAnalytics() {
   }).observe($("time-chart"));
   $("group-by").addEventListener("change", () => analyticsReport && renderLedger());
   $("chart-metric").addEventListener("change", () => analyticsReport && renderCharts());
-  $("history-prev").addEventListener("click", () => run(() => loadUsage(Math.max(0, analyticsReport.offset - 50))));
-  $("history-next").addEventListener("click", () => run(() => loadUsage(analyticsReport.offset + 50)));
+  $("history-prev").addEventListener("click", (event) => pageHistory(event.currentTarget, () => Math.max(0, analyticsReport.offset - 50)));
+  $("history-next").addEventListener("click", (event) => pageHistory(event.currentTarget, () => analyticsReport.offset + 50));
   document.querySelectorAll("[data-days]").forEach((control) => control.addEventListener("click", () => run(async () => {
     const end = new Date(), start = new Date(end);
     start.setUTCDate(start.getUTCDate() - Number(control.dataset.days) + 1);
@@ -51,14 +64,13 @@ function initializeAnalytics() {
     await loadUsage();
   }, control)));
 }
-async function loadUsage(offset = null) {
+export async function loadUsage(offset = null) {
   const version = ++analyticsVersion;
+  $("analytics-status").classList.remove("sr-only");
   $("analytics-status").textContent = "Loading usage…";
-  $("analytics-status").hidden = false;
-  $("analytics-content").hidden = true;
+  // Earlier results stay in place (dimmed while busy) so focus and scroll
+  // position survive; the block is hidden only before the first report.
   $("page-overview").setAttribute("aria-busy", "true");
-  $("history-prev").disabled = true;
-  $("history-next").disabled = true;
   try {
     let params;
     if (offset !== null && analyticsParams) params = new URLSearchParams(analyticsParams);
@@ -84,9 +96,14 @@ async function loadUsage(offset = null) {
     }
     $("analytics-content").hidden = false;
     renderAnalytics();
-    $("analytics-status").hidden = true;
+    // Keep the live region in the accessibility tree; announce the result once.
+    $("analytics-status").textContent = offset === null ? `Usage loaded: ${number(report.total[0].requests)} requests in this selection.` : `Request history: ${$("history-caption").textContent}.`;
+    $("analytics-status").classList.add("sr-only");
   } catch (error) {
-    if (version === analyticsVersion) $("analytics-status").textContent = `Could not load usage. ${error.message} Apply filters or refresh to retry.`;
+    if (version === analyticsVersion) {
+      $("analytics-status").textContent = `Could not load usage. ${error.message} Apply filters or refresh to retry.`;
+      $("analytics-content").hidden = true;
+    }
     throw error;
   } finally {
     if (version === analyticsVersion) $("page-overview").setAttribute("aria-busy", "false");
@@ -95,7 +112,7 @@ async function loadUsage(offset = null) {
 function renderAnalytics() {
   const report = analyticsReport, total = report.total[0];
   const personId = analyticsParams.get("person_id");
-  $("scope-title").textContent = personId ? people.find((p) => p.id === personId)?.name || "Selected user" : "All users";
+  $("scope-title").textContent = personId ? state.people.find((p) => p.id === personId)?.name || "Selected user" : "All users";
   const through = new Date(new Date(report.to).getTime() - 1).toISOString().slice(0, 10);
   $("scope-period").textContent = `${report.from.slice(0, 10)} – ${through} · UTC${analyticsParams.get("model") ? ` · ${analyticsParams.get("model")}` : " · All models"}`;
   const summary = $("usage-summary");
@@ -160,7 +177,7 @@ function shareChart(id, entries, metric, action) {
 }
 function renderCharts() {
   const report = analyticsReport, metric = $("chart-metric").value, total = report.total[0];
-  shareChart("model-chart", report.model, metric, async (id) => { $("usage-model").value = id; await loadUsage(); });
+  shareChart("model-chart", report.model, metric, async (id) => { $("usage-model").value = id; await loadUsage(); $("scope-title").focus(); });
   shareChart("person-chart", report.person, metric, selectUsagePerson);
   $("person-chart-note").textContent = `Share of ${$("chart-metric").selectedOptions[0].textContent.toLowerCase()} in this selection. Select a user to explore.`;
   shareChart("token-chart", tokenFields.map((field, index) => ({ label: tokenLabels[index], value: total[field] })), "value");
@@ -185,7 +202,8 @@ function renderTimeChart(metric) {
   container.replaceChildren(); rows.replaceChildren();
   for (const entry of entries) {
     const row = node("tr");
-    for (const field of ["label", "observed_total_tokens", "requests", "errors", "incomplete_requests"]) row.append(node("td", field === "label" ? entry[field] : number(entry[field])));
+    const day = node("th", entry.label); day.scope = "row"; row.append(day);
+    for (const field of ["observed_total_tokens", "requests", "errors", "incomplete_requests"]) row.append(node("td", number(entry[field])));
     rows.append(row);
   }
   if (!analyticsReport.total[0].requests) { container.append(node("p", "No requests in this period. Change the filters to explore another period.", "chart-empty")); return; }
@@ -222,10 +240,11 @@ function renderTimeChart(metric) {
 function renderLedger() {
   const group = $("group-by").value, entries = analyticsReport[group], total = analyticsReport.total[0];
   $("group-heading").textContent = $("group-by").selectedOptions[0].textContent;
+  $("ledger-caption").textContent = `Token ledger by ${$("group-by").selectedOptions[0].textContent.toLowerCase()}`;
   const rows = $("usage-rows"); rows.replaceChildren();
   for (const entry of [...entries, ...(entries.length ? [{ ...total, label: "Total for selection", isTotal: true }] : [])]) {
     const row = node("tr", undefined, entry.isTotal ? "total-row" : "");
-    const label = node("td");
+    const label = node("th"); label.scope = "row";
     if (group === "person" && !entry.isTotal) label.append(button(entry.label, () => selectUsagePerson(entry.id), "text-button"));
     else label.textContent = entry.label;
     row.append(label);
@@ -246,7 +265,8 @@ function renderHistory() {
     if (entry.response_model && entry.response_model !== entry.resolved_model) model.append(node("span", `Response: ${entry.response_model}`, "status-detail"));
     const person = node("td", entry.person_name); person.append(node("span", entry.key_label, "status-detail"));
     const outcome = entry.outcome.replaceAll("_", " ");
-    row.append(node("td", entry.started_at.replace("T", " ").replace("Z", "")), person, model, node("td", `${outcome} · ${entry.http_status ?? "—"}`), node("td", duration(entry.finished_at ? Math.max(0, new Date(entry.finished_at) - new Date(entry.started_at)) : null)));
+    const started = node("th", entry.started_at.replace("T", " ").replace("Z", "")); started.scope = "row";
+    row.append(started, person, model, node("td", `${outcome} · ${entry.http_status ?? "—"}`), node("td", duration(entry.finished_at ? Math.max(0, new Date(entry.finished_at) - new Date(entry.started_at)) : null)));
     for (const field of [...tokenFields, "observed_total_tokens"]) row.append(node("td", number(entry[field])));
     const measurement = node("td"); measurement.append(node("span", entry.usage_state.replaceAll("_", " "), ["partial", "unknown"].includes(entry.usage_state) ? "status warning" : "status"));
     row.append(measurement); rows.append(row);

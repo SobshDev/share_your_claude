@@ -5,8 +5,7 @@
     <meta name="viewport" content="width=device-width, initial-scale=1" />
     <title>Shared Router</title>
     <link rel="stylesheet" href="/assets/app.css" />
-    <script src="/assets/analytics.js" defer></script>
-    <script src="/assets/app.js" defer></script>
+    <script type="module" src="/assets/app.js"></script>
   </head>
   <body>
     <a class="skip-link" href="#main">Skip to content</a>
@@ -29,11 +28,12 @@
         </div>
       </aside>
       <main id="main" tabindex="-1">
-        <div id="notice" class="notice" role="status" hidden></div>
+        <div id="notice" class="notice" role="status"></div>
+        <div id="notice-error" class="notice error" role="alert"></div>
         <section id="page-overview" class="page">
           <header class="page-header">
             <div>
-              <h1>Usage overview</h1>
+              <h1 tabindex="-1">Usage overview</h1>
               <p>See what each person uses, across all of their keys.</p>
             </div>
             <button id="refresh-usage" class="secondary">Refresh usage</button>
@@ -52,7 +52,7 @@
           </form>
           <p id="analytics-status" role="status">Loading usage…</p>
           <div id="analytics-content" hidden>
-            <div class="report-heading scope-heading"><h2 id="scope-title">All users</h2><p id="scope-period"></p></div>
+            <div class="report-heading scope-heading"><h2 id="scope-title" tabindex="-1">All users</h2><p id="scope-period"></p></div>
             <dl id="usage-summary" class="usage-summary"></dl>
             <p id="measurement-note" class="helper"></p>
             <section class="trend-section" aria-labelledby="trend-title">
@@ -76,6 +76,7 @@
           </div>
           <div class="table-wrap">
             <table class="usage-table">
+              <caption id="ledger-caption" class="sr-only">Token ledger by user</caption>
               <thead>
                 <tr>
                   <th scope="col" id="group-heading">Person</th>
@@ -96,7 +97,7 @@
             <p>
               No message requests match these filters. Try a wider date range or choose another user.
             </p>
-            <a href="#connection">Set up Claude</a>
+            <a class="needs-connection" href="#connection">Set up Claude</a>
           </div>
           <div class="report-notes">
             <p>
@@ -109,16 +110,16 @@
             </p>
           </div>
           <section class="history-section" aria-labelledby="history-title">
-            <div class="report-heading"><h2 id="history-title">Request history</h2><p>Newest first · UTC · 50 per page</p></div>
-            <div class="table-wrap" tabindex="0" aria-label="Request history, scroll for all columns"><table><thead><tr><th scope="col">Started (UTC)</th><th scope="col">User / key</th><th scope="col">Model</th><th scope="col">Outcome / HTTP</th><th scope="col">Duration</th><th scope="col">Input</th><th scope="col">Cache read</th><th scope="col">Cache write</th><th scope="col">Output</th><th scope="col">Observed total</th><th scope="col">Measurement</th></tr></thead><tbody id="request-rows"></tbody></table></div>
-            <div class="history-pagination"><button id="history-prev" class="secondary" disabled>Previous</button><p id="history-caption" role="status"></p><button id="history-next" class="secondary" disabled>Next</button></div>
+            <div class="report-heading"><h2 id="history-title" tabindex="-1">Request history</h2><p>Newest first · UTC · 50 per page</p></div>
+            <div class="table-wrap" tabindex="0" aria-label="Request history, scroll for all columns"><table><caption class="sr-only">Request history, newest first</caption><thead><tr><th scope="col">Started (UTC)</th><th scope="col">User / key</th><th scope="col">Model</th><th scope="col">Outcome / HTTP</th><th scope="col">Duration</th><th scope="col">Input</th><th scope="col">Cache read</th><th scope="col">Cache write</th><th scope="col">Output</th><th scope="col">Observed total</th><th scope="col">Measurement</th></tr></thead><tbody id="request-rows"></tbody></table></div>
+            <div class="history-pagination"><button id="history-prev" class="secondary" disabled>Previous</button><p id="history-caption"></p><button id="history-next" class="secondary" disabled>Next</button></div>
           </section>
           </div>
         </section>
         <section id="page-keys" class="page" hidden>
           <header class="page-header">
             <div>
-              <h1>Friends &amp; keys</h1>
+              <h1 tabindex="-1">Friends &amp; keys</h1>
               <p>
                 One identity per friend. A separate key for each device or
                 workflow.
@@ -173,7 +174,7 @@
         <section id="page-connection" class="page" hidden>
           <header class="page-header">
             <div>
-              <h1>Claude connection</h1>
+              <h1 tabindex="-1">Claude connection</h1>
               <p>
                 Your credentials stay on this server. Friends receive router
                 keys only.
@@ -232,7 +233,11 @@
         </footer>
       </main>
     </div>
-    <dialog id="output-dialog" aria-labelledby="output-title">
+    <dialog
+      id="output-dialog"
+      aria-labelledby="output-title"
+      aria-describedby="output-description"
+    >
       <div class="dialog-heading">
         <h2 id="output-title">Your new API key</h2>
         <button id="close-output" class="secondary">Close</button>
