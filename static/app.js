@@ -85,7 +85,13 @@ function formAction(id, action) {
     run(action, event.submitter);
   });
 }
-function showOutput(title, description, content, copyLabel) {
+// A one-time secret is lost when the dialog closes, so Escape is refused
+// until it has been copied. The Close button always discards it.
+let outputSecret = false,
+  outputCopied = false;
+function showOutput(title, description, content, copyLabel, secret = false) {
+  outputSecret = secret;
+  outputCopied = false;
   $("output-title").textContent = title;
   $("output-description").textContent = description;
   $("output-content").textContent = content;
@@ -459,6 +465,7 @@ async function initialize() {
       "Copy this key now and share it privately with your friend. It cannot be displayed again. Revoking the key will stop future requests.",
       result.secret,
       "Copy API key",
+      true,
     );
     await loadAccess();
   });
@@ -492,17 +499,32 @@ async function initialize() {
     }, event.currentTarget),
   );
   $("close-output").addEventListener("click", () => $("output-dialog").close());
+  $("output-dialog").addEventListener("cancel", (event) => {
+    if (!outputSecret || outputCopied) return;
+    event.preventDefault();
+    $("copy-status").textContent =
+      "Copy the key first, or press Close to discard it.";
+  });
   $("output-dialog").addEventListener("close", () => {
     $("output-content").textContent = "";
     $("copy-status").textContent = "";
+    outputSecret = false;
   });
   $("copy-output").addEventListener("click", async () => {
     try {
       await navigator.clipboard.writeText($("output-content").textContent);
+      outputCopied = true;
       $("copy-status").textContent = "Copied to clipboard.";
     } catch {
+      const content = $("output-content"),
+        range = document.createRange(),
+        selection = getSelection();
+      range.selectNodeContents(content);
+      selection.removeAllRanges();
+      selection.addRange(range);
+      content.focus();
       $("copy-status").textContent =
-        "Clipboard access is unavailable. Select and copy the text above.";
+        "Clipboard access is unavailable. The text above is selected; copy it with your keyboard.";
     }
   });
   await connection();
