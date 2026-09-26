@@ -15,6 +15,7 @@ async fn with_upstream(h: &Harness, service: Router) -> (Router, tokio::task::Jo
         password_hash: password_hash(),
         encryption_key: zeroize::Zeroizing::new(*h.state.config.encryption_key),
         secure_cookie: false,
+        trusted_proxy_hops: 0,
     };
     let mut state = AppState::new(config, h.state.db.clone()).unwrap();
     Arc::get_mut(&mut state).unwrap().upstream = format!("http://{address}");

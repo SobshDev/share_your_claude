@@ -67,27 +67,39 @@ impl Filter {
         Ok(Self { from, to, query })
     }
 
+    /// The FROM and WHERE clauses for this filter. The model condition is added only when a
+    /// model is given, written exactly like index `usage_endpoint_model_time` so SQLite uses it.
+    fn source(&self) -> String {
+        let mut source = SOURCE.to_owned();
+        if self.query.model.is_some() {
+            source.push_str(" AND COALESCE(u.resolved_model,u.requested_model)=?");
+        }
+        source
+    }
+
+    /// Binds the parameters of [`Self::source`], in order.
     fn bind<'a>(
         &'a self,
         sql: &'a str,
     ) -> sqlx::query::Query<'a, sqlx::Sqlite, sqlx::sqlite::SqliteArguments<'a>> {
-        sqlx::query(sql)
+        let query = sqlx::query(sql)
             .bind(&self.from)
             .bind(&self.to)
             .bind(&self.query.person_id)
             .bind(&self.query.person_id)
             .bind(&self.query.key_id)
-            .bind(&self.query.key_id)
-            .bind(&self.query.model)
-            .bind(&self.query.model)
+            .bind(&self.query.key_id);
+        match &self.query.model {
+            Some(model) => query.bind(model),
+            None => query,
+        }
     }
 }
 
 const SOURCE: &str =
     "FROM request_usage u JOIN api_key k ON k.id=u.key_id JOIN person p ON p.id=k.person_id
     WHERE u.endpoint='/v1/messages' AND u.started_at>=? AND u.started_at<?
-    AND (? IS NULL OR p.id=?) AND (? IS NULL OR k.id=?)
-    AND (? IS NULL OR COALESCE(u.resolved_model,u.requested_model)=?)";
+    AND (? IS NULL OR p.id=?) AND (? IS NULL OR k.id=?)";
 const TOTAL: &str = "CASE WHEN u.raw_usage IS NOT NULL THEN COALESCE(u.input_tokens,0)+COALESCE(u.cache_read_tokens,0)+COALESCE(u.cache_write_tokens,0)+COALESCE(u.output_tokens,0) END";
 const COUNTS: &[&str] = &[
     "requests",
@@ -167,6 +179,7 @@ async fn aggregate(
         GroupBy::Total => String::new(),
         _ => format!("GROUP BY {expr} ORDER BY {label}, {expr}"),
     };
+    let source = filter.source();
     // Only fixed expressions are interpolated. Every user filter is bound.
     let sql = format!("SELECT {expr} AS id,{label} AS label,COUNT(*) AS requests,
         COUNT(CASE WHEN u.outcome='completed' THEN 1 END) AS completed_requests,
@@ -184,7 +197,7 @@ async fn aggregate(
         SUM({TOTAL}) AS observed_total_tokens,
         AVG(CASE WHEN u.outcome='completed' THEN MAX(0,(julianday(u.finished_at)-julianday(u.started_at))*86400000) END) AS average_duration_ms,
         COUNT(CASE WHEN u.outcome='completed' AND u.finished_at IS NOT NULL THEN 1 END) AS duration_samples,
-        MAX(u.started_at) AS last_used_at {SOURCE} {grouping}");
+        MAX(u.started_at) AS last_used_at {source} {grouping}");
     let rows = filter.bind(&sql).fetch_all(conn).await?;
     Ok(rows.iter().map(|row| {
         let mut value = json!({"id":row.get::<String,_>("id"), "label":row.get::<String,_>("label"),
@@ -226,10 +239,11 @@ pub async fn report(
     ] {
         result[group.name()] = json!(aggregate(&mut tx, &filter, group).await?);
     }
+    let source = filter.source();
     let sql = format!("SELECT u.id,p.id AS person_id,p.name AS person_name,k.label AS key_label,
         u.requested_model,u.resolved_model,u.response_model,u.started_at,u.finished_at,
         u.outcome,u.http_status,u.usage_state,u.input_tokens,u.cache_read_tokens,u.cache_write_tokens,u.output_tokens,
-        {TOTAL} AS observed_total_tokens {SOURCE} ORDER BY u.started_at DESC,u.id DESC LIMIT 51 OFFSET ?");
+        {TOTAL} AS observed_total_tokens {source} ORDER BY u.started_at DESC,u.id DESC LIMIT 51 OFFSET ?");
     let offset = filter.query.offset.unwrap_or(0);
     let rows = filter
         .bind(&sql)

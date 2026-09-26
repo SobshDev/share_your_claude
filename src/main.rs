@@ -1,16 +1,9 @@
 use anyhow::Context;
 use argon2::{Argon2, PasswordHasher, password_hash::SaltString};
-use axum::{
-    body::Body,
-    extract::{Request, State},
-    http::{StatusCode, header},
-    middleware::{self, Next},
-    response::Response,
-};
 use base64::{Engine, engine::general_purpose::STANDARD};
 use chacha20poly1305::aead::{OsRng, rand_core::RngCore};
 use shared_router::{
-    AppState,
+    AppState, Phase,
     config::{self, Config},
     db,
 };
@@ -18,10 +11,6 @@ use std::{
     future::IntoFuture,
     io::{self, IsTerminal, Read},
     net::{IpAddr, Ipv4Addr, Ipv6Addr},
-    sync::{
-        Arc,
-        atomic::{AtomicBool, Ordering},
-    },
     time::Duration,
 };
 
@@ -29,6 +18,8 @@ use std::{
 /// 30-second `stop_grace_period` in compose.yaml, leaving time to record interrupted requests
 /// and close the database before the container is killed.
 const DRAIN_PERIOD: Duration = Duration::from_secs(20);
+/// How long interrupted streams get to record their outcome and end after the drain period.
+const INTERRUPT_GRACE: Duration = Duration::from_secs(3);
 /// Upper bound for closing the database pool once serving has stopped.
 const CLOSE_TIMEOUT: Duration = Duration::from_secs(5);
 /// Upper bound for the `healthcheck` command's readiness request.
@@ -153,31 +144,36 @@ async fn serve() -> anyhow::Result<()> {
     let state = AppState::new(config, pool.clone())?;
     let listener = tokio::net::TcpListener::bind(address).await?;
     tracing::info!(%address,"router listening");
-    let draining = Arc::new(AtomicBool::new(false));
-    let app = shared_router::app(state)
-        .layer(middleware::from_fn_with_state(draining.clone(), readiness));
-    let (stopping, mut stop_requested) = tokio::sync::watch::channel(false);
+    let mut phase = state.phase.subscribe();
     // Connect info lets the login limiter tell direct clients apart by peer address.
-    let app = app.into_make_service_with_connect_info::<std::net::SocketAddr>();
+    let app = shared_router::app(state.clone())
+        .into_make_service_with_connect_info::<std::net::SocketAddr>();
+    let signalled = state.clone();
     let server = axum::serve(listener, app).with_graceful_shutdown(async move {
         shutdown().await;
-        draining.store(true, Ordering::SeqCst);
+        // `/readyz` now reports 503.
+        signalled.phase.send_replace(Phase::Draining);
         tracing::info!("shutdown requested; draining open requests");
-        let _ = stopping.send(true);
     });
+    let mut server = std::pin::pin!(server.into_future());
     let deadline = async {
-        let _ = stop_requested.wait_for(|stopping| *stopping).await;
+        let _ = phase.wait_for(|phase| *phase != Phase::Serving).await;
         tokio::time::sleep(DRAIN_PERIOD).await;
     };
     let served = tokio::select! {
-        result = server.into_future() => result.map_err(anyhow::Error::from),
+        result = &mut server => result.map_err(anyhow::Error::from),
         () = deadline => {
             tracing::warn!("drain period elapsed; interrupting open requests");
-            Ok(())
+            // Open streams checkpoint their usage, record themselves as interrupted, and end.
+            state.phase.send_replace(Phase::Stopping);
+            match tokio::time::timeout(INTERRUPT_GRACE, &mut server).await {
+                Ok(result) => result.map_err(anyhow::Error::from),
+                Err(_) => Ok(()),
+            }
         }
     };
-    // Requests still open are recorded now, with the shutdown time, instead of by startup
-    // recovery on the next start.
+    // Requests still open, such as non-streaming calls, are recorded now with the shutdown
+    // time instead of by startup recovery on the next start.
     match db::interrupt_in_flight(&pool).await {
         Ok(0) => (),
         Ok(count) => tracing::warn!(count, "recorded open requests as interrupted"),
@@ -194,21 +190,6 @@ async fn serve() -> anyhow::Result<()> {
     served
 }
 
-/// Reports the server as not ready once shutdown has begun, so load balancers stop routing to it.
-async fn readiness(
-    State(draining): State<Arc<AtomicBool>>,
-    request: Request,
-    next: Next,
-) -> Response {
-    let probe = request.uri().path() == "/readyz";
-    let mut response = next.run(request).await;
-    if probe && draining.load(Ordering::SeqCst) {
-        *response.status_mut() = StatusCode::SERVICE_UNAVAILABLE;
-        response.headers_mut().remove(header::CONTENT_LENGTH);
-        *response.body_mut() = Body::from("shutting down");
-    }
-    response
-}
 async fn shutdown() {
     let ctrl_c = async {
         let _ = tokio::signal::ctrl_c().await;

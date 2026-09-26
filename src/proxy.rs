@@ -37,10 +37,22 @@ const MAX_UPSTREAM_REQUEST_ID_BYTES: usize = 200;
 const STREAM_CHANNEL_CAPACITY: usize = 4;
 /// How long a client may stop reading a stream before the router abandons it.
 pub const CLIENT_SEND_TIMEOUT: Duration = Duration::from_secs(120);
+/// Upper bound for a non-streaming `/v1/messages` call, including its reply body. It matches
+/// the `x-stainless-timeout` the router announces upstream.
+pub const MESSAGE_TIMEOUT: Duration = Duration::from_secs(600);
+/// Upper bound for a `count_tokens` call, including its reply body.
+pub const COUNT_TOKENS_TIMEOUT: Duration = Duration::from_secs(60);
+/// Longest a relayed stream may run. A stream still open after this ends with a
+/// `timeout_error` event and is recorded as interrupted.
+pub const MAX_STREAM_DURATION: Duration = Duration::from_secs(60 * 60);
 /// How long the router tries to deliver the sanitized error event that ends a failed stream.
 const STREAM_ERROR_SEND_TIMEOUT: Duration = Duration::from_secs(5);
 /// Seconds a client should wait before retrying when admission is saturated.
 const BUSY_RETRY_AFTER_SECONDS: &str = "1";
+/// Error message when Claude serves a model other than the one the router resolved.
+const MODEL_MISMATCH: &str = "Claude answered with a different model than requested";
+/// Error message when upstream ends a stream with an `error` event.
+const STREAM_ERROR: &str = "Claude ended the stream with an error";
 /// Client-requested betas reviewed for pass-through. The router's own compatibility betas,
 /// [`oauth::BETA`], are always sent and may also be requested.
 pub const CLIENT_BETAS: &[&str] = &[
@@ -134,16 +146,59 @@ pub async fn models(
 }
 
 pub async fn limited_body(response: reqwest::Response, limit: usize) -> Result<Vec<u8>> {
+    read_body(response, limit)
+        .await
+        .map_err(|_| AppError::upstream())
+}
+
+/// Reads an upstream body up to `limit` bytes. A failure carries its log category.
+async fn read_body(
+    response: reqwest::Response,
+    limit: usize,
+) -> std::result::Result<Vec<u8>, &'static str> {
     let mut chunks = response.bytes_stream();
     let mut body = Vec::new();
     while let Some(chunk) = chunks.next().await {
-        let chunk = chunk.map_err(|_| AppError::upstream())?;
+        let chunk = chunk.map_err(|error| read_failure(&error))?;
         if chunk.len() > limit.saturating_sub(body.len()) {
-            return Err(AppError::upstream());
+            return Err("too_large");
         }
         body.extend_from_slice(&chunk);
     }
     Ok(body)
+}
+
+/// Logs why a request to Claude failed, once per failed request. Only the router's request
+/// id, the endpoint, a static category, and the upstream status are logged: never headers,
+/// bodies, keys, tokens, or error text, which can contain URLs.
+fn log_failure(id: &str, endpoint: &str, category: &'static str, status: Option<u16>) {
+    tracing::warn!(
+        request_id = id,
+        endpoint,
+        category,
+        upstream_status = status,
+        "upstream request failed"
+    );
+}
+
+/// Category of a failure to send a request or receive response headers.
+fn send_failure(error: &reqwest::Error) -> &'static str {
+    if error.is_timeout() {
+        "timeout"
+    } else if error.is_connect() {
+        "connect"
+    } else {
+        "request"
+    }
+}
+
+/// Category of a failure while reading a response body.
+fn read_failure(error: &reqwest::Error) -> &'static str {
+    if error.is_timeout() {
+        "timeout"
+    } else {
+        "truncated"
+    }
 }
 
 /// A request that passed policy review.
@@ -213,23 +268,28 @@ async fn forward(
     };
     let mut access = match oauth::access(&state).await {
         Ok(v) => v,
-        Err(e) => return fail(&mut guard, "upstream_error", e.0.as_u16(), true, e).await,
+        Err(e) => {
+            log_failure(&id, endpoint, "credential", None);
+            return fail(&mut guard, "upstream_error", e.0.as_u16(), true, e).await;
+        }
     };
     let streaming = !counting && admitted.body.get("stream") == Some(&Value::Bool(true));
-    let mut response = match send_upstream(&state, endpoint, &access, &admitted, streaming).await {
+    let sent = send_upstream(&state, &id, endpoint, &access, &admitted, streaming).await;
+    let mut response = match sent {
         Ok(r) => r,
         Err(e) => return fail(&mut guard, "upstream_error", e.0.as_u16(), false, e).await,
     };
     record_upstream(&state, &id, &response).await?;
     if response.status() == StatusCode::UNAUTHORIZED {
         (response, access) =
-            match retry_unauthorized(&state, endpoint, &access, &admitted, counting).await {
+            match retry_unauthorized(&state, &id, endpoint, &access, &admitted, counting).await {
                 Ok(v) => v,
                 Err(e) => return fail(&mut guard, "upstream_error", e.0.as_u16(), true, e).await,
             };
         record_upstream(&state, &id, &response).await?;
     }
     if !response.status().is_success() {
+        log_failure(&id, endpoint, "status", Some(response.status().as_u16()));
         return handle_error_status(&state, &access, response, &mut guard).await;
     }
     if streaming {
@@ -337,16 +397,18 @@ fn reviewed_betas(headers: &HeaderMap) -> Result<Option<HeaderValue>> {
 
 async fn send_upstream(
     state: &AppState,
+    id: &str,
     endpoint: &str,
     access: &oauth::Access,
     admitted: &Admitted,
     streaming: bool,
 ) -> Result<reqwest::Response> {
-    let mut outbound = oauth::upstream_headers(access)?;
+    let mut outbound = oauth::upstream_headers(access)
+        .inspect_err(|_| log_failure(id, endpoint, "credential", None))?;
     if let Some(betas) = &admitted.betas {
         outbound.insert("anthropic-beta", betas.clone());
     }
-    state
+    let mut request = state
         .client
         .post(format!("{}{endpoint}", state.upstream))
         .headers(outbound)
@@ -358,10 +420,19 @@ async fn send_upstream(
                 "application/json"
             },
         )
-        .json(&admitted.body)
-        .send()
-        .await
-        .map_err(|_| AppError::upstream())
+        .json(&admitted.body);
+    // Streams are bounded by `MAX_STREAM_DURATION` while they are relayed.
+    if !streaming {
+        request = request.timeout(if endpoint == "/v1/messages" {
+            MESSAGE_TIMEOUT
+        } else {
+            COUNT_TOKENS_TIMEOUT
+        });
+    }
+    request.send().await.map_err(|error| {
+        log_failure(id, endpoint, send_failure(&error), None);
+        AppError::upstream()
+    })
 }
 
 /// Records the upstream status and request id before the body is read.
@@ -385,20 +456,24 @@ async fn record_upstream(state: &AppState, id: &str, response: &reqwest::Respons
 /// retryable 503 and sends the request again itself.
 async fn retry_unauthorized(
     state: &AppState,
+    id: &str,
     endpoint: &str,
     access: &oauth::Access,
     admitted: &Admitted,
     counting: bool,
 ) -> Result<(reqwest::Response, oauth::Access)> {
-    let fresh = oauth::force_refresh(state, access.generation).await?;
+    let fresh = oauth::force_refresh(state, access.generation)
+        .await
+        .inspect_err(|_| log_failure(id, endpoint, "refresh", Some(401)))?;
     if !counting {
+        log_failure(id, endpoint, "unauthorized", Some(401));
         return Err(AppError(
             StatusCode::SERVICE_UNAVAILABLE,
             "api_error",
             "The router renewed its Claude session. Retry the request",
         ));
     }
-    let response = send_upstream(state, endpoint, &fresh, admitted, false).await?;
+    let response = send_upstream(state, id, endpoint, &fresh, admitted, false).await?;
     Ok((response, fresh))
 }
 
@@ -475,6 +550,8 @@ async fn open_stream(
         .and_then(|v| v.to_str().ok())
         .is_some_and(|v| v.starts_with("text/event-stream"))
     {
+        let status = response.status().as_u16();
+        log_failure(&id, "/v1/messages", "bad_content_type", Some(status));
         return fail(
             &mut guard,
             "upstream_error",
@@ -489,16 +566,20 @@ async fn open_stream(
         let _permits = permits;
         let Admitted { model, mapping, .. } = admitted;
         let result = stream_response(&state, &id, &model, response, mapping, &tx, &mut guard).await;
-        let (kind, outcome, status) = match result {
+        let (kind, outcome, status, category) = match result {
             Ok(()) => return,
             // The client is not reading, so no error event could reach it.
             Err(StreamError::ClientStalled) => {
+                log_failure(&id, "/v1/messages", "client_stalled", Some(200));
                 let _ = guard.finish("interrupted", Some(200), false).await;
                 return;
             }
-            Err(StreamError::Upstream(kind)) => (kind, "upstream_error", 200),
-            Err(StreamError::Internal) => ("api_error", "interrupted", 500),
+            Err(StreamError::TooLong) => ("timeout_error", "interrupted", 200, "stream_limit"),
+            Err(StreamError::Shutdown) => ("api_error", "interrupted", 200, "shutdown"),
+            Err(StreamError::Upstream(kind, category)) => (kind, "upstream_error", 200, category),
+            Err(StreamError::Internal) => ("api_error", "interrupted", 500, "internal"),
         };
+        log_failure(&id, "/v1/messages", category, Some(200));
         let event = interrupted_event(kind);
         let _ = tokio::time::timeout(STREAM_ERROR_SEND_TIMEOUT, tx.send(Ok(event))).await;
         let _ = guard.finish(outcome, Some(status), false).await;
@@ -524,11 +605,21 @@ async fn finish_json(
 ) -> Result<Response> {
     let status = response.status();
     let Admitted { model, mapping, .. } = admitted;
-    let data = match limited_body(response, MAX_RESPONSE_BODY_BYTES).await {
+    let endpoint = if counting {
+        "/v1/messages/count_tokens"
+    } else {
+        "/v1/messages"
+    };
+    let malformed = || log_failure(id, endpoint, "malformed", Some(status.as_u16()));
+    let data = match read_body(response, MAX_RESPONSE_BODY_BYTES).await {
         Ok(v) => v,
-        Err(e) => return fail(guard, "upstream_error", 502, false, e).await,
+        Err(category) => {
+            log_failure(id, endpoint, category, Some(status.as_u16()));
+            return fail(guard, "upstream_error", 502, false, AppError::upstream()).await;
+        }
     };
     let Ok(mut value) = serde_json::from_slice::<Value>(&data) else {
+        malformed();
         return fail(guard, "upstream_error", 502, false, AppError::upstream()).await;
     };
     if counting {
@@ -537,6 +628,7 @@ async fn finish_json(
             .and_then(Value::as_i64)
             .is_some_and(|n| n >= 0)
         {
+            malformed();
             return fail(guard, "upstream_error", 502, true, AppError::upstream()).await;
         }
     } else {
@@ -546,9 +638,16 @@ async fn finish_json(
         if value.get("type").and_then(Value::as_str) != Some("message")
             || !value.get("content").is_some_and(Value::is_array)
         {
+            malformed();
             return fail(guard, "upstream_error", 502, false, AppError::upstream()).await;
         }
         if let Err(error) = verify_response_model(state, id, &model, value.get("model")).await {
+            let category = if error.2 == MODEL_MISMATCH {
+                "model_mismatch"
+            } else {
+                "internal"
+            };
+            log_failure(id, endpoint, category, Some(status.as_u16()));
             return fail(guard, "upstream_error", 502, false, error).await;
         }
         mapping.restore(&mut value);
@@ -581,7 +680,11 @@ async fn verify_response_model(
             .execute(&state.db)
             .await?;
         if actual != expected {
-            return Err(AppError::upstream());
+            return Err(AppError(
+                StatusCode::BAD_GATEWAY,
+                "api_error",
+                MODEL_MISMATCH,
+            ));
         }
     }
     Ok(())
@@ -589,10 +692,15 @@ async fn verify_response_model(
 
 /// Why a relayed stream ended before `message_stop`.
 enum StreamError {
-    /// Upstream sent malformed, truncated, or error data. Carries the error type to relay.
-    Upstream(&'static str),
+    /// Upstream sent malformed, truncated, or error data. Carries the error type to relay and
+    /// the category to log.
+    Upstream(&'static str, &'static str),
     /// The client stopped reading for longer than the send timeout.
     ClientStalled,
+    /// The stream ran longer than [`MAX_STREAM_DURATION`].
+    TooLong,
+    /// The server is stopping after its drain period.
+    Shutdown,
     /// The router itself failed, for example while writing a usage checkpoint.
     Internal,
 }
@@ -603,7 +711,12 @@ impl From<AppError> for StreamError {
         if error.0 == StatusCode::INTERNAL_SERVER_ERROR {
             Self::Internal
         } else {
-            Self::Upstream(error.1)
+            let category = match error.2 {
+                MODEL_MISMATCH => "model_mismatch",
+                STREAM_ERROR => "stream_error",
+                _ => "malformed",
+            };
+            Self::Upstream(error.1, category)
         }
     }
 }
@@ -620,15 +733,26 @@ async fn stream_response(
     let mut stream = response.bytes_stream();
     let mut decoder = SseDecoder::default();
     let mut progress = StreamProgress::default();
+    let deadline = tokio::time::sleep(state.max_stream_duration);
+    tokio::pin!(deadline);
+    let mut phase = state.phase.subscribe();
     loop {
         let chunk = tokio::select! {
             _ = tx.closed() => { guard.finish("interrupted",Some(200),false).await?; return Ok(()); }
+            () = &mut deadline => return Err(StreamError::TooLong),
+            true = async { phase.wait_for(|p| *p == crate::Phase::Stopping).await.is_ok() } => {
+                // Keep the counts seen so far before the stream is recorded as interrupted.
+                progress.usage.checkpoint(&state.db, id, false).await?;
+                return Err(StreamError::Shutdown);
+            }
             chunk = stream.next() => chunk,
         };
         let Some(chunk) = chunk else {
-            return Err(StreamError::Upstream("api_error"));
+            return Err(StreamError::Upstream("api_error", "truncated"));
         };
-        decoder.push(&chunk.map_err(|_| AppError::upstream())?)?;
+        let chunk =
+            chunk.map_err(|error| StreamError::Upstream("api_error", read_failure(&error)))?;
+        decoder.push(&chunk)?;
         while let Some(event) = decoder.next_event()? {
             let (kind, bytes) = progress
                 .observe(state, id, model, event, &mapping, guard)
@@ -744,11 +868,7 @@ impl StreamProgress {
                     .and_then(Value::as_str)
                     .and_then(error::known_error_type)
                     .unwrap_or("api_error");
-                return Err(AppError(
-                    StatusCode::BAD_GATEWAY,
-                    kind,
-                    "Claude ended the stream with an error",
-                ));
+                return Err(AppError(StatusCode::BAD_GATEWAY, kind, STREAM_ERROR));
             }
             "message_stop" => {
                 if !self.started {

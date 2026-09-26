@@ -15,6 +15,9 @@ pub struct Config {
     pub password_hash: String,
     pub encryption_key: Zeroizing<[u8; 32]>,
     pub secure_cookie: bool,
+    /// Reverse proxies in front of the router whose `X-Forwarded-For` entries are trusted
+    /// when throttling admin sign-ins. 0 uses the socket peer address.
+    pub trusted_proxy_hops: usize,
 }
 
 impl Config {
@@ -70,6 +73,17 @@ impl Config {
             || format!("DATABASE_URL must be a SQLite URL such as {DEFAULT_DATABASE_URL}");
         anyhow::ensure!(database_url.starts_with("sqlite:"), database_error());
         sqlx::sqlite::SqliteConnectOptions::from_str(&database_url).with_context(database_error)?;
+        let trusted_proxy_hops = match get("TRUSTED_PROXY_HOPS") {
+            Some(value) if !value.trim().is_empty() => {
+                value.trim().parse::<usize>().map_err(|_| {
+                    anyhow::anyhow!(
+                        "TRUSTED_PROXY_HOPS must be a non-negative integer (0 when the router \
+                         is reached directly)"
+                    )
+                })?
+            }
+            _ => 0,
+        };
         Ok(Self {
             bind: bind_address(get("BIND_ADDRESS"))?,
             database_url,
@@ -77,6 +91,7 @@ impl Config {
             password_hash,
             encryption_key,
             secure_cookie: origin.scheme() == "https",
+            trusted_proxy_hops,
         })
     }
 }
@@ -93,13 +108,15 @@ pub fn bind_address(value: Option<String>) -> anyhow::Result<SocketAddr> {
         })
 }
 
+/// Shared upstream client. It bounds connecting and each read, with no total timeout: every
+/// non-streaming call sets its own request timeout, and streams are bounded by
+/// [`crate::proxy::MAX_STREAM_DURATION`].
 pub fn http_client() -> anyhow::Result<reqwest::Client> {
     Ok(reqwest::Client::builder()
         .redirect(reqwest::redirect::Policy::none())
         .retry(reqwest::retry::never())
         .connect_timeout(Duration::from_secs(15))
         .read_timeout(Duration::from_secs(120))
-        .timeout(Duration::from_secs(1800))
         .build()?)
 }
 
@@ -157,6 +174,7 @@ mod tests {
         assert!(config.secure_cookie);
         assert_eq!(config.bind, DEFAULT_BIND_ADDRESS.parse().unwrap());
         assert_eq!(config.database_url, DEFAULT_DATABASE_URL);
+        assert_eq!(config.trusted_proxy_hops, 0);
     }
 
     #[test]
@@ -250,5 +268,24 @@ mod tests {
         assert_rejected("DATABASE_URL", "sqlite://data/router.sqlite?mode=bogus");
         let config = load(&with("BIND_ADDRESS", "0.0.0.0:9000")).unwrap();
         assert_eq!(config.bind, "0.0.0.0:9000".parse().unwrap());
+    }
+
+    #[test]
+    fn reads_trusted_proxy_hops() {
+        for value in ["-1", "one", "1.5"] {
+            assert_rejected("TRUSTED_PROXY_HOPS", value);
+        }
+        assert_eq!(
+            load(&with("TRUSTED_PROXY_HOPS", ""))
+                .unwrap()
+                .trusted_proxy_hops,
+            0
+        );
+        assert_eq!(
+            load(&with("TRUSTED_PROXY_HOPS", " 2 "))
+                .unwrap()
+                .trusted_proxy_hops,
+            2
+        );
     }
 }

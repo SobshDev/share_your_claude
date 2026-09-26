@@ -25,6 +25,8 @@ use subtle::ConstantTimeEq;
 
 /// `api_key.last_used_at` is refreshed at most once per this many seconds.
 const LAST_USED_RESOLUTION_SECS: i64 = 60;
+/// Lifetime of an admin session, in the database and in the cookie.
+const SESSION_TTL_SECS: i64 = 43200;
 
 pub fn random_secret() -> String {
     let mut bytes = [0; 32];
@@ -76,7 +78,7 @@ pub async fn api_key(headers: &HeaderMap, state: &AppState) -> Result<String> {
     let now = chrono::Utc::now();
     let cutoff = (now - chrono::Duration::seconds(LAST_USED_RESOLUTION_SECS))
         .to_rfc3339_opts(chrono::SecondsFormat::Millis, true);
-    if sqlx::query(
+    if let Err(error) = sqlx::query(
         "UPDATE api_key SET last_used_at=? WHERE id=? AND (last_used_at IS NULL OR last_used_at<?)",
     )
     .bind(now.to_rfc3339_opts(chrono::SecondsFormat::Millis, true))
@@ -84,8 +86,8 @@ pub async fn api_key(headers: &HeaderMap, state: &AppState) -> Result<String> {
     .bind(cutoff)
     .execute(&state.db)
     .await
-    .is_err()
     {
+        crate::error::log_database_error(&error);
         tracing::warn!("could not record key last use");
     }
     Ok(id)
@@ -106,6 +108,20 @@ pub fn cookie_name(state: &AppState) -> &'static str {
     } else {
         "router_session"
     }
+}
+
+/// The `Set-Cookie` value that stores `value` as the admin session for `max_age` seconds.
+/// An empty value with `max_age` 0 clears the cookie.
+fn session_cookie(state: &AppState, value: &str, max_age: i64) -> String {
+    let secure = if state.config.secure_cookie {
+        "; Secure"
+    } else {
+        ""
+    };
+    format!(
+        "{}={value}; Path=/; HttpOnly; SameSite=Strict; Max-Age={max_age}{secure}",
+        cookie_name(state)
+    )
 }
 
 pub fn session_token(headers: &HeaderMap, state: &AppState) -> Result<String> {
@@ -211,12 +227,6 @@ impl Window {
     }
 }
 
-impl Default for LoginLimiter {
-    fn default() -> Self {
-        Self::new(0)
-    }
-}
-
 impl LoginLimiter {
     pub const WINDOW_SECS: i64 = 60;
     pub const CLIENT_FAILURES: u32 = 5;
@@ -229,19 +239,6 @@ impl LoginLimiter {
             clients: HashMap::new(),
             global: Window::default(),
         }
-    }
-
-    /// Reads `TRUSTED_PROXY_HOPS` (default 0). An invalid value is ignored with a warning,
-    /// which falls back to the socket peer address.
-    pub fn from_env() -> Self {
-        let hops = match std::env::var("TRUSTED_PROXY_HOPS") {
-            Err(_) => 0,
-            Ok(value) => value.trim().parse::<usize>().unwrap_or_else(|_| {
-                tracing::warn!("TRUSTED_PROXY_HOPS must be a non-negative integer; using 0");
-                0
-            }),
-        };
-        Self::new(hops)
     }
 
     /// The rate-limit key for a request.
@@ -369,20 +366,12 @@ pub async fn login(
     )
     .bind(hash(&token))
     .bind(&csrf)
-    .bind(db::epoch() + 43200)
+    .bind(db::epoch() + SESSION_TTL_SECS)
     .bind(&fingerprint)
     .execute(&mut *tx)
     .await?;
     tx.commit().await?;
-    let secure = if state.config.secure_cookie {
-        "; Secure"
-    } else {
-        ""
-    };
-    let cookie = format!(
-        "{}={token}; Path=/; HttpOnly; SameSite=Strict; Max-Age=43200{secure}",
-        cookie_name(&state)
-    );
+    let cookie = session_cookie(&state, &token, SESSION_TTL_SECS);
     Ok((
         [(header::SET_COOKIE, cookie)],
         Json(json!({"csrf_token":csrf})),
@@ -396,15 +385,7 @@ pub async fn logout(State(state): State<Arc<AppState>>, headers: HeaderMap) -> R
         .bind(hash(&token))
         .execute(&state.db)
         .await?;
-    let secure = if state.config.secure_cookie {
-        "; Secure"
-    } else {
-        ""
-    };
-    let cookie = format!(
-        "{}=; Path=/; HttpOnly; SameSite=Strict; Max-Age=0{secure}",
-        cookie_name(&state)
-    );
+    let cookie = session_cookie(&state, "", 0);
     Ok(([(header::SET_COOKIE, cookie)], StatusCode::NO_CONTENT).into_response())
 }
 

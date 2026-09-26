@@ -6,7 +6,7 @@ use crate::{
 use askama::Template;
 use axum::{
     Json, Router,
-    extract::{DefaultBodyLimit, Path, State},
+    extract::{Path, RawQuery, State},
     http::{HeaderMap, StatusCode, header},
     middleware,
     response::{Html, IntoResponse, Redirect, Response},
@@ -16,6 +16,60 @@ use serde::Deserialize;
 use serde_json::{Value, json};
 use sqlx::Row;
 use std::{collections::HashMap, sync::Arc};
+
+/// Upper bound for each upstream catalog page request, including its body.
+pub const CATALOG_REQUEST_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(30);
+
+const JS: &str = "text/javascript; charset=utf-8";
+const CSS: &str = "text/css; charset=utf-8";
+/// Static dashboard assets embedded in the binary: path, content type, and contents.
+const ASSETS: [(&str, &str, &str); 4] = [
+    ("/assets/app.js", JS, include_str!("../static/app.js")),
+    ("/assets/common.js", JS, include_str!("../static/common.js")),
+    (
+        "/assets/analytics.js",
+        JS,
+        include_str!("../static/analytics.js"),
+    ),
+    ("/assets/app.css", CSS, include_str!("../static/app.css")),
+];
+/// Cache policy of an asset requested with the current [`ASSET_VERSION`].
+const VERSIONED_ASSET_CACHE: &str = "public, max-age=31536000, immutable";
+
+/// Content hash of every embedded asset. Templates add it to asset URLs as `?v=`, so any
+/// change to an asset gives the pages new URLs and browsers never run stale scripts.
+pub static ASSET_VERSION: std::sync::LazyLock<String> = std::sync::LazyLock::new(|| {
+    use sha2::{Digest, Sha256};
+    let mut hasher = Sha256::new();
+    for (path, _, body) in ASSETS {
+        hasher.update(path.as_bytes());
+        hasher.update((body.len() as u64).to_le_bytes());
+        hasher.update(body.as_bytes());
+    }
+    hasher.finalize()[..8]
+        .iter()
+        .map(|byte| format!("{byte:02x}"))
+        .collect()
+});
+
+/// Serves an embedded asset. Only a URL carrying the current version may be cached for good;
+/// any other request, such as a module imported by relative path, must be revalidated.
+fn asset(query: Option<&str>, content_type: &'static str, body: &'static str) -> Response {
+    let versioned = query.and_then(|q| q.strip_prefix("v=")) == Some(ASSET_VERSION.as_str());
+    let cache = if versioned {
+        VERSIONED_ASSET_CACHE
+    } else {
+        "no-cache"
+    };
+    (
+        [
+            (header::CONTENT_TYPE, content_type),
+            (header::CACHE_CONTROL, cache),
+        ],
+        body,
+    )
+        .into_response()
+}
 
 pub fn routes(state: Arc<AppState>) -> Router<Arc<AppState>> {
     let protected = Router::new()
@@ -36,71 +90,79 @@ pub fn routes(state: Arc<AppState>) -> Router<Arc<AppState>> {
         .route("/admin/api/usage", get(crate::analytics::usage_report))
         .route("/admin/api/analytics", get(crate::analytics::report))
         .route_layer(middleware::from_fn_with_state(state, auth::require_admin));
-    Router::new()
+    let router = Router::new()
         .merge(protected)
         .route("/", get(|| async { Redirect::to("/admin") }))
         .route("/admin", get(dashboard))
         .route("/admin/login", get(login_page))
-        .route("/admin/api/login", post(auth::login))
-        .route(
-            "/assets/app.js",
-            get(|| async {
-                (
-                    [(header::CONTENT_TYPE, "text/javascript; charset=utf-8")],
-                    include_str!("../static/app.js"),
-                )
-            }),
-        )
-        .route(
-            "/assets/common.js",
-            get(|| async {
-                (
-                    [(header::CONTENT_TYPE, "text/javascript; charset=utf-8")],
-                    include_str!("../static/common.js"),
-                )
-            }),
-        )
-        .route(
-            "/assets/analytics.js",
-            get(|| async {
-                (
-                    [(header::CONTENT_TYPE, "text/javascript; charset=utf-8")],
-                    include_str!("../static/analytics.js"),
-                )
-            }),
-        )
-        .route(
-            "/assets/app.css",
-            get(|| async {
-                (
-                    [(header::CONTENT_TYPE, "text/css; charset=utf-8")],
-                    include_str!("../static/app.css"),
-                )
-            }),
-        )
-        .layer(DefaultBodyLimit::max(64 * 1024))
+        .route("/admin/api/login", post(auth::login));
+    ASSETS
+        .iter()
+        .fold(router, |router, &(path, content_type, body)| {
+            router.route(
+                path,
+                get(move |RawQuery(query): RawQuery| async move {
+                    asset(query.as_deref(), content_type, body)
+                }),
+            )
+        })
 }
 
 #[derive(Template)]
 #[template(path = "dashboard.html")]
-struct Dashboard;
+struct Dashboard {
+    asset_version: &'static str,
+}
 #[derive(Template)]
 #[template(path = "login.html")]
-struct LoginPage;
+struct LoginPage {
+    asset_version: &'static str,
+}
 
 async fn dashboard(State(state): State<Arc<AppState>>, headers: HeaderMap) -> Response {
     if auth::session(&headers, &state).await.is_err() {
         return Redirect::to("/admin/login").into_response();
     }
-    match Dashboard.render() {
+    let page = Dashboard {
+        asset_version: &ASSET_VERSION,
+    };
+    match page.render() {
         Ok(html) => Html(html).into_response(),
-        Err(_) => AppError::internal().into_response(),
+        Err(_) => page_error(),
     }
 }
-async fn login_page() -> Result<Html<String>> {
-    Ok(Html(LoginPage.render().map_err(|_| AppError::internal())?))
+async fn login_page() -> Response {
+    let page = LoginPage {
+        asset_version: &ASSET_VERSION,
+    };
+    match page.render() {
+        Ok(html) => Html(html).into_response(),
+        Err(_) => page_error(),
+    }
+}
+/// A minimal HTML 500 page for browser routes, which should not show a JSON error.
+fn page_error() -> Response {
+    tracing::error!("dashboard template failed to render");
+    (
+        StatusCode::INTERNAL_SERVER_ERROR,
+        Html(
+            "<!doctype html><html lang=\"en\"><head><meta charset=\"utf-8\" />\
+             <title>Shared Router</title></head><body><h1>Something went wrong</h1>\
+             <p>The dashboard could not be displayed. Reload the page, or check the router \
+             logs if this keeps happening.</p></body></html>",
+        ),
+    )
+        .into_response()
 }
 pub async fn ready(State(state): State<Arc<AppState>>) -> Result<&'static str> {
+    // Load balancers stop routing here once shutdown has begun.
+    if state.phase() != crate::Phase::Serving {
+        return Err(AppError(
+            StatusCode::SERVICE_UNAVAILABLE,
+            "overloaded_error",
+            "The router is shutting down",
+        ));
+    }
     sqlx::query("SELECT 1").execute(&state.db).await?;
     Ok("ready")
 }
@@ -116,9 +178,6 @@ fn valid_label(value: &str) -> Result<String> {
         return Err(AppError::bad("Enter a name between 1 and 100 characters"));
     }
     Ok(value.to_owned())
-}
-fn not_found(message: &'static str) -> AppError {
-    AppError(StatusCode::NOT_FOUND, "not_found_error", message)
 }
 /// Rejects keys that do not exist or were revoked.
 async fn require_active_key<'e>(db: impl sqlx::SqliteExecutor<'e>, id: &str) -> Result<()> {
@@ -165,7 +224,7 @@ async fn rename_person(
         .await?
         .rows_affected();
     if n == 0 {
-        return Err(not_found("Friend not found"));
+        return Err(AppError::not_found("Friend not found"));
     }
     Ok(StatusCode::NO_CONTENT)
 }
@@ -255,7 +314,7 @@ async fn revoke_key(
         .await?
         .rows_affected();
     if n == 0 {
-        return Err(not_found("Key not found"));
+        return Err(AppError::not_found("Key not found"));
     }
     Ok(StatusCode::NO_CONTENT)
 }
@@ -326,25 +385,32 @@ async fn models(State(state): State<Arc<AppState>>) -> Result<Json<Value>> {
     Ok(Json(json!(rows.iter().map(|r|json!({"id":r.get::<String,_>("id"),"display_name":r.get::<String,_>("display_name"),"enabled":r.get::<bool,_>("enabled"),"reviewed_at":r.get::<Option<String>,_>("reviewed_at"),"blocked":policy::blocked(r.get("id"),r.get("model_group"))})).collect::<Vec<_>>())))
 }
 async fn refresh_models(State(state): State<Arc<AppState>>) -> Result<Json<Value>> {
-    let access = oauth::access(&state).await?;
+    let mut access = oauth::access(&state).await?;
+    let mut refreshed = false;
     let mut after: Option<String> = None;
     let mut candidates = Vec::new();
     let mut seen = std::collections::HashSet::new();
     let mut done = false;
     for _ in 0..20 {
-        let mut request = state
-            .client
-            .get(format!("{}/v1/models", state.upstream))
-            .headers(oauth::upstream_headers(&access)?)
-            .query(&[("limit", "100")]);
-        if let Some(ref cursor) = after {
-            request = request.query(&[("after_id", cursor)]);
-        }
-        let response = request.send().await.map_err(|_| AppError::upstream())?;
-        if matches!(response.status().as_u16(), 401 | 403) {
-            oauth::mark_reauth(&state, access.generation).await?;
-            return Err(AppError::reauth());
-        }
+        let response = loop {
+            let response = models_page(&state, &access, after.as_deref()).await?;
+            match response.status() {
+                // Listing models is idempotent, so the page is fetched again with new tokens.
+                StatusCode::UNAUTHORIZED if !refreshed => {
+                    access = oauth::force_refresh(&state, access.generation).await?;
+                    refreshed = true;
+                }
+                StatusCode::UNAUTHORIZED => return reject_credential(&state, &access).await,
+                StatusCode::FORBIDDEN => {
+                    // Most 403s concern permissions, not the owner's token.
+                    if proxy::upstream_error_type(response).await == Some("authentication_error") {
+                        return reject_credential(&state, &access).await;
+                    }
+                    return Err(AppError::forbidden("Claude did not allow listing models"));
+                }
+                _ => break response,
+            }
+        };
         if !response.status().is_success() {
             return Err(AppError::upstream());
         }
@@ -420,6 +486,31 @@ async fn refresh_models(State(state): State<Arc<AppState>>) -> Result<Json<Value
     Ok(Json(
         json!({"discovered":candidates.len(),"message":"Review new models before granting access"}),
     ))
+}
+
+/// Requests one page of the upstream model catalog.
+async fn models_page(
+    state: &AppState,
+    access: &oauth::Access,
+    after: Option<&str>,
+) -> Result<reqwest::Response> {
+    let mut request = state
+        .client
+        .get(format!("{}/v1/models", state.upstream))
+        .timeout(CATALOG_REQUEST_TIMEOUT)
+        .headers(oauth::upstream_headers(access)?)
+        .query(&[("limit", "100")]);
+    if let Some(cursor) = after {
+        request = request.query(&[("after_id", cursor)]);
+    }
+    request.send().await.map_err(|_| AppError::upstream())
+}
+
+/// Upstream rejected tokens that were just refreshed, or reported an authentication error:
+/// only a new login can help.
+async fn reject_credential<T>(state: &AppState, access: &oauth::Access) -> Result<T> {
+    oauth::mark_reauth(state, access.generation).await?;
+    Err(AppError::reauth())
 }
 #[derive(Deserialize)]
 #[serde(deny_unknown_fields)]

@@ -42,12 +42,13 @@ pub struct OAuthState {
     /// Admin sign-in throttling (kept here so it shares `AppState`'s existing lock).
     pub(crate) login: auth::LoginLimiter,
 }
-impl Default for OAuthState {
-    fn default() -> Self {
+impl OAuthState {
+    /// `trusted_proxy_hops` configures the admin login limiter; see [`auth::LoginLimiter`].
+    pub fn new(trusted_proxy_hops: usize) -> Self {
         Self {
             pending: None,
             refresh: Arc::default(),
-            login: auth::LoginLimiter::from_env(),
+            login: auth::LoginLimiter::new(trusted_proxy_hops),
         }
     }
 }
@@ -229,7 +230,7 @@ pub async fn complete(
                 ExchangeError::Failed => AppError::upstream(),
             })?;
     let encrypted = encrypt(&state.config.encryption_key, &tokens)?;
-    sqlx::query("INSERT INTO claude_credential VALUES(1,?,?,1,'connected') ON CONFLICT(id) DO UPDATE SET encrypted_tokens=excluded.encrypted_tokens,expires_at=excluded.expires_at,generation=generation+1,state='connected'")
+    sqlx::query("INSERT INTO claude_credential(id,encrypted_tokens,expires_at,generation,state) VALUES(1,?,?,1,'connected') ON CONFLICT(id) DO UPDATE SET encrypted_tokens=excluded.encrypted_tokens,expires_at=excluded.expires_at,generation=generation+1,state='connected'")
         .bind(encrypted).bind(expires).execute(&state.db).await?;
     Ok(Json(json!({"state":"connected"})))
 }

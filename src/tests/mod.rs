@@ -37,6 +37,7 @@ mod dashboard;
 mod oauth;
 mod policy;
 mod proxy;
+mod server;
 mod startup;
 mod usage;
 
