@@ -53,8 +53,8 @@ function initializeAnalytics() {
 }
 async function loadUsage(offset = null) {
   const version = ++analyticsVersion;
+  $("analytics-status").classList.remove("sr-only");
   $("analytics-status").textContent = "Loading usage…";
-  $("analytics-status").hidden = false;
   $("analytics-content").hidden = true;
   $("page-overview").setAttribute("aria-busy", "true");
   $("history-prev").disabled = true;
@@ -84,7 +84,9 @@ async function loadUsage(offset = null) {
     }
     $("analytics-content").hidden = false;
     renderAnalytics();
-    $("analytics-status").hidden = true;
+    // Keep the live region in the accessibility tree; announce the result once.
+    $("analytics-status").textContent = offset === null ? `Usage loaded: ${number(report.total[0].requests)} requests in this selection.` : `Request history: ${$("history-caption").textContent}.`;
+    $("analytics-status").classList.add("sr-only");
   } catch (error) {
     if (version === analyticsVersion) $("analytics-status").textContent = `Could not load usage. ${error.message} Apply filters or refresh to retry.`;
     throw error;
@@ -185,7 +187,8 @@ function renderTimeChart(metric) {
   container.replaceChildren(); rows.replaceChildren();
   for (const entry of entries) {
     const row = node("tr");
-    for (const field of ["label", "observed_total_tokens", "requests", "errors", "incomplete_requests"]) row.append(node("td", field === "label" ? entry[field] : number(entry[field])));
+    const day = node("th", entry.label); day.scope = "row"; row.append(day);
+    for (const field of ["observed_total_tokens", "requests", "errors", "incomplete_requests"]) row.append(node("td", number(entry[field])));
     rows.append(row);
   }
   if (!analyticsReport.total[0].requests) { container.append(node("p", "No requests in this period. Change the filters to explore another period.", "chart-empty")); return; }
@@ -222,10 +225,11 @@ function renderTimeChart(metric) {
 function renderLedger() {
   const group = $("group-by").value, entries = analyticsReport[group], total = analyticsReport.total[0];
   $("group-heading").textContent = $("group-by").selectedOptions[0].textContent;
+  $("ledger-caption").textContent = `Token ledger by ${$("group-by").selectedOptions[0].textContent.toLowerCase()}`;
   const rows = $("usage-rows"); rows.replaceChildren();
   for (const entry of [...entries, ...(entries.length ? [{ ...total, label: "Total for selection", isTotal: true }] : [])]) {
     const row = node("tr", undefined, entry.isTotal ? "total-row" : "");
-    const label = node("td");
+    const label = node("th"); label.scope = "row";
     if (group === "person" && !entry.isTotal) label.append(button(entry.label, () => selectUsagePerson(entry.id), "text-button"));
     else label.textContent = entry.label;
     row.append(label);
@@ -246,7 +250,8 @@ function renderHistory() {
     if (entry.response_model && entry.response_model !== entry.resolved_model) model.append(node("span", `Response: ${entry.response_model}`, "status-detail"));
     const person = node("td", entry.person_name); person.append(node("span", entry.key_label, "status-detail"));
     const outcome = entry.outcome.replaceAll("_", " ");
-    row.append(node("td", entry.started_at.replace("T", " ").replace("Z", "")), person, model, node("td", `${outcome} · ${entry.http_status ?? "—"}`), node("td", duration(entry.finished_at ? Math.max(0, new Date(entry.finished_at) - new Date(entry.started_at)) : null)));
+    const started = node("th", entry.started_at.replace("T", " ").replace("Z", "")); started.scope = "row";
+    row.append(started, person, model, node("td", `${outcome} · ${entry.http_status ?? "—"}`), node("td", duration(entry.finished_at ? Math.max(0, new Date(entry.finished_at) - new Date(entry.started_at)) : null)));
     for (const field of [...tokenFields, "observed_total_tokens"]) row.append(node("td", number(entry[field])));
     const measurement = node("td"); measurement.append(node("span", entry.usage_state.replaceAll("_", " "), ["partial", "unknown"].includes(entry.usage_state) ? "status warning" : "status"));
     row.append(measurement); rows.append(row);

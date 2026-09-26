@@ -57,8 +57,10 @@ button:hover {
   background: var(--green-dark);
 }
 button:disabled {
-  cursor: wait;
   opacity: 0.55;
+}
+button[aria-busy="true"] {
+  cursor: wait;
 }
 .secondary {
   background: transparent;
@@ -86,14 +88,14 @@ button:focus-visible,
 input:focus-visible,
 select:focus-visible,
 pre:focus-visible {
-  outline: 3px solid #779b6d;
+  outline: 3px solid #345c41;
   outline-offset: 3px;
 }
 input,
 select {
   width: 100%;
   min-height: 44px;
-  border: 1px solid #9fa99e;
+  border: 1px solid #7b857a;
   border-radius: 5px;
   background: white;
   color: var(--ink);
@@ -297,6 +299,12 @@ td {
 td:first-child {
   font-weight: 600;
 }
+tbody th {
+  font-size: inherit;
+  font-weight: 600;
+  color: inherit;
+  border-top: 1px solid var(--line);
+}
 .usage-table tbody tr:hover {
   background: #f0f3eb;
 }
@@ -432,6 +440,21 @@ form h2 {
   gap: 12px 24px;
   margin-bottom: 18px;
 }
+.grant-fieldset {
+  border: 0;
+  margin: 0;
+  padding: 0;
+  min-width: 0;
+}
+.grant-legend {
+  padding: 0;
+  font-size: 1.05rem;
+  font-weight: 650;
+  margin-bottom: 6px;
+}
+.grant-fieldset .helper {
+  margin-bottom: 14px;
+}
 .check-label {
   display: flex;
   align-items: center;
@@ -514,6 +537,9 @@ form h2 {
 .error {
   font-size: 0.9rem;
   min-height: 1.5em;
+}
+.notice:empty {
+  display: none;
 }
 footer {
   display: flex;
@@ -789,11 +815,11 @@ pre {
 .total-row { font-weight: 700; background: var(--soft); }
 .history-section { margin-top: 40px; }
 .history-section .table-wrap { max-height: 560px; }
-.history-section th { position: sticky; top: 0; z-index: 1; background: var(--paper); }
+.history-section thead th { position: sticky; top: 0; z-index: 1; background: var(--paper); }
 .history-pagination { display: flex; justify-content: space-between; align-items: center; gap: 16px; margin-top: 16px; }
 .history-pagination p { color: var(--muted); font-size: .85rem; }
 summary { cursor: pointer; color: var(--green); padding: 12px 0; font-size: .9rem; }
-summary:focus-visible, .table-wrap:focus-visible { outline: 3px solid #779b6d; outline-offset: 3px; }
+summary:focus-visible, .table-wrap:focus-visible { outline: 3px solid #345c41; outline-offset: 3px; }
 .sr-only { position: absolute; width: 1px; height: 1px; padding: 0; margin: -1px; overflow: hidden; clip-path: inset(50%); white-space: nowrap; border: 0; }
 @media (max-width: 1200px) {
   .share-chart { flex-direction: column; align-items: stretch; }

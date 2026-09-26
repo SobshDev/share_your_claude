@@ -14,12 +14,20 @@ function node(tag, text, className) {
   if (className) element.className = className;
   return element;
 }
+// Both live regions stay in the accessibility tree; new text is set on the
+// next frame after clearing so a repeated message is announced again.
+let noticeFrame = 0;
 function notice(message, error = false) {
-  const box = $("notice");
-  if (!box) return;
-  box.textContent = message;
-  box.className = error ? "notice error" : "notice";
-  box.hidden = !message;
+  const status = $("notice"),
+    alert = $("notice-error");
+  if (!status || !alert) return;
+  cancelAnimationFrame(noticeFrame);
+  status.textContent = "";
+  alert.textContent = "";
+  if (message)
+    noticeFrame = requestAnimationFrame(() => {
+      (error ? alert : status).textContent = message;
+    });
 }
 async function api(path, method = "GET", body) {
   let response;
@@ -60,7 +68,10 @@ async function api(path, method = "GET", body) {
   return data;
 }
 async function run(action, button) {
-  if (button) button.disabled = true;
+  if (button) {
+    button.disabled = true;
+    button.setAttribute("aria-busy", "true");
+  }
   notice("");
   try {
     await action();
@@ -70,7 +81,10 @@ async function run(action, button) {
     if (error.status === 503 && error.type === "authentication_error")
       await connection().catch(() => {});
   } finally {
-    if (button) button.disabled = button.dataset.unavailable === "true";
+    if (button) {
+      button.disabled = button.dataset.unavailable === "true";
+      button.removeAttribute("aria-busy");
+    }
   }
 }
 function button(label, action, className = "secondary") {
@@ -240,15 +254,18 @@ function renderPeople() {
               return;
             }
             const form = node("form", undefined, "grant-form"),
+              fieldset = node("fieldset", undefined, "grant-fieldset"),
               options = node("div", undefined, "grant-options");
-            form.append(
-              node("h3", `Model access for ${key.label}`),
+            fieldset.append(
+              node("legend", `Model access for ${key.label}`, "grant-legend"),
               node(
                 "p",
                 "Fable 5.1 cannot be granted. Save with none selected to pause model access.",
                 "helper",
               ),
+              options,
             );
+            form.append(fieldset);
             for (const model of models.filter(
               (m) => m.enabled && m.reviewed_at && !m.blocked,
             )) {
@@ -288,7 +305,6 @@ function renderPeople() {
             const save = node("button", "Save access");
             save.type = "submit";
             form.append(
-              options,
               save,
               button("Cancel", async () => form.remove()),
             );

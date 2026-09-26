@@ -29,7 +29,8 @@
         </div>
       </aside>
       <main id="main" tabindex="-1">
-        <div id="notice" class="notice" role="status" hidden></div>
+        <div id="notice" class="notice" role="status"></div>
+        <div id="notice-error" class="notice error" role="alert"></div>
         <section id="page-overview" class="page">
           <header class="page-header">
             <div>
@@ -76,6 +77,7 @@
           </div>
           <div class="table-wrap">
             <table class="usage-table">
+              <caption id="ledger-caption" class="sr-only">Token ledger by user</caption>
               <thead>
                 <tr>
                   <th scope="col" id="group-heading">Person</th>
@@ -110,8 +112,8 @@
           </div>
           <section class="history-section" aria-labelledby="history-title">
             <div class="report-heading"><h2 id="history-title">Request history</h2><p>Newest first · UTC · 50 per page</p></div>
-            <div class="table-wrap" tabindex="0" aria-label="Request history, scroll for all columns"><table><thead><tr><th scope="col">Started (UTC)</th><th scope="col">User / key</th><th scope="col">Model</th><th scope="col">Outcome / HTTP</th><th scope="col">Duration</th><th scope="col">Input</th><th scope="col">Cache read</th><th scope="col">Cache write</th><th scope="col">Output</th><th scope="col">Observed total</th><th scope="col">Measurement</th></tr></thead><tbody id="request-rows"></tbody></table></div>
-            <div class="history-pagination"><button id="history-prev" class="secondary" disabled>Previous</button><p id="history-caption" role="status"></p><button id="history-next" class="secondary" disabled>Next</button></div>
+            <div class="table-wrap" tabindex="0" aria-label="Request history, scroll for all columns"><table><caption class="sr-only">Request history, newest first</caption><thead><tr><th scope="col">Started (UTC)</th><th scope="col">User / key</th><th scope="col">Model</th><th scope="col">Outcome / HTTP</th><th scope="col">Duration</th><th scope="col">Input</th><th scope="col">Cache read</th><th scope="col">Cache write</th><th scope="col">Output</th><th scope="col">Observed total</th><th scope="col">Measurement</th></tr></thead><tbody id="request-rows"></tbody></table></div>
+            <div class="history-pagination"><button id="history-prev" class="secondary" disabled>Previous</button><p id="history-caption"></p><button id="history-next" class="secondary" disabled>Next</button></div>
           </section>
           </div>
         </section>
