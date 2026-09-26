@@ -13,17 +13,20 @@ RUN --mount=type=cache,target=/usr/local/cargo/registry \
     && cp target/release/shared-router /shared-router
 
 FROM debian:bookworm-slim@sha256:88200866dfff7ea7f5cbcb6ec7c8a701889efe6fe859fe64d6990e4b07ea4171
-RUN apt-get update && apt-get install -y --no-install-recommends ca-certificates curl \
+RUN apt-get update && apt-get install -y --no-install-recommends ca-certificates \
     && rm -rf /var/lib/apt/lists/* \
     && groupadd --gid 10001 router \
     && useradd --uid 10001 --gid 10001 --no-create-home --shell /usr/sbin/nologin router \
     && install -d -o 10001 -g 10001 -m 0700 /data
+# The image distributes the binary, so it carries the license and third-party notices too.
+COPY LICENSE THIRD_PARTY_NOTICES.md THIRD_PARTY_NOTICES_CRATES.md /usr/share/doc/shared-router/
 COPY --from=build /shared-router /usr/local/bin/shared-router
 USER 10001:10001
 WORKDIR /data
 ENV BIND_ADDRESS=0.0.0.0:8080 DATABASE_URL=sqlite:///data/router.sqlite
 EXPOSE 8080
-HEALTHCHECK --interval=30s --timeout=3s --start-period=10s CMD curl --fail --silent http://127.0.0.1:8080/readyz || exit 1
+# The binary probes its own /readyz (5-second request timeout), so the image needs no curl.
+HEALTHCHECK --interval=30s --timeout=6s --start-period=10s CMD ["shared-router", "healthcheck"]
 ARG REVISION=unknown
 LABEL org.opencontainers.image.source="https://github.com/SobshDev/shared_router" \
       org.opencontainers.image.licenses="MIT" \

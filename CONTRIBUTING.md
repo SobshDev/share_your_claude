@@ -17,11 +17,11 @@ node --check static/*.js
 
 The tests use temporary SQLite databases and mock upstream servers, never real Claude credentials. They need permission to open loopback sockets, so they can fail inside restrictive sandboxes.
 
-An ignored smoke test runs the real opencodex Anthropic adapter against the mock-backed router. Run it when you change the proxy, the request allowlists, tool name mapping, or streaming. It needs Bun and an unpacked opencodex package:
+An ignored smoke test runs the real opencodex Anthropic adapter against the mock-backed router. Run it when you change the proxy, the request allowlists, tool name mapping, or streaming, either locally or through the manual **opencodex smoke** workflow. It needs Bun and an unpacked `@bitkyc08/opencodex` package at the version pinned as `OPENCODEX_VERSION` in `.github/workflows/opencodex-smoke.yml`:
 
 ```bash
-OPENCODEX_SOURCE=/absolute/path/to/opencodex \
-cargo test opencodex_adapter_smoke -- --ignored
+OPENCODEX_SOURCE=/absolute/path/to/node_modules/@bitkyc08/opencodex \
+cargo test --locked opencodex_adapter_smoke -- --ignored
 ```
 
 ## Invariants
@@ -32,7 +32,7 @@ These are not negotiable. A pull request that weakens one will not be merged, ev
 - **Secrets and content are never logged or stored.** Do not log, persist, or echo router keys, OAuth tokens, the encryption key, passwords or their hashes, session or CSRF tokens, prompts, completions, raw provider error bodies, or SQL values. Only the allowlisted numeric usage fields are stored.
 - **The proxy never replays or retries a `/v1/messages` request upstream,** including after 429s, timeouts, or network errors. Each accepted request is sent upstream at most once.
 - **One replica per database.** Refresh coordination, admission control, the login throttle, and pending OAuth logins are process-local, and startup recovery assumes no other process is writing. Do not add behavior that depends on multiple replicas.
-- **New upstream surface is reviewed explicitly.** Request fields, control keys, tool types, and `anthropic-beta` values reach Claude only through the allowlists in `policy.rs` and `proxy.rs`. Add to them deliberately, and update the accepted request surface table in the README in the same change.
+- **New upstream surface is reviewed explicitly.** Request fields, control keys, tool types, and `anthropic-beta` values reach Claude only through the allowlists in `policy.rs` and `proxy::CLIENT_BETAS`. Add to them deliberately, and update the accepted request surface table in the README in the same change.
 - **Unknown usage stays unknown.** Missing token counts are never estimated or shown as zero.
 
 ## Commits and pull requests

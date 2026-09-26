@@ -8,6 +8,8 @@ services:
       ENCRYPTION_KEY: ${ENCRYPTION_KEY:?Set ENCRYPTION_KEY to a base64-encoded 32-byte key}
       ADMIN_PASSWORD_HASH: ${ADMIN_PASSWORD_HASH:?Set ADMIN_PASSWORD_HASH to your Argon2id password hash}
       RUST_LOG: ${RUST_LOG:-shared_router=info}
+      # Set to 1 behind Dokploy's Traefik so sign-in throttling sees each client's address.
+      TRUSTED_PROXY_HOPS: ${TRUSTED_PROXY_HOPS:-0}
     volumes:
       - router_data:/data
     expose:
