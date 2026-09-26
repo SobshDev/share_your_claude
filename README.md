@@ -188,6 +188,12 @@ bash scripts/backup.sh
 
 This uses SQLite `VACUUM INTO` for a consistent online database copy. Do not copy only the live `.sqlite` file while WAL mode is active. Store the encryption key separately; a database backup alone cannot recover Claude credentials. Treat database backups as private even though provider tokens are encrypted.
 
+The script writes `router-<UTC timestamp>.sqlite` (mode 600) to `./backups` and prints its absolute path. On the server, set `BACKUP_DIR` to a directory outside the Dokploy checkout, because Dokploy may replace that directory on redeploy. `BACKUP_KEEP=N` keeps only the newest N `router-*.sqlite` files in that directory; without it, nothing is pruned. When `sqlite3` is installed on the host, the script runs `PRAGMA integrity_check` on the copy; a failed check keeps the file, skips pruning, and exits nonzero. Without `sqlite3` it warns and skips the check. The temporary snapshot inside `/data` is removed on every exit, including failures and Ctrl-C, and a partial local copy is deleted.
+
+```bash
+BACKUP_DIR=/srv/router-backups BACKUP_KEEP=14 bash scripts/backup.sh
+```
+
 Database migrations run automatically at every startup and are forward-only. Take a backup before each upgrade; rolling back means redeploying the previous version and restoring that backup.
 
 The [operations runbook](docs/operations.md) has copy-paste commands for finding the Compose volume, backing up, restoring, upgrading, rotating the encryption key or owner password (including invalidating existing sessions), and troubleshooting `needs_reauth`, sign-in throttling, and `/readyz` failures.

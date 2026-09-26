@@ -32,7 +32,7 @@ docker exec "$router_container" rm "/data/$router_backup"
 chmod 600 "./$router_backup"
 ```
 
-From a Compose directory that uses the same project name, `bash scripts/backup.sh` does the same and writes to `backups/`. Move the file to protected storage. Backups contain hashed keys, usage history, and the encrypted Claude tokens, so treat them as private.
+From a Compose directory that uses the same project name, `bash scripts/backup.sh` does the same, writes to `./backups` or to `BACKUP_DIR`, and with `BACKUP_KEEP=N` keeps only the newest N backups there. On Dokploy, point `BACKUP_DIR` outside the checkout. Move the file to protected storage. Backups contain hashed keys, usage history, and the encrypted Claude tokens, so treat them as private.
 
 ## Restore
 
