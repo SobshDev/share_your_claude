@@ -68,6 +68,14 @@ async function api(path, method = "GET", body) {
   return data;
 }
 async function run(action, button) {
+  // Keyboard users keep their place: re-rendering replaces the control, so
+  // focus returns to its replacement (by data-focus-key) or a fallback.
+  const hadFocus =
+      button &&
+      (document.activeElement === button ||
+        button.form?.contains(document.activeElement)),
+    focusKey = button?.dataset.focusKey,
+    focusFallback = button?.dataset.focusFallback;
   if (button) {
     button.disabled = true;
     button.setAttribute("aria-busy", "true");
@@ -85,7 +93,28 @@ async function run(action, button) {
       button.disabled = button.dataset.unavailable === "true";
       button.removeAttribute("aria-busy");
     }
+    if (hadFocus) restoreFocus(button, focusKey, focusFallback);
   }
+}
+function restoreFocus(button, ...keys) {
+  const active = document.activeElement;
+  if (active && active !== document.body && active.isConnected) return;
+  const target = [
+    button,
+    ...keys.map(
+      (key) =>
+        key && document.querySelector(`[data-focus-key="${CSS.escape(key)}"]`),
+    ),
+  ].find(
+    (element) =>
+      element?.isConnected && !element.disabled && !element.closest("[hidden]"),
+  );
+  target?.focus();
+}
+function focusKey(element, key, fallback) {
+  element.dataset.focusKey = key;
+  if (fallback) element.dataset.focusFallback = fallback;
+  return element;
 }
 function button(label, action, className = "secondary") {
   const element = node("button", label, className);
@@ -113,12 +142,19 @@ function showOutput(title, description, content, copyLabel, secret = false) {
   $("copy-status").textContent = "";
   $("output-dialog").showModal();
 }
-function page() {
-  const name = ["overview", "keys", "connection"].includes(
-    location.hash.slice(1),
-  )
-    ? location.hash.slice(1)
-    : "overview";
+const pages = {
+  overview: "Usage overview",
+  keys: "Friends & keys",
+  connection: "Claude connection",
+};
+let currentPage = null;
+function page(focusHeading = false) {
+  const hash = location.hash.slice(1),
+    known = Object.hasOwn(pages, hash);
+  // Other fragments (such as #main) keep the page that is already shown.
+  if (!known && currentPage) return;
+  const name = known ? hash : "overview";
+  currentPage = name;
   document.querySelectorAll(".page").forEach((element) => {
     element.hidden = element.id !== `page-${name}`;
   });
@@ -127,7 +163,8 @@ function page() {
       element.setAttribute("aria-current", "page");
     else element.removeAttribute("aria-current");
   });
-  document.title = `${{ overview: "Usage overview", keys: "Friends & keys", connection: "Claude connection" }[name]} · Shared Router`;
+  document.title = `${pages[name]} · Shared Router`;
+  if (focusHeading) $(`page-${name}`).querySelector("h1").focus();
 }
 async function connection() {
   const data = await api("me");
@@ -184,12 +221,19 @@ function renderPeople() {
   for (const person of people) {
     const section = node("section", undefined, "friend");
     const heading = node("div", undefined, "friend-heading");
-    heading.append(node("h3", person.name));
-    heading.append(button("View usage", () => selectUsagePerson(person.id), "text-button"));
+    const name = focusKey(node("h3", person.name), `person:${person.id}`);
+    name.tabIndex = -1;
+    heading.append(name);
+    heading.append(
+      focusKey(
+        button("View usage", () => selectUsagePerson(person.id), "text-button"),
+        `person:${person.id}:usage`,
+      ),
+    );
     heading.append(
       button(
         "Rename",
-        async () => {
+        async (opener) => {
           if (section.querySelector(".rename-form")) return;
           const form = node("form", undefined, "rename-form input-action"),
             input = node("input");
@@ -197,12 +241,19 @@ function renderPeople() {
           input.required = true;
           input.maxLength = 100;
           input.setAttribute("aria-label", "New name");
-          const save = node("button", "Save name");
+          const save = focusKey(
+            node("button", "Save name"),
+            `person:${person.id}:save`,
+            `person:${person.id}:rename`,
+          );
           save.type = "submit";
           form.append(
             input,
             save,
-            button("Cancel", async () => form.remove()),
+            button("Cancel", async () => {
+              form.remove();
+              opener.focus();
+            }),
           );
           form.addEventListener("submit", (event) => {
             event.preventDefault();
@@ -218,6 +269,7 @@ function renderPeople() {
         "text-button",
       ),
     );
+    focusKey(heading.lastElementChild, `person:${person.id}:rename`);
     section.append(heading);
     const ownKeys = keys.filter((key) => key.person_id === person.id);
     if (!ownKeys.length)
@@ -248,7 +300,7 @@ function renderPeople() {
       const actions = node("div", undefined, "key-actions");
       if (!key.revoked_at) {
         actions.append(
-          button("Edit access", async () => {
+          button("Edit access", async (opener) => {
             if (row.nextElementSibling?.classList.contains("grant-form")) {
               row.nextElementSibling.remove();
               return;
@@ -302,11 +354,18 @@ function renderPeople() {
                   "helper",
                 ),
               );
-            const save = node("button", "Save access");
+            const save = focusKey(
+              node("button", "Save access"),
+              `key:${key.id}:save`,
+              `key:${key.id}:access`,
+            );
             save.type = "submit";
             form.append(
               save,
-              button("Cancel", async () => form.remove()),
+              button("Cancel", async () => {
+                form.remove();
+                opener.focus();
+              }),
             );
             form.addEventListener("submit", (event) => {
               event.preventDefault();
@@ -324,6 +383,7 @@ function renderPeople() {
             row.after(form);
           }),
         );
+        focusKey(actions.lastElementChild, `key:${key.id}:access`);
         actions.append(
           button("opencodex setup", async () => {
             const config = await api(`keys/${key.id}/config`);
@@ -335,6 +395,7 @@ function renderPeople() {
             );
           }),
         );
+        focusKey(actions.lastElementChild, `key:${key.id}:config`);
         // Revocation cannot be undone, so it needs a deliberate second click.
         let revokeTimer;
         const prompt = () =>
@@ -372,6 +433,7 @@ function renderPeople() {
           },
           "secondary danger",
         );
+        focusKey(revoke, `key:${key.id}:revoke`, `person:${person.id}`);
         // run() disables the button while busy, which can blur it; ignore that.
         revoke.addEventListener("blur", () => {
           if (!revoke.disabled && revoke.dataset.confirm === "yes")
@@ -415,6 +477,7 @@ function renderModels() {
           },
         ),
       );
+    if (!model.blocked) focusKey(row.lastElementChild, `model:${model.id}`);
     $("model-list").append(row);
   }
   if (!models.some((m) => !m.blocked))
@@ -447,7 +510,11 @@ async function initialize() {
     return;
   }
   page();
-  window.addEventListener("hashchange", page);
+  window.addEventListener("hashchange", () => page(true));
+  document.querySelector(".skip-link").addEventListener("click", (event) => {
+    event.preventDefault();
+    $("main").focus();
+  });
   const today = new Date(),
     start = new Date(today);
   start.setUTCDate(start.getUTCDate() - 29);

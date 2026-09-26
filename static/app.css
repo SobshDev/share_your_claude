@@ -628,6 +628,12 @@ pre {
 [hidden] {
   display: none !important;
 }
+#page-overview[aria-busy="true"] #analytics-content {
+  opacity: 0.6;
+}
+[tabindex="-1"]:focus {
+  outline: none;
+}
 @media (prefers-reduced-motion: no-preference) {
   .notice {
     animation: notice-in 0.2s ease-out;

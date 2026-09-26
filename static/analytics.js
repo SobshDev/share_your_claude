@@ -28,7 +28,19 @@ async function selectUsagePerson(id) {
   $("usage-person").value = id;
   location.hash = "overview";
   await loadUsage();
+  $("scope-title").focus({ preventScroll: true });
   $("scope-title").scrollIntoView({ block: "start" });
+}
+// Keep focus on the pagination controls; move it only when the pressed one
+// becomes disabled at the first or last page.
+function pageHistory(control, offset) {
+  const hadFocus = document.activeElement === control;
+  return run(async () => {
+    await loadUsage(offset());
+    if (!hadFocus || !control.disabled) return;
+    const other = $(control.id === "history-next" ? "history-prev" : "history-next");
+    (other.disabled ? $("history-title") : other).focus();
+  });
 }
 function initializeAnalytics() {
   let chartWidth = 0;
@@ -41,8 +53,8 @@ function initializeAnalytics() {
   }).observe($("time-chart"));
   $("group-by").addEventListener("change", () => analyticsReport && renderLedger());
   $("chart-metric").addEventListener("change", () => analyticsReport && renderCharts());
-  $("history-prev").addEventListener("click", () => run(() => loadUsage(Math.max(0, analyticsReport.offset - 50))));
-  $("history-next").addEventListener("click", () => run(() => loadUsage(analyticsReport.offset + 50)));
+  $("history-prev").addEventListener("click", (event) => pageHistory(event.currentTarget, () => Math.max(0, analyticsReport.offset - 50)));
+  $("history-next").addEventListener("click", (event) => pageHistory(event.currentTarget, () => analyticsReport.offset + 50));
   document.querySelectorAll("[data-days]").forEach((control) => control.addEventListener("click", () => run(async () => {
     const end = new Date(), start = new Date(end);
     start.setUTCDate(start.getUTCDate() - Number(control.dataset.days) + 1);
@@ -55,10 +67,9 @@ async function loadUsage(offset = null) {
   const version = ++analyticsVersion;
   $("analytics-status").classList.remove("sr-only");
   $("analytics-status").textContent = "Loading usage…";
-  $("analytics-content").hidden = true;
+  // Earlier results stay in place (dimmed while busy) so focus and scroll
+  // position survive; the block is hidden only before the first report.
   $("page-overview").setAttribute("aria-busy", "true");
-  $("history-prev").disabled = true;
-  $("history-next").disabled = true;
   try {
     let params;
     if (offset !== null && analyticsParams) params = new URLSearchParams(analyticsParams);
@@ -88,7 +99,10 @@ async function loadUsage(offset = null) {
     $("analytics-status").textContent = offset === null ? `Usage loaded: ${number(report.total[0].requests)} requests in this selection.` : `Request history: ${$("history-caption").textContent}.`;
     $("analytics-status").classList.add("sr-only");
   } catch (error) {
-    if (version === analyticsVersion) $("analytics-status").textContent = `Could not load usage. ${error.message} Apply filters or refresh to retry.`;
+    if (version === analyticsVersion) {
+      $("analytics-status").textContent = `Could not load usage. ${error.message} Apply filters or refresh to retry.`;
+      $("analytics-content").hidden = true;
+    }
     throw error;
   } finally {
     if (version === analyticsVersion) $("page-overview").setAttribute("aria-busy", "false");
@@ -162,7 +176,7 @@ function shareChart(id, entries, metric, action) {
 }
 function renderCharts() {
   const report = analyticsReport, metric = $("chart-metric").value, total = report.total[0];
-  shareChart("model-chart", report.model, metric, async (id) => { $("usage-model").value = id; await loadUsage(); });
+  shareChart("model-chart", report.model, metric, async (id) => { $("usage-model").value = id; await loadUsage(); $("scope-title").focus(); });
   shareChart("person-chart", report.person, metric, selectUsagePerson);
   $("person-chart-note").textContent = `Share of ${$("chart-metric").selectedOptions[0].textContent.toLowerCase()} in this selection. Select a user to explore.`;
   shareChart("token-chart", tokenFields.map((field, index) => ({ label: tokenLabels[index], value: total[field] })), "value");
