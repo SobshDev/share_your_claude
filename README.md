@@ -170,7 +170,9 @@ bash scripts/backup.sh
 
 This uses SQLite `VACUUM INTO` for a consistent online database copy. Do not copy only the live `.sqlite` file while WAL mode is active. Store the encryption key separately; a database backup alone cannot recover Claude credentials. Treat database backups as private even though provider tokens are encrypted.
 
-To restore, stop the router, replace the database in its named volume using an offline container, remove any old `router.sqlite-wal` and `router.sqlite-shm` belonging to the replaced database, restore the matching encryption key, ensure files are owned by UID 10001, and restart. A stale refresh token in an old backup can require a new Claude login. Changing the encryption key without re-encrypting the database makes saved credentials unreadable. Reconnect with the new key to replace them.
+Database migrations run automatically at every startup and are forward-only. Take a backup before each upgrade; rolling back means redeploying the previous version and restoring that backup.
+
+The [operations runbook](docs/operations.md) has copy-paste commands for finding the Compose volume, backing up, restoring, upgrading, rotating the encryption key or owner password (including invalidating existing sessions), and troubleshooting `needs_reauth`, sign-in throttling, and `/readyz` failures.
 
 ## Development and verification
 
