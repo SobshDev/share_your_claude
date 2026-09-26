@@ -2,9 +2,10 @@
 //! and the OAuth token endpoint.
 //!
 //! The text of the first user message selects a scenario: `error` (429), `unauthorized` (401),
-//! `redirect` (307), `disconnect` (stream that waits for the client to hang up),
-//! `no-final-usage`, `stream-error`, `truncated`, `missing` (no usage), and `wrong-model`
-//! (serves `claude-fable-5-1`). Anything else succeeds.
+//! `redirect` (307), `status-NNN` (that status with an Anthropic error envelope),
+//! `disconnect` (stream that waits for the client to hang up), `no-final-usage`,
+//! `stream-error` (an `overloaded_error` event), `truncated`, `missing` (no usage), and
+//! `wrong-model` (serves `claude-fable-5-1`). Anything else succeeds.
 use super::*;
 
 #[derive(Default)]
@@ -80,6 +81,21 @@ async fn mock_message(
         )
             .into_response();
     }
+    if let Some(status) = content.strip_prefix("status-") {
+        let status = StatusCode::from_u16(status.parse().unwrap()).unwrap();
+        let kind = match status.as_u16() {
+            400 => "invalid_request_error",
+            403 => "permission_error",
+            404 => "not_found_error",
+            529 => "overloaded_error",
+            _ => "api_error",
+        };
+        return (
+            status,
+            Json(json!({"type":"error","error":{"type":kind,"message":"secret upstream text"}})),
+        )
+            .into_response();
+    }
     if body["stream"] == true {
         let prefix = format!(
             "event: message_start\r\ndata: {}\r\n\r\n",
@@ -112,7 +128,7 @@ async fn mock_message(
             stream.push_str("event: message_delta\ndata: {\"type\":\"message_delta\",\"usage\":{\"output_tokens\":7}}\n\n");
         }
         if content == "stream-error" {
-            stream.push_str("event: error\ndata: {\"type\":\"error\",\"error\":{\"message\":\"secret upstream text\"}}\n\n");
+            stream.push_str("event: error\ndata: {\"type\":\"error\",\"error\":{\"type\":\"overloaded_error\",\"message\":\"secret upstream text\"}}\n\n");
         } else if content != "truncated" {
             stream.push_str("event: message_stop\ndata: {\"type\":\"message_stop\"}\n\n");
         }

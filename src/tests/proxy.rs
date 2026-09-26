@@ -284,3 +284,80 @@ async fn unreviewed_betas_are_rejected_before_upstream() {
     assert_eq!(outcomes, [("denied".into(), 400), ("denied".into(), 400)]);
     assert_eq!(h.mock.requests.load(Ordering::SeqCst), 0);
 }
+
+#[tokio::test]
+async fn upstream_statuses_keep_their_anthropic_error_type() {
+    let h = Harness::new().await;
+    for (status, kind) in [
+        (400, "invalid_request_error"),
+        (404, "not_found_error"),
+        (529, "overloaded_error"),
+        (500, "api_error"),
+    ] {
+        let response = h
+            .request(
+                "/v1/messages",
+                &h.key,
+                message(&format!("status-{status}"), false),
+            )
+            .await;
+        assert_eq!(response.status(), status);
+        let body = json_body(response).await;
+        assert_eq!(body["type"], "error");
+        assert_eq!(body["error"]["type"], kind, "status {status}");
+        assert!(!body.to_string().contains("secret upstream text"));
+    }
+}
+
+#[tokio::test]
+async fn stream_error_events_keep_only_their_type() {
+    let h = Harness::new().await;
+    let response = h
+        .request("/v1/messages", &h.key, message("stream-error", true))
+        .await;
+    let text = text_body(response).await;
+    let last = text.trim_end().rsplit("\n\n").next().unwrap();
+    assert!(last.starts_with("event: error\n"), "{last}");
+    let data: Value = serde_json::from_str(last.split_once("data: ").unwrap().1).unwrap();
+    assert_eq!(data["error"]["type"], "overloaded_error");
+    assert!(!text.contains("secret upstream text"));
+}
+
+#[tokio::test]
+async fn router_generated_errors_use_the_anthropic_envelope() {
+    let h = Harness::new().await;
+    let auth = [("x-api-key", h.key.as_str())];
+    let oversized = vec![b' '; proxy::MAX_REQUEST_BODY_BYTES + 1];
+    for (response, status, kind) in [
+        (h.get("/v1/unknown", &auth).await, 404, "not_found_error"),
+        (
+            h.request("/v1/messages/batches", &h.key, message("hello", false))
+                .await,
+            404,
+            "not_found_error",
+        ),
+        (
+            h.get("/v1/messages", &auth).await,
+            405,
+            "invalid_request_error",
+        ),
+        (
+            h.send(
+                "POST",
+                "/v1/messages",
+                &[("content-type", "application/json"), auth[0]],
+                oversized,
+            )
+            .await,
+            413,
+            "request_too_large",
+        ),
+    ] {
+        assert_eq!(response.status(), status);
+        assert_eq!(response.headers()["content-type"], "application/json");
+        let body = json_body(response).await;
+        assert_eq!(body["type"], "error");
+        assert_eq!(body["error"]["type"], kind, "status {status}");
+    }
+    assert_eq!(h.mock.requests.load(Ordering::SeqCst), 0);
+}

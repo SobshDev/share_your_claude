@@ -1,6 +1,6 @@
 use crate::{
     AppState, auth,
-    error::{AppError, Result},
+    error::{self, AppError, Result},
     oauth,
     policy::{self, ToolMap},
     usage::{self, RequestGuard, Usage},
@@ -36,8 +36,6 @@ const STREAM_CHANNEL_CAPACITY: usize = 4;
 const CLIENT_SEND_TIMEOUT: Duration = Duration::from_secs(120);
 /// How long the router tries to deliver the sanitized error event that ends a failed stream.
 const STREAM_ERROR_SEND_TIMEOUT: Duration = Duration::from_secs(5);
-/// Sanitized event that replaces whatever went wrong in a stream.
-const STREAM_INTERRUPTED: &[u8] = b"event: error\ndata: {\"type\":\"error\",\"error\":{\"type\":\"api_error\",\"message\":\"The stream was interrupted. Usage may be incomplete.\"}}\n\n";
 /// Client-requested betas reviewed for pass-through. The router's own compatibility betas,
 /// [`oauth::BETA`], are always sent and may also be requested.
 pub const CLIENT_BETAS: &[&str] = &[
@@ -303,11 +301,7 @@ async fn handle_error_status(
     };
     let mut result = AppError(
         code,
-        if code == StatusCode::TOO_MANY_REQUESTS {
-            "rate_limit_error"
-        } else {
-            "api_error"
-        },
+        error::error_type(code),
         "Claude rejected the request. Check the model, connection, or retry later",
     )
     .into_response();
@@ -350,9 +344,9 @@ async fn open_stream(
             ..
         } = admitted;
         let result = stream_response(&state, &id, &model, response, mapping, &tx, &mut guard).await;
-        if result.is_err() {
-            let error = Bytes::from_static(STREAM_INTERRUPTED);
-            let _ = tokio::time::timeout(STREAM_ERROR_SEND_TIMEOUT, tx.send(Ok(error))).await;
+        if let Err(error) = result {
+            let event = interrupted_event(error.1);
+            let _ = tokio::time::timeout(STREAM_ERROR_SEND_TIMEOUT, tx.send(Ok(event))).await;
             let _ = guard.finish("upstream_error", Some(200), false).await;
         }
     });
@@ -415,6 +409,15 @@ async fn finish_json(
         .finish("completed", Some(status.as_u16()), counting)
         .await?;
     Ok(Json(value).into_response())
+}
+
+/// Sanitized event that ends a failed stream. Only the error type is kept.
+fn interrupted_event(kind: &str) -> Bytes {
+    let payload = json!({"type":"error","error":{
+        "type": kind,
+        "message": "The stream was interrupted. Usage may be incomplete.",
+    }});
+    Bytes::from(format!("event: error\ndata: {payload}\n\n"))
 }
 
 async fn verify_response_model(
@@ -565,7 +568,19 @@ impl StreamProgress {
                 let delta_model = value.get("delta").and_then(|v| v.get("model"));
                 verify_response_model(state, id, model, delta_model).await?;
             }
-            "error" => return Err(AppError::upstream()),
+            "error" => {
+                // Relay a documented error type, such as a retryable overload, never the text.
+                let kind = value
+                    .pointer("/error/type")
+                    .and_then(Value::as_str)
+                    .and_then(error::known_error_type)
+                    .unwrap_or("api_error");
+                return Err(AppError(
+                    StatusCode::BAD_GATEWAY,
+                    kind,
+                    "Claude ended the stream with an error",
+                ));
+            }
             "message_stop" => {
                 if !self.started {
                     return Err(AppError::upstream());
