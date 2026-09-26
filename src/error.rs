@@ -56,15 +56,15 @@ pub async fn envelope_rejections(request: Request, next: Next) -> Response {
     if !plain || !(status.is_client_error() || status.is_server_error()) {
         return response;
     }
+    let (mut parts, body) = response.into_parts();
     let message = match status.as_u16() {
         404 => "Not found",
         405 => "Method not allowed",
         413 => "Request body is too large",
         415 => "Expected an application/json request body",
-        400 | 422 => "Invalid JSON request body",
+        400 | 422 => rejection_message(body).await,
         _ => "The router could not complete this operation",
     };
-    let (mut parts, _) = response.into_parts();
     parts.headers.remove(header::CONTENT_TYPE);
     parts.headers.remove(header::CONTENT_LENGTH);
     let (envelope, body) = AppError(status, error_type(status), message)
@@ -72,6 +72,21 @@ pub async fn envelope_rejections(request: Request, next: Next) -> Response {
         .into_parts();
     parts.headers.extend(envelope.headers);
     Response::from_parts(parts, body)
+}
+
+/// A client-facing message for an axum 400 or 422 rejection. The body is axum's own text,
+/// read only to tell query, JSON, and other rejections apart; it is never relayed.
+async fn rejection_message(body: axum::body::Body) -> &'static str {
+    let text = axum::body::to_bytes(body, 4096).await.unwrap_or_default();
+    if text.starts_with(b"Failed to deserialize query string") {
+        "Invalid query parameters"
+    } else if text.starts_with(b"Failed to parse the request body as JSON")
+        || text.starts_with(b"Failed to deserialize the JSON body")
+    {
+        "Invalid JSON request body"
+    } else {
+        "Invalid request"
+    }
 }
 
 #[derive(Debug)]

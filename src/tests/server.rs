@@ -277,3 +277,31 @@ async fn failures_log_one_sanitized_category_each() {
         assert!(!text.contains(secret), "logs contain {secret}: {text}");
     }
 }
+#[tokio::test]
+async fn rejections_name_the_part_of_the_request_that_was_invalid() {
+    let h = Harness::new().await;
+    let response = h.admin("/admin/api/analytics?offset=-1", "GET", None).await;
+    assert_eq!(response.status(), 400);
+    let body = json_body(response).await;
+    assert_eq!(body["error"]["type"], "invalid_request_error");
+    assert_eq!(body["error"]["message"], "Invalid query parameters");
+    let session = h.session().await;
+    let response = h
+        .send(
+            "POST",
+            "/admin/api/people",
+            &[
+                ("content-type", "application/json"),
+                ("cookie", session.cookie.as_str()),
+                ("origin", ORIGIN),
+                ("x-csrf-token", session.csrf.as_str()),
+            ],
+            "{",
+        )
+        .await;
+    assert_eq!(response.status(), 400);
+    assert_eq!(
+        json_body(response).await["error"]["message"],
+        "Invalid JSON request body"
+    );
+}
