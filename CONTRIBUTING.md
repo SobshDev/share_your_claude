@@ -32,7 +32,7 @@ These are not negotiable. A pull request that weakens one will not be merged, ev
 - **Secrets and content are never logged or stored.** Do not log, persist, or echo router keys, OAuth tokens, the encryption key, passwords or their hashes, session or CSRF tokens, prompts, completions, raw provider error bodies, or SQL values. Only the allowlisted numeric usage fields are stored.
 - **The proxy never replays or retries a `/v1/messages` request upstream,** including after 429s, timeouts, or network errors. Each accepted request is sent upstream at most once.
 - **One replica per database.** Refresh coordination, admission control, the login throttle, and pending OAuth logins are process-local, and startup recovery assumes no other process is writing. Do not add behavior that depends on multiple replicas.
-- **New upstream surface is reviewed explicitly.** Request fields, control keys, tool types, and `anthropic-beta` values reach Claude only through the allowlists in `policy.rs` and `proxy.rs`. Add to them deliberately, and update the accepted request surface table in the README in the same change.
+- **New upstream surface is reviewed explicitly.** Request fields, control keys, tool types, and `anthropic-beta` values reach Claude only through the allowlists in `policy.rs` and `proxy::CLIENT_BETAS`. Add to them deliberately, and update the accepted request surface table in the README in the same change.
 - **Unknown usage stays unknown.** Missing token counts are never estimated or shown as zero.
 
 ## Commits and pull requests

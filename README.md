@@ -143,7 +143,7 @@ Admission control keeps one friend from taking the whole router. Each key may ha
 
 ### Accepted request surface
 
-Anything outside these lists is rejected with a 400 `invalid_request_error`. The allowlists live in [`src/policy.rs`](src/policy.rs) (`validate`) and [`src/proxy.rs`](src/proxy.rs) (`forward`), which are the source of truth.
+Anything outside these lists is rejected with a 400 `invalid_request_error`. The allowlists live in [`src/policy.rs`](src/policy.rs) (`validate`), [`src/proxy.rs`](src/proxy.rs) (`CLIENT_BETAS`), and [`src/oauth.rs`](src/oauth.rs) (`BETA`, the router's own betas), which are the source of truth.
 
 | Part | Accepted values |
 |---|---|
@@ -155,9 +155,9 @@ Anything outside these lists is rejected with a 400 `invalid_request_error`. The
 | `cache_control` keys (top level) | `type`, `ttl` |
 | Tool definition keys | `name`, `type`, `description`, `input_schema`, `cache_control`, `strict`, `defer_loading`, `allowed_callers`, `max_uses`, `allowed_domains`, `blocked_domains`, `user_location`, `citations`, `max_content_tokens`, `display_width_px`, `display_height_px`, `display_number` |
 | Tool `type` values | omitted or `custom`, `web_search_20250305`, `web_fetch_20250910`, `code_execution_20250522`, `code_execution_20250825`, `text_editor_20250124`, `text_editor_20250429`, `text_editor_20250728`, `computer_20250124`, `bash_20250124` |
-| `anthropic-beta` header values | `claude-code-20250219`, `oauth-2025-04-20`, `prompt-caching-2024-07-31`, `interleaved-thinking-2025-05-14`, `fine-grained-tool-streaming-2025-05-14` |
+| `anthropic-beta` header values | Caller betas (`proxy::CLIENT_BETAS`): `prompt-caching-2024-07-31`, `interleaved-thinking-2025-05-14`, `fine-grained-tool-streaming-2025-05-14`. The router's own betas (`oauth::BETA`), `claude-code-20250219` and `oauth-2025-04-20`, may also be listed. |
 
-`model` is required (1–200 characters) and `messages` must be an array. `/v1/messages` requires a positive integer `max_tokens`; `stream` must be a boolean, and `count_tokens` refuses `stream: true`. Tool names must be 1–128 characters and unique within a request. The contents of messages, system blocks, and tool input schemas are passed through as data. The header may list several comma-separated betas, and every one must be on the list. The router always sends `claude-code-20250219,oauth-2025-04-20` upstream and appends accepted caller betas.
+`model` is required (1–200 bytes) and `messages` must be an array. `/v1/messages` requires a positive integer `max_tokens`; `stream` must be a boolean, and `count_tokens` refuses `stream: true`. Each tool must be an object with a name of 1–128 bytes, unique within the request. The contents of messages, system blocks, and tool input schemas are passed through as data. Betas may be split across several `anthropic-beta` header lines and comma-separated within each, and every one must be on the list. The router always sends `claude-code-20250219,oauth-2025-04-20` upstream, followed by the accepted caller betas, each listed once.
 
 The dashboard API uses session cookies, exact-origin checks, and `X-CSRF-Token` for mutations. `POST /admin/api/login` takes `{"password":"…"}`, requires the configured Origin, and returns the CSRF token; `GET /admin/api/me` returns it for an existing session. Sessions expire after twelve hours. Each session is bound to the `ADMIN_PASSWORD_HASH` it was issued under, so changing that value and redeploying signs every dashboard session out. Friend API keys never authorize admin operations.
 
