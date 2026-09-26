@@ -182,6 +182,8 @@ async fn startup_upgrades_an_initial_database_and_recovers_it() {
         "INSERT INTO request_usage(id,key_id,endpoint,requested_model,started_at,outcome,usage_state,input_tokens,output_tokens,raw_usage) VALUES('counted','k','/v1/messages','claude-sonnet-4-6','2026-01-01T00:00:01.000Z','in_progress','complete',12,3,'{\"input_tokens\":12,\"output_tokens\":3}')",
         "INSERT INTO request_usage(id,key_id,endpoint,requested_model,started_at,outcome) VALUES('uncounted','k','/v1/messages','claude-sonnet-4-6','2026-01-01T00:00:02.000Z','in_progress')",
         "INSERT INTO request_usage(id,key_id,endpoint,requested_model,started_at,finished_at,outcome,usage_state) VALUES('done','k','/v1/messages','claude-sonnet-4-6','2026-01-01T00:00:03.000Z','2026-01-01T00:00:04.000Z','completed','unknown')",
+        "INSERT INTO model(id,display_name,model_group,enabled,reviewed_at) VALUES('claude-sonnet-4-6','Sonnet','claude',1,'now')",
+        "INSERT INTO key_model_grant(key_id,model_id) VALUES('k','claude-sonnet-4-6'),('k','claude-fable-5-1')",
     ] {
         sqlx::query(sql).execute(&old).await.unwrap();
     }
@@ -221,6 +223,13 @@ async fn startup_upgrades_an_initial_database_and_recovers_it() {
     // 0004
     assert_eq!(index("usage_model_time").await.unwrap(), 0);
     assert_eq!(index("usage_endpoint_model_time").await.unwrap(), 1);
+    // 0005: an erroneous Fable grant from an older release is removed; other grants stay.
+    let grants: Vec<String> =
+        sqlx::query_scalar("SELECT model_id FROM key_model_grant WHERE key_id='k'")
+            .fetch_all(&pool)
+            .await
+            .unwrap();
+    assert_eq!(grants, ["claude-sonnet-4-6"]);
 
     let name: String = sqlx::query_scalar("SELECT name FROM person WHERE id='p'")
         .fetch_one(&pool)
@@ -319,5 +328,62 @@ async fn database_rejects_key_labels_outside_the_length_limit() {
     };
     assert!(rename("x".repeat(101)).await.is_err());
     rename("Desktop".into()).await.unwrap();
+    pool.close().await;
+}
+
+#[tokio::test]
+async fn database_refuses_to_grant_fable() {
+    let dir = tempfile::tempdir().unwrap();
+    let (pool, key) = database_with_key(dir.path()).await;
+    for (id, group) in [
+        ("claude-fable-5-1-20260901", "claude"),
+        ("CLAUDE-FABLE-5-1", "claude"),
+        ("renamed-fable", "fable-5.1"),
+        ("claude-sonnet-4-6", "claude"),
+    ] {
+        sqlx::query("INSERT INTO model(id,display_name,model_group,enabled,reviewed_at) VALUES(?,?,?,1,'now')")
+            .bind(id)
+            .bind(id)
+            .bind(group)
+            .execute(&pool)
+            .await
+            .unwrap();
+    }
+    let grant = |model: &'static str| {
+        sqlx::query("INSERT INTO key_model_grant(key_id,model_id) VALUES(?,?)")
+            .bind(&key)
+            .bind(model)
+            .execute(&pool)
+    };
+    for model in [
+        "claude-fable-5-1",
+        "claude-fable-5-1-20260901",
+        "CLAUDE-FABLE-5-1",
+        "renamed-fable",
+    ] {
+        let error = grant(model).await.unwrap_err();
+        assert!(
+            error.to_string().contains("Fable 5.1 cannot be granted"),
+            "{model}: {error}"
+        );
+    }
+    grant("claude-sonnet-4-6").await.unwrap();
+    let moved =
+        sqlx::query("UPDATE key_model_grant SET model_id='claude-fable-5-1' WHERE key_id=?")
+            .bind(&key)
+            .execute(&pool)
+            .await;
+    assert!(moved.is_err());
+
+    // Regrouping a granted model as Fable revokes its grants.
+    sqlx::query("UPDATE model SET model_group='fable-5.1' WHERE id='claude-sonnet-4-6'")
+        .execute(&pool)
+        .await
+        .unwrap();
+    let grants: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM key_model_grant")
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+    assert_eq!(grants, 0);
     pool.close().await;
 }
