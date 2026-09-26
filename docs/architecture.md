@@ -6,10 +6,10 @@ Shared Router is a single Rust binary built on Axum, with one SQLite database. I
 
 | Module | Responsibility |
 |---|---|
-| [`main.rs`](../src/main.rs) | CLI entry point. `serve` (default) loads config, opens the database, and runs the server with graceful shutdown on Ctrl-C or SIGTERM. `generate-key`, `hash-password`, and `backup PATH` are one-shot helper commands. |
+| [`main.rs`](../src/main.rs) | CLI entry point. `serve` (default) loads config, opens the database, and runs the server; on Ctrl-C or SIGTERM it reports `/readyz` as 503, drains open requests for up to 20 seconds, records the rest as `interrupted`, and closes the database. `generate-key`, `hash-password` (piped input only), `backup PATH`, `healthcheck`, and `help` are one-shot commands; stray arguments exit with status 2. |
 | [`lib.rs`](../src/lib.rs) | `AppState` (config, SQLite pool, HTTP client, OAuth state with the login throttle, and the admission semaphores with their limits) and the router: health probes, friend routes, admin routes, the 32 MiB body limit, and security headers on every response. |
 | [`config.rs`](../src/config.rs) | Reads and validates environment variables at startup, and builds the upstream HTTP client with redirects and automatic retries disabled. |
-| [`db.rs`](../src/db.rs) | Opens SQLite in WAL mode, runs embedded migrations, and performs startup recovery: unfinished requests become `interrupted` and expired admin sessions are deleted. |
+| [`db.rs`](../src/db.rs) | Creates the database file (mode 600) and missing parent directories (mode 700), opens SQLite in WAL mode, runs embedded migrations, and performs startup recovery: unfinished requests become `interrupted` with an empty `finished_at`, and expired admin sessions are deleted. Also writes owner-only `backup` copies. |
 | [`auth.rs`](../src/auth.rs) | Router key authentication (`x-api-key` or `Authorization: Bearer`, SHA-256 lookup), owner login with Argon2id and a login throttle, session cookies, the exact-origin check, and CSRF enforcement for admin mutations. |
 | [`policy.rs`](../src/policy.rs) | The Fable 5.1 block, model resolution through grants and aliases, the request body allowlists, and `ToolMap`, which renames custom tools to hashed `custom_` names on the way up and restores them on the way down. |
 | [`proxy.rs`](../src/proxy.rs) | Friend routes: `/v1/messages`, `/v1/messages/count_tokens`, and `/v1/models`. Runs the request pipeline below, the `anthropic-beta` allowlist, the SSE decoder, and response model verification. |

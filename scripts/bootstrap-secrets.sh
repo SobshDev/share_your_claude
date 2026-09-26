@@ -5,7 +5,7 @@ if ! docker image inspect "$router_image" >/dev/null 2>&1; then
   echo "Image $router_image not found. Build the image first: docker build -t $router_image ." >&2
   exit 1
 fi
-read -r -s -p 'Owner password (at least 12 characters): ' router_password
+read -r -s -p 'Owner password (12 to 1024 bytes): ' router_password
 echo
 read -r -s -p 'Repeat password: ' router_confirmation
 echo

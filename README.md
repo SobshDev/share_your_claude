@@ -10,8 +10,6 @@ Requires Rust 1.88+ and a C compiler (SQLite is bundled). HTTP is accepted only 
 
 ```bash
 cargo build --locked
-mkdir -p data
-chmod 700 data
 export ENCRYPTION_KEY="$(./target/debug/shared-router generate-key)"
 ```
 
@@ -25,7 +23,20 @@ unset router_password
 PUBLIC_ORIGIN=http://localhost:8080 ./target/debug/shared-router
 ```
 
-Open http://localhost:8080/admin. Keep `PUBLIC_ORIGIN` identical to the browser origin, including its port. The default bind address is `127.0.0.1:8080`; the database defaults to `data/router.sqlite`.
+Open http://localhost:8080/admin. Keep `PUBLIC_ORIGIN` identical to the browser origin, including its port. The default bind address is `127.0.0.1:8080`; the database defaults to `data/router.sqlite`. The router creates the database file with mode 600, and any missing parent directories with mode 700, on first start.
+
+### Commands
+
+| Command | Behavior |
+|---|---|
+| `shared-router` or `shared-router serve` | Runs the router. |
+| `shared-router generate-key` | Prints a new random `ENCRYPTION_KEY`. |
+| `shared-router hash-password` | Reads the password from piped standard input and prints its Argon2id `ADMIN_PASSWORD_HASH`. It refuses to read from a terminal, where the password would be echoed. Trailing line breaks are ignored, and the password must be 12 to 1024 bytes. |
+| `shared-router backup PATH` | Writes a consistent copy of the database named by `DATABASE_URL` to a new file at `PATH` (mode 600) with SQLite `VACUUM INTO`. It is safe while the router is serving, and it never overwrites an existing file. |
+| `shared-router healthcheck` | Requests `/readyz` from the router at `BIND_ADDRESS` (an unspecified address such as `0.0.0.0` becomes loopback) with a 5-second timeout. Exits 0 when ready and 1 otherwise. The Docker image uses it as its health check. |
+| `shared-router help`, `-h`, `--help` | Prints usage and exits 0. |
+
+Any other command, or extra arguments to one of the commands above, prints the usage to standard error and exits with status 2.
 
 ## Deploy on Dokploy
 
@@ -175,6 +186,8 @@ AdminSession: hashed session token + CSRF token + expiry
 `input_tokens` excludes cache reads/writes. Observed total = input + cache read + cache write + output. Cumulative streaming snapshots replace previous counts; they are not added. The router checkpoints usage before forwarding usage-bearing events and finalizes once. Tool names are mapped with stable hashed `custom_` names and restored only at protocol tool-use locations; original names that already start with `custom_` remain distinct.
 
 Usage states are `complete`, `partial`, `unknown`, and `not_applicable`. Stream cancellation aborts the upstream connection and preserves the last observed counts. Missing counters are never estimated from text. Reports include observed partial counts and show incomplete request counts; an em dash means unreported, not zero. Requests interrupted before the next checkpoint, or while the process is unavailable, cannot have exact totals reconstructed from the subscription. Completed usage describes what Anthropic reported, even if the final client delivery fails.
+
+On a clean shutdown, requests still open after the drain period are recorded as `interrupted` with the shutdown time. After a crash or kill, the next startup marks the leftover `in_progress` rows as `interrupted` and leaves their `finished_at` empty, because the time the process stopped is unknown. Both keep the last checkpointed counts.
 
 Prompts, completions, raw error bodies, API keys, and OAuth tokens are not logged or stored as usage. Only allowlisted numeric usage fields are persisted. Logs report operation failures without SQL values or provider response bodies. Do not enable HTTP body tracing or configure a reverse proxy to log credentials.
 

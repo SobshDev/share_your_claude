@@ -67,7 +67,7 @@ From a Compose directory that uses the same project name, `bash scripts/backup.s
 
    The last command prints `ready`. Sign in to the dashboard and check that **Friends & keys** shows the people and keys from the backup.
 
-Startup marks requests that were in progress at backup time as `interrupted` and removes expired sessions. If the backup's refresh token has already been rotated, the dashboard will ask you to connect Claude again. A key issued after the backup no longer exists and must be issued again.
+Startup marks requests that were in progress at backup time as `interrupted`, with an empty `finished_at` because their real end is unknown, and removes expired sessions. If the backup's refresh token has already been rotated, the dashboard will ask you to connect Claude again. A key issued after the backup no longer exists and must be issued again.
 
 ## Upgrade
 
