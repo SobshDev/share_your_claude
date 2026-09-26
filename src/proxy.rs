@@ -404,7 +404,7 @@ async fn retry_unauthorized(
 
 /// Returns the `error.type` of an upstream error body, read up to a small bound. The body's
 /// text is never logged or returned.
-async fn upstream_error_type(response: reqwest::Response) -> Option<&'static str> {
+pub(crate) async fn upstream_error_type(response: reqwest::Response) -> Option<&'static str> {
     let body = limited_body(response, MAX_ERROR_BODY_BYTES).await.ok()?;
     let value: Value = serde_json::from_slice(&body).ok()?;
     error::known_error_type(value.pointer("/error/type")?.as_str()?)
