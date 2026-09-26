@@ -43,6 +43,8 @@ pub struct AppState {
     pub(crate) token_endpoint: String,
     /// How long a client may stop reading a stream; tests shorten it.
     pub(crate) client_send_timeout: std::time::Duration,
+    /// Longest a relayed stream may run; tests shorten it.
+    pub(crate) max_stream_duration: std::time::Duration,
 }
 
 impl AppState {
@@ -58,6 +60,7 @@ impl AppState {
             upstream: "https://api.anthropic.com".into(),
             token_endpoint: "https://api.anthropic.com/v1/oauth/token".into(),
             client_send_timeout: proxy::CLIENT_SEND_TIMEOUT,
+            max_stream_duration: proxy::MAX_STREAM_DURATION,
         }))
     }
 }

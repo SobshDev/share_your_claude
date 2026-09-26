@@ -17,6 +17,9 @@ use serde_json::{Value, json};
 use sqlx::Row;
 use std::{collections::HashMap, sync::Arc};
 
+/// Upper bound for each upstream catalog page request, including its body.
+pub const CATALOG_REQUEST_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(30);
+
 pub fn routes(state: Arc<AppState>) -> Router<Arc<AppState>> {
     let protected = Router::new()
         .route("/admin/api/me", get(auth::me))
@@ -451,6 +454,7 @@ async fn models_page(
     let mut request = state
         .client
         .get(format!("{}/v1/models", state.upstream))
+        .timeout(CATALOG_REQUEST_TIMEOUT)
         .headers(oauth::upstream_headers(access)?)
         .query(&[("limit", "100")]);
     if let Some(cursor) = after {

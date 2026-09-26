@@ -88,3 +88,56 @@ async fn catalog_refresh_authentication_403_requires_reconnect() {
     assert!(!body.to_string().contains("provider-secret"));
     assert_eq!(credential(&h).await.0, "needs_reauth");
 }
+/// A harness whose state was changed by `edit` before its router was built.
+fn rebuilt(mut h: Harness, edit: impl FnOnce(&mut AppState)) -> Harness {
+    // The router holds the only other references to the state; rebuild it around the change.
+    h.router = Router::new();
+    edit(Arc::get_mut(&mut h.state).unwrap());
+    h.router = app(h.state.clone());
+    h
+}
+
+/// Waits for the latest request to reach a terminal outcome and returns it with its status.
+async fn settled(h: &Harness) -> (String, Option<i64>) {
+    tokio::time::timeout(Duration::from_secs(5), async {
+        loop {
+            let row: (String, Option<i64>) = sqlx::query_as(
+                "SELECT outcome,http_status FROM request_usage ORDER BY rowid DESC LIMIT 1",
+            )
+            .fetch_one(&h.state.db)
+            .await
+            .unwrap();
+            if row.0 != "in_progress" {
+                break row;
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+    })
+    .await
+    .unwrap()
+}
+
+#[tokio::test]
+async fn a_stream_past_the_duration_limit_ends_with_a_timeout_error() {
+    let h = rebuilt(Harness::new().await, |state| {
+        state.max_stream_duration = Duration::from_millis(100);
+    });
+    let response = h
+        .request("/v1/messages", &h.key, message("disconnect", true))
+        .await;
+    assert_eq!(response.status(), 200);
+    let body = tokio::time::timeout(Duration::from_secs(5), text_body(response))
+        .await
+        .unwrap();
+    assert!(body.contains("event: message_start"), "{body}");
+    assert!(body.contains("\"type\":\"timeout_error\""), "{body}");
+    assert_eq!(settled(&h).await, ("interrupted".into(), Some(200)));
+    // The router hung up on the upstream stream.
+    tokio::time::timeout(Duration::from_secs(5), async {
+        while !h.mock.disconnected.load(Ordering::SeqCst) {
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+    })
+    .await
+    .unwrap();
+}

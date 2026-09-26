@@ -108,13 +108,15 @@ pub fn bind_address(value: Option<String>) -> anyhow::Result<SocketAddr> {
         })
 }
 
+/// Shared upstream client. It bounds connecting and each read, with no total timeout: every
+/// non-streaming call sets its own request timeout, and streams are bounded by
+/// [`crate::proxy::MAX_STREAM_DURATION`].
 pub fn http_client() -> anyhow::Result<reqwest::Client> {
     Ok(reqwest::Client::builder()
         .redirect(reqwest::redirect::Policy::none())
         .retry(reqwest::retry::never())
         .connect_timeout(Duration::from_secs(15))
         .read_timeout(Duration::from_secs(120))
-        .timeout(Duration::from_secs(1800))
         .build()?)
 }
 

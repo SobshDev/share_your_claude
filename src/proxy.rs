@@ -37,6 +37,14 @@ const MAX_UPSTREAM_REQUEST_ID_BYTES: usize = 200;
 const STREAM_CHANNEL_CAPACITY: usize = 4;
 /// How long a client may stop reading a stream before the router abandons it.
 pub const CLIENT_SEND_TIMEOUT: Duration = Duration::from_secs(120);
+/// Upper bound for a non-streaming `/v1/messages` call, including its reply body. It matches
+/// the `x-stainless-timeout` the router announces upstream.
+pub const MESSAGE_TIMEOUT: Duration = Duration::from_secs(600);
+/// Upper bound for a `count_tokens` call, including its reply body.
+pub const COUNT_TOKENS_TIMEOUT: Duration = Duration::from_secs(60);
+/// Longest a relayed stream may run. A stream still open after this ends with a
+/// `timeout_error` event and is recorded as interrupted.
+pub const MAX_STREAM_DURATION: Duration = Duration::from_secs(60 * 60);
 /// How long the router tries to deliver the sanitized error event that ends a failed stream.
 const STREAM_ERROR_SEND_TIMEOUT: Duration = Duration::from_secs(5);
 /// Seconds a client should wait before retrying when admission is saturated.
@@ -346,7 +354,7 @@ async fn send_upstream(
     if let Some(betas) = &admitted.betas {
         outbound.insert("anthropic-beta", betas.clone());
     }
-    state
+    let mut request = state
         .client
         .post(format!("{}{endpoint}", state.upstream))
         .headers(outbound)
@@ -358,10 +366,16 @@ async fn send_upstream(
                 "application/json"
             },
         )
-        .json(&admitted.body)
-        .send()
-        .await
-        .map_err(|_| AppError::upstream())
+        .json(&admitted.body);
+    // Streams are bounded by `MAX_STREAM_DURATION` while they are relayed.
+    if !streaming {
+        request = request.timeout(if endpoint == "/v1/messages" {
+            MESSAGE_TIMEOUT
+        } else {
+            COUNT_TOKENS_TIMEOUT
+        });
+    }
+    request.send().await.map_err(|_| AppError::upstream())
 }
 
 /// Records the upstream status and request id before the body is read.
@@ -496,6 +510,7 @@ async fn open_stream(
                 let _ = guard.finish("interrupted", Some(200), false).await;
                 return;
             }
+            Err(StreamError::TooLong) => ("timeout_error", "interrupted", 200),
             Err(StreamError::Upstream(kind)) => (kind, "upstream_error", 200),
             Err(StreamError::Internal) => ("api_error", "interrupted", 500),
         };
@@ -593,6 +608,8 @@ enum StreamError {
     Upstream(&'static str),
     /// The client stopped reading for longer than the send timeout.
     ClientStalled,
+    /// The stream ran longer than [`MAX_STREAM_DURATION`].
+    TooLong,
     /// The router itself failed, for example while writing a usage checkpoint.
     Internal,
 }
@@ -620,9 +637,12 @@ async fn stream_response(
     let mut stream = response.bytes_stream();
     let mut decoder = SseDecoder::default();
     let mut progress = StreamProgress::default();
+    let deadline = tokio::time::sleep(state.max_stream_duration);
+    tokio::pin!(deadline);
     loop {
         let chunk = tokio::select! {
             _ = tx.closed() => { guard.finish("interrupted",Some(200),false).await?; return Ok(()); }
+            () = &mut deadline => return Err(StreamError::TooLong),
             chunk = stream.next() => chunk,
         };
         let Some(chunk) = chunk else {
