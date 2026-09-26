@@ -43,7 +43,7 @@ async fn main() -> anyhow::Result<()> {
                 "Backup destination already exists"
             );
             let url = std::env::var("DATABASE_URL")
-                .unwrap_or_else(|_| "sqlite://data/router.sqlite".into());
+                .unwrap_or_else(|_| shared_router::config::DEFAULT_DATABASE_URL.into());
             let pool = sqlx::sqlite::SqlitePoolOptions::new()
                 .max_connections(1)
                 .connect(&url)
@@ -67,9 +67,6 @@ async fn main() -> anyhow::Result<()> {
         ),
     }
     let config = Config::from_env()?;
-    if config.database_url == "sqlite://data/router.sqlite" {
-        std::fs::create_dir_all("data")?;
-    }
     let pool = db::connect(&config.database_url).await?;
     let address = config.bind;
     let state = AppState::new(config, pool)?;
