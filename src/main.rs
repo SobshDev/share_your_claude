@@ -38,26 +38,9 @@ async fn main() -> anyhow::Result<()> {
             let destination = std::env::args().nth(2).ok_or_else(|| {
                 anyhow::anyhow!("usage: shared-router backup /path/to/new-backup.sqlite")
             })?;
-            anyhow::ensure!(
-                !std::path::Path::new(&destination).exists(),
-                "Backup destination already exists"
-            );
             let url = std::env::var("DATABASE_URL")
                 .unwrap_or_else(|_| shared_router::config::DEFAULT_DATABASE_URL.into());
-            let pool = sqlx::sqlite::SqlitePoolOptions::new()
-                .max_connections(1)
-                .connect(&url)
-                .await?;
-            sqlx::query("VACUUM INTO ?")
-                .bind(&destination)
-                .execute(&pool)
-                .await?;
-            pool.close().await;
-            #[cfg(unix)]
-            {
-                use std::os::unix::fs::PermissionsExt;
-                std::fs::set_permissions(&destination, std::fs::Permissions::from_mode(0o600))?;
-            }
+            db::backup(&url, std::path::Path::new(&destination)).await?;
             println!("Database backup created");
             return Ok(());
         }
