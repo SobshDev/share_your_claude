@@ -17,11 +17,11 @@ node --check static/*.js
 
 The tests use temporary SQLite databases and mock upstream servers, never real Claude credentials. They need permission to open loopback sockets, so they can fail inside restrictive sandboxes.
 
-An ignored smoke test runs the real opencodex Anthropic adapter against the mock-backed router. Run it when you change the proxy, the request allowlists, tool name mapping, or streaming. It needs Bun and an unpacked opencodex package:
+An ignored smoke test runs the real opencodex Anthropic adapter against the mock-backed router. Run it when you change the proxy, the request allowlists, tool name mapping, or streaming, either locally or through the manual **opencodex smoke** workflow. It needs Bun and an unpacked `@bitkyc08/opencodex` package at the version pinned as `OPENCODEX_VERSION` in `.github/workflows/opencodex-smoke.yml`:
 
 ```bash
-OPENCODEX_SOURCE=/absolute/path/to/opencodex \
-cargo test opencodex_adapter_smoke -- --ignored
+OPENCODEX_SOURCE=/absolute/path/to/node_modules/@bitkyc08/opencodex \
+cargo test --locked opencodex_adapter_smoke -- --ignored
 ```
 
 ## Invariants

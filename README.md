@@ -212,11 +212,13 @@ CI runs fmt and clippy on a pinned toolchain, `dtolnay/rust-toolchain@1.97` in [
 
 Tests run against temporary SQLite databases and mock HTTP upstreams. They require loopback socket access and never use your real Claude credentials. They cover model denial, admin isolation, key rotation, token arithmetic, streaming cancellation, recovery, encrypted credentials, PKCE state, refresh concurrency, and sanitized failures.
 
-An optional compatibility test runs the actual installed opencodex adapter against the mock-backed router. It needs Bun and the unpacked opencodex package, without changing your existing opencodex configuration:
+An optional compatibility test runs the real opencodex Anthropic adapter from the `@bitkyc08/opencodex` npm package against the mock-backed router. It needs Bun and the unpacked package, and it does not touch your own opencodex configuration. The tested version is `OPENCODEX_VERSION` in [`.github/workflows/opencodex-smoke.yml`](.github/workflows/opencodex-smoke.yml), which runs the same test weekly and can be started manually from the Actions tab. To run it locally against that version:
 
 ```bash
-OPENCODEX_SOURCE=/absolute/path/to/opencodex \
-cargo test opencodex_adapter_smoke -- --ignored
+opencodex_version=$(sed -n 's/^ *OPENCODEX_VERSION: "\(.*\)"$/\1/p' .github/workflows/opencodex-smoke.yml)
+npm install --prefix /tmp/opencodex --ignore-scripts "@bitkyc08/opencodex@$opencodex_version"
+OPENCODEX_SOURCE=/tmp/opencodex/node_modules/@bitkyc08/opencodex \
+cargo test --locked opencodex_adapter_smoke -- --ignored
 ```
 
 Production readiness still requires completing browser OAuth and one live allowed-model streaming/tool request on your deployed server. The offline suite proves the router contract, not Anthropic’s current account entitlement or OAuth availability.
