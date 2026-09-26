@@ -6,10 +6,11 @@ use crate::{
     usage::{self, RequestGuard, Usage},
 };
 use axum::{
-    Json,
+    Extension, Json,
     body::Body,
-    extract::State,
+    extract::{Request, State},
     http::{HeaderMap, HeaderValue, StatusCode, header},
+    middleware::Next,
     response::{IntoResponse, Response},
 };
 use bytes::Bytes;
@@ -46,23 +47,61 @@ pub const CLIENT_BETAS: &[&str] = &[
 
 type Chunk = std::result::Result<Bytes, io::Error>;
 
+/// Id of the router key that authenticated the request, set by [`authenticate`].
+#[derive(Clone)]
+pub struct KeyId(String);
+
+/// Authenticates the router key from the headers alone, before any request body is read.
+pub async fn authenticate(
+    State(state): State<Arc<AppState>>,
+    mut request: Request,
+    next: Next,
+) -> Response {
+    match auth::api_key(request.headers(), &state).await {
+        Ok(key) => {
+            request.extensions_mut().insert(KeyId(key));
+            next.run(request).await
+        }
+        Err(error) => error.into_response(),
+    }
+}
+
+/// Parses a friend's JSON request body. The route's body limit has already been applied.
+fn json_body(headers: &HeaderMap, body: &[u8]) -> Result<Value> {
+    let json = headers
+        .get(header::CONTENT_TYPE)
+        .and_then(|v| v.to_str().ok())
+        .and_then(|v| v.split(';').next())
+        .is_some_and(|v| v.trim().eq_ignore_ascii_case("application/json"));
+    if !json {
+        return Err(AppError::bad("Expected an application/json request body"));
+    }
+    serde_json::from_slice(body).map_err(|_| AppError::bad("Invalid JSON body"))
+}
+
 pub async fn messages(
     State(state): State<Arc<AppState>>,
+    Extension(KeyId(key)): Extension<KeyId>,
     headers: HeaderMap,
-    Json(body): Json<Value>,
+    body: Bytes,
 ) -> Result<Response> {
-    forward(state, headers, body, false).await
+    let body = json_body(&headers, &body)?;
+    forward(state, key, headers, body, false).await
 }
 pub async fn count_tokens(
     State(state): State<Arc<AppState>>,
+    Extension(KeyId(key)): Extension<KeyId>,
     headers: HeaderMap,
-    Json(body): Json<Value>,
+    body: Bytes,
 ) -> Result<Response> {
-    forward(state, headers, body, true).await
+    let body = json_body(&headers, &body)?;
+    forward(state, key, headers, body, true).await
 }
 
-pub async fn models(State(state): State<Arc<AppState>>, headers: HeaderMap) -> Result<Json<Value>> {
-    let key = auth::api_key(&headers, &state).await?;
+pub async fn models(
+    State(state): State<Arc<AppState>>,
+    Extension(KeyId(key)): Extension<KeyId>,
+) -> Result<Json<Value>> {
     let rows = sqlx::query(
         "SELECT m.* FROM model m JOIN key_model_grant g ON m.id=g.model_id \
          WHERE g.key_id=? AND m.enabled=1 AND m.reviewed_at IS NOT NULL ORDER BY m.id",
@@ -127,11 +166,11 @@ async fn fail<T>(
 
 async fn forward(
     state: Arc<AppState>,
+    key: String,
     headers: HeaderMap,
     body: Value,
     counting: bool,
 ) -> Result<Response> {
-    let key = auth::api_key(&headers, &state).await?;
     let endpoint = if counting {
         "/v1/messages/count_tokens"
     } else {

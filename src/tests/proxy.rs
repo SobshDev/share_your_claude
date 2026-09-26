@@ -361,3 +361,68 @@ async fn router_generated_errors_use_the_anthropic_envelope() {
     }
     assert_eq!(h.mock.requests.load(Ordering::SeqCst), 0);
 }
+
+#[tokio::test]
+async fn keys_are_checked_before_the_request_body_is_read() {
+    let h = Harness::new().await;
+    for headers in [
+        &[("content-type", "application/json")][..],
+        &[
+            ("content-type", "application/json"),
+            ("x-api-key", "sr_wrong"),
+        ][..],
+    ] {
+        // A body that never finishes: reading it would hang the request.
+        let pending = Body::from_stream(futures_util::stream::pending::<
+            std::result::Result<bytes::Bytes, std::io::Error>,
+        >());
+        let response = tokio::time::timeout(
+            Duration::from_secs(5),
+            h.send("POST", "/v1/messages", headers, pending),
+        )
+        .await
+        .expect("rejected without reading the body");
+        assert_eq!(response.status(), 401);
+        let body = json_body(response).await;
+        assert_eq!(body["error"]["type"], "authentication_error");
+    }
+    let rows: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM request_usage")
+        .fetch_one(&h.state.db)
+        .await
+        .unwrap();
+    assert_eq!(rows, 0);
+}
+
+#[tokio::test]
+async fn malformed_bodies_and_content_types_are_invalid_requests() {
+    let h = Harness::new().await;
+    let valid = message("hello", false).to_string();
+    for path in ["/v1/messages", "/v1/messages/count_tokens"] {
+        for (content_type, body) in [
+            (Some("application/json"), "{not json".to_owned()),
+            (Some("text/plain"), valid.clone()),
+            (None, valid.clone()),
+        ] {
+            let mut headers = vec![("x-api-key", h.key.as_str())];
+            headers.extend(content_type.map(|v| ("content-type", v)));
+            let response = h.send("POST", path, &headers, body).await;
+            assert_eq!(response.status(), 400, "{path} {content_type:?}");
+            let body = json_body(response).await;
+            assert_eq!(body["type"], "error");
+            assert_eq!(body["error"]["type"], "invalid_request_error");
+        }
+    }
+    let charset = h
+        .send(
+            "POST",
+            "/v1/messages",
+            &[
+                ("x-api-key", h.key.as_str()),
+                ("content-type", "application/json; charset=utf-8"),
+            ],
+            valid,
+        )
+        .await;
+    assert_eq!(charset.status(), 200);
+    assert_eq!(h.mock.requests.load(Ordering::SeqCst), 1);
+}

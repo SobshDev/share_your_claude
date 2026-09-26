@@ -19,6 +19,9 @@ use axum::{
 use std::sync::Arc;
 use tokio::sync::{Mutex, Semaphore};
 
+/// Body limit for routes that do not declare their own.
+const DEFAULT_BODY_LIMIT_BYTES: usize = 64 * 1024;
+
 pub struct AppState {
     pub config: config::Config,
     pub db: sqlx::SqlitePool,
@@ -47,15 +50,28 @@ impl AppState {
 }
 
 pub fn app(state: Arc<AppState>) -> Router {
+    // Friend routes authenticate from headers before any body is buffered or parsed.
+    let friend_api = Router::new()
+        .route(
+            "/v1/messages",
+            post(proxy::messages).layer(DefaultBodyLimit::max(proxy::MAX_REQUEST_BODY_BYTES)),
+        )
+        .route(
+            "/v1/messages/count_tokens",
+            post(proxy::count_tokens).layer(DefaultBodyLimit::max(proxy::MAX_REQUEST_BODY_BYTES)),
+        )
+        .route("/v1/models", get(proxy::models))
+        .route_layer(middleware::from_fn_with_state(
+            state.clone(),
+            proxy::authenticate,
+        ));
     Router::new()
         .route("/healthz", get(|| async { "ok" }))
         .route("/readyz", get(admin::ready))
-        .route("/v1/messages", post(proxy::messages))
-        .route("/v1/messages/count_tokens", post(proxy::count_tokens))
-        .route("/v1/models", get(proxy::models))
+        .merge(friend_api)
         .merge(admin::routes(state.clone()))
         .fallback(|| async { error::AppError::not_found() })
-        .layer(DefaultBodyLimit::max(proxy::MAX_REQUEST_BODY_BYTES))
+        .layer(DefaultBodyLimit::max(DEFAULT_BODY_LIMIT_BYTES))
         .layer(middleware::from_fn(error::envelope_rejections))
         .layer(middleware::from_fn(|req: axum::extract::Request, next: middleware::Next| async move {
             let mut response = next.run(req).await;
