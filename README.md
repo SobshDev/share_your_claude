@@ -1,6 +1,6 @@
 # Shared Router
 
-A private Claude gateway for a small group. Friends use individual router keys in opencodex; the owner’s Claude OAuth credentials remain on the server. Fable 5.1 is reserved for the owner and cannot be enabled for friend keys.
+A private Claude gateway for a small group. Friends use individual router keys in opencodex; the owner’s Claude OAuth credentials remain on the server. Fable 5.1 is blocked for every router key and cannot be granted; the owner reaches it only through direct Claude access, outside this router.
 
 The Rust service includes an owner dashboard, model grants, streaming and non-streaming Messages API support, token counting, model discovery, encrypted OAuth credentials, coordinated refresh, and SQLite usage reports. It does **not** impose token budgets or convert token counts into subscription-limit percentages.
 
@@ -44,7 +44,7 @@ bash scripts/bootstrap-secrets.sh
 
 The bootstrap script asks for a password and prints ready-to-paste environment entries without creating files. `ENCRYPTION_KEY` is a random 32-byte key encoded as base64. `ADMIN_PASSWORD_HASH` is an Argon2id hash of the password you will use to sign in; it is not another random string. The binary's `generate-key` and `hash-password` commands generate these values individually too.
 
-Generate the encryption key once, keep it stable across redeployments, and back it up securely. Replacing it makes saved Claude credentials unreadable. Keep production values out of the repository. Remove the old `_SOURCE`/`_FILE` settings when upgrading this setup; the service now reads the two direct environment values only. If you already generated secret files, reuse their contents rather than regenerating the encryption key.
+Generate the encryption key once, keep it stable across redeployments, and back it up securely. Replacing it makes saved Claude credentials unreadable. Keep production values out of the repository.
 
 Compose exposes port 8080 only to the container network, with no host-port bindings. Configure the domain in Dokploy's UI; it adds the required routing labels and network automatically. See [Dokploy Compose domains](https://docs.dokploy.com/docs/core/docker-compose/domains). Keep streaming responses unbuffered if you add any custom proxy middleware.
 
@@ -53,6 +53,16 @@ The router runs as UID 10001 with a read-only root filesystem and a persistent `
 For local Compose use, copy `.env.example` to `.env` and fill in the same direct values. Preserve single quotes around the password hash in `.env`; when exporting it in a shell, quote it there as well.
 
 `GET /healthz` checks the process; `GET /readyz` checks SQLite. Readiness does not require an active Claude login, so initial setup can be completed through the dashboard.
+
+### Releases and upgrades
+
+Releases are tagged `vX.Y.Z`, and [CHANGELOG.md](CHANGELOG.md) lists what each one changes, including any configuration steps and new migrations. Read it before upgrading, and take a backup first (see the [operations runbook](docs/operations.md)).
+
+Deploying from `main` picks up every change as it lands. To deploy only releases from a GitHub source, keep **Auto Deploy** on in the Compose service and set its **Trigger Type** to **On Tag**; Dokploy then deploys the tagged commit whenever a new tag is pushed. Confirm after the first push that ordinary commits no longer deploy, because some Dokploy versions have ignored this setting. The tag trigger reacts to new tags and does not hold a deployment on one, so to stay on or return to a specific release, point a deployment branch at that tag and select the branch in Dokploy:
+
+```bash
+git push --force origin 'v0.1.0^{commit}:refs/heads/deploy'
+```
 
 ## First connection and friend setup
 
@@ -76,7 +86,7 @@ For local Compose use, copy `.env.example` to `.env` and fill in the same direct
 }
 ```
 
-The displayed configuration uses only models granted to that key. Even if a client invents another model name, the router checks access again before contacting Claude. Revocation blocks new requests; already-admitted requests can finish. A newly enabled model is granted automatically to future keys; existing keys are changed explicitly through **Edit access**.
+The displayed configuration uses only models granted to that key. Even if a client invents another model name, the router checks access again before contacting Claude. Revocation blocks new requests; already-admitted requests can finish. New keys start with every currently enabled model except Fable 5.1. Enabling a model later does not change existing keys; use **Edit access**.
 
 If friends previously received your actual account credentials, revoke those sessions/credentials before relying on router restrictions. Personal requests sent directly to Claude are outside this router’s per-person accounting. Blocking Fable does not reserve shared account capacity.
 
@@ -91,6 +101,26 @@ Friend endpoints accept `x-api-key: sr_…` or `Authorization: Bearer sr_…`. C
 | GET | `/v1/models` | Permitted reviewed model catalog |
 
 No batch, arbitrary forward-proxy, Files, Managed Agents, or provider-management routes are exposed to friends. Unreviewed request fields, beta headers, server tool types, and fallback/advisor routing are rejected. Custom client tools, images, thinking, and cache controls are supported. Incoming credentials are replaced with the owner’s upstream token. Inference requests are never automatically replayed, including after 429 or network errors.
+
+At most 8 upstream requests run at once across all keys. The router does not queue: a request beyond that limit is answered immediately with `429 rate_limit_error` ("The router is busy"), and a streaming response holds its slot until the stream ends. See [docs/architecture.md](docs/architecture.md) for the module map and the full request flow.
+
+### Accepted request surface
+
+Anything outside these lists is rejected with a 400 `invalid_request_error`. The allowlists live in [`src/policy.rs`](src/policy.rs) (`validate`) and [`src/proxy.rs`](src/proxy.rs) (`forward`), which are the source of truth.
+
+| Part | Accepted values |
+|---|---|
+| Top-level body fields | `model`, `messages`, `system`, `tools`, `tool_choice`, `max_tokens`, `stream`, `temperature`, `top_p`, `top_k`, `stop_sequences`, `metadata`, `thinking`, `output_config`, `cache_control`, `service_tier` |
+| `thinking` keys | `type`, `budget_tokens`, `display` |
+| `output_config` keys | `effort`, `format` |
+| `tool_choice` keys | `type`, `name`, `disable_parallel_tool_use` |
+| `metadata` keys | `user_id` |
+| `cache_control` keys (top level) | `type`, `ttl` |
+| Tool definition keys | `name`, `type`, `description`, `input_schema`, `cache_control`, `strict`, `defer_loading`, `allowed_callers`, `max_uses`, `allowed_domains`, `blocked_domains`, `user_location`, `citations`, `max_content_tokens`, `display_width_px`, `display_height_px`, `display_number` |
+| Tool `type` values | omitted or `custom`, `web_search_20250305`, `web_fetch_20250910`, `code_execution_20250522`, `code_execution_20250825`, `text_editor_20250124`, `text_editor_20250429`, `text_editor_20250728`, `computer_20250124`, `bash_20250124` |
+| `anthropic-beta` header values | `claude-code-20250219`, `oauth-2025-04-20`, `prompt-caching-2024-07-31`, `interleaved-thinking-2025-05-14`, `fine-grained-tool-streaming-2025-05-14` |
+
+`model` is required (1–200 characters) and `messages` must be an array. `/v1/messages` requires a positive integer `max_tokens`; `stream` must be a boolean, and `count_tokens` refuses `stream: true`. Tool names must be 1–128 characters and unique within a request. The contents of messages, system blocks, and tool input schemas are passed through as data. The header may list several comma-separated betas, and every one must be on the list. The router always sends `claude-code-20250219,oauth-2025-04-20` upstream and appends accepted caller betas.
 
 The dashboard API uses session cookies, exact-origin checks, and `X-CSRF-Token` for mutations. `POST /admin/api/login` takes `{"password":"…"}`, requires the configured Origin, and returns the CSRF token; `GET /admin/api/me` returns it for an existing session. Login is limited to five attempts per minute across this single-owner service. Sessions expire after twelve hours. Friend API keys never authorize admin operations.
 
@@ -120,7 +150,7 @@ All charts and tables share the applied filters. Model reporting groups by the r
 
 ## Accounting and failure behavior
 
-SQLite stores people, hashed keys, reviewed models/aliases, grants, an encrypted credential, admin sessions, and per-request usage. The full schema is in `migrations/0001_initial.sql`.
+SQLite stores people, hashed keys, reviewed models/aliases, grants, an encrypted credential, admin sessions, and per-request usage. The schema is the ordered set of files in [`migrations/`](migrations/).
 
 ```text
 Person 1 ── N ApiKey N ── N Model (through KeyModelGrant)
@@ -136,6 +166,8 @@ Usage states are `complete`, `partial`, `unknown`, and `not_applicable`. Stream 
 
 Prompts, completions, raw error bodies, API keys, and OAuth tokens are not logged or stored as usage. Only allowlisted numeric usage fields are persisted. Logs report operation failures without SQL values or provider response bodies. Do not enable HTTP body tracing or configure a reverse proxy to log credentials.
 
+Report suspected vulnerabilities privately as described in [SECURITY.md](SECURITY.md), never in a public issue.
+
 Terminal refresh failures mark the account as needing reconnection. Transient failures return an error without falling back to billed API access. The OAuth compatibility behavior is based on opencodex 2.49.0; live provider requirements can change. Model routing is restricted to the reviewed schema rather than passing new provider features through automatically.
 
 ## Backup and recovery
@@ -148,7 +180,9 @@ bash scripts/backup.sh
 
 This uses SQLite `VACUUM INTO` for a consistent online database copy. Do not copy only the live `.sqlite` file while WAL mode is active. Store the encryption key separately; a database backup alone cannot recover Claude credentials. Treat database backups as private even though provider tokens are encrypted.
 
-To restore, stop the router, replace the database in its named volume using an offline container, remove any old `router.sqlite-wal` and `router.sqlite-shm` belonging to the replaced database, restore the matching encryption key, ensure files are owned by UID 10001, and restart. A stale refresh token in an old backup can require a new Claude login. Changing the encryption key without re-encrypting the database makes saved credentials unreadable. Reconnect with the new key to replace them.
+Database migrations run automatically at every startup and are forward-only. Take a backup before each upgrade; rolling back means redeploying the previous version and restoring that backup.
+
+The [operations runbook](docs/operations.md) has copy-paste commands for finding the Compose volume, backing up, restoring, upgrading, rotating the encryption key or owner password (including invalidating existing sessions), and troubleshooting `needs_reauth`, sign-in throttling, and `/readyz` failures.
 
 ## Development and verification
 
@@ -168,3 +202,18 @@ cargo test opencodex_adapter_smoke -- --ignored
 ```
 
 Production readiness still requires completing browser OAuth and one live allowed-model streaming/tool request on your deployed server. The offline suite proves the router contract, not Anthropic’s current account entitlement or OAuth availability.
+
+See [CONTRIBUTING.md](CONTRIBUTING.md) for the commit convention and the invariants every change must keep.
+
+## Licenses
+
+Shared Router is MIT licensed. [THIRD_PARTY_NOTICES.md](THIRD_PARTY_NOTICES.md) covers bundled SQLite and adapted opencodex code, and [THIRD_PARTY_NOTICES_CRATES.md](THIRD_PARTY_NOTICES_CRATES.md) lists every Rust crate compiled into the Linux binary with its license text. Include both files when you distribute the binary or a Docker image built from it.
+
+Regenerate the crate list whenever `Cargo.lock` changes:
+
+```bash
+cargo install --locked cargo-about
+cargo about generate --locked about.hbs -o THIRD_PARTY_NOTICES_CRATES.md
+```
+
+`about.toml` lists the accepted licenses. A new dependency under any other license makes generation fail until the license is reviewed and added there.

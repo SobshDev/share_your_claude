@@ -1,0 +1,27 @@
+# cargo-about configuration: https://embarkstudios.github.io/cargo-about/
+# Regenerate THIRD_PARTY_NOTICES_CRATES.md after any Cargo.lock change:
+#   cargo install --locked cargo-about
+#   cargo about generate --locked about.hbs -o THIRD_PARTY_NOTICES_CRATES.md
+
+# Licenses we accept. Order sets priority when a crate offers a choice (OR).
+accepted = [
+    "MIT",
+    "Apache-2.0",
+    "ISC",
+    "BSD-3-Clause",
+    "Zlib",
+    "Unicode-3.0",
+    "CDLA-Permissive-2.0",
+]
+
+# The Docker image ships a Linux binary; cover both architectures it is built for.
+targets = ["x86_64-unknown-linux-gnu", "aarch64-unknown-linux-gnu"]
+
+# Dev-dependencies are never compiled into the shipped binary.
+ignore-dev-dependencies = true
+
+# Use only license files shipped in each crate; no network lookups.
+no-clearly-defined = true
+
+# ring's top-level LICENSE is a pointer to several license files.
+workarounds = ["ring"]
