@@ -97,8 +97,12 @@ async fn analytics_scopes_totals_models_history_and_preserves_unknown_usage() {
             .bind(format!("analytics-{index}")).bind(key).bind(endpoint).bind(requested).bind(resolved).bind(started).bind(finished).bind(outcome).bind(measurement).bind(tokens).bind(tokens).bind(tokens.map(|_| "{}"))
             .execute(&h.state.db).await.unwrap();
     }
-    h.admin(&format!("/admin/api/keys/{}", h.key_id), "DELETE", None)
-        .await;
+    assert_eq!(
+        h.admin(&format!("/admin/api/keys/{}", h.key_id), "DELETE", None)
+            .await
+            .status(),
+        204
+    );
     let range = "from=2026-09-01T00:00:00Z&to=2026-09-03T00:00:00Z";
     let report = json_body(
         h.admin(&format!("/admin/api/analytics?{range}"), "GET", None)
@@ -192,31 +196,36 @@ async fn analytics_scopes_totals_models_history_and_preserves_unknown_usage() {
 async fn analytics_empty_ranges_validation_and_pagination() {
     let h = Harness::new().await;
     let anonymous = h.get("/admin/api/analytics", &[]).await;
-    assert_eq!(anonymous.status(), 401);
+    assert_error(anonymous, 401, "authentication_error", AUTH_REQUIRED).await;
     let empty = json_body(h.admin("/admin/api/analytics", "GET", None).await).await;
     assert_eq!(empty["total"][0]["requests"], 0);
     assert!(empty["total"][0]["observed_total_tokens"].is_null());
     assert!(empty["total"][0]["average_duration_ms"].is_null());
     assert_eq!(empty["has_more"], false);
-    for query in [
-        "from=invalid",
-        "from=2026-09-02T00:00:00Z&to=2026-09-01T00:00:00Z",
-        "offset=-1",
-        "offset=4294967296",
+    // An offset that is not a u32 fails axum's query extractor, whose rejection text is
+    // replaced by the generic 400 message, so only the status and type identify it.
+    for (query, message) in [
+        ("from=invalid", "Use RFC3339 timestamps for from and to"),
+        (
+            "from=2026-09-02T00:00:00Z&to=2026-09-01T00:00:00Z",
+            "from must precede to",
+        ),
+        ("offset=-1", ""),
+        ("offset=4294967296", ""),
     ] {
-        assert_eq!(
-            h.admin(&format!("/admin/api/analytics?{query}"), "GET", None)
-                .await
-                .status(),
-            400
-        );
+        let response = h
+            .admin(&format!("/admin/api/analytics?{query}"), "GET", None)
+            .await;
+        assert_error(response, 400, "invalid_request_error", message).await;
     }
-    assert_eq!(
+    assert_error(
         h.admin("/admin/api/usage?group_by=invalid", "GET", None)
-            .await
-            .status(),
-        400
-    );
+            .await,
+        400,
+        "invalid_request_error",
+        GROUP_BY,
+    )
+    .await;
     for index in 0..51 {
         sqlx::query("INSERT INTO request_usage(id,key_id,endpoint,requested_model,started_at,outcome) VALUES(?,?,'/v1/messages',?,'2026-09-02T00:00:00.000Z','in_progress')")
             .bind(format!("page-{index:03}")).bind(&h.key_id).bind(MODEL).execute(&h.state.db).await.unwrap();
@@ -321,10 +330,15 @@ async fn empty_filters_mean_no_filter() {
         200
     );
     // "total" is internal to the analytics report, not a client grouping.
-    assert_eq!(
+    assert_error(
         h.admin("/admin/api/usage?group_by=total", "GET", None)
-            .await
-            .status(),
-        400
-    );
+            .await,
+        400,
+        "invalid_request_error",
+        GROUP_BY,
+    )
+    .await;
 }
+
+/// Message for an unsupported `group_by` value.
+const GROUP_BY: &str = "group_by must be person, key, model, or day";

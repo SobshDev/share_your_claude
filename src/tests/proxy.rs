@@ -150,22 +150,22 @@ async fn upstream_errors_are_sanitized_and_never_replayed() {
     let r = h
         .request("/v1/messages", &h.key, message("error", false))
         .await;
-    assert_eq!(r.status(), 429);
     assert_eq!(r.headers()["retry-after"], "20");
-    assert!(
-        !json_body(r)
-            .await
-            .to_string()
-            .contains("sensitive provider echo")
-    );
-    assert_eq!(
+    let relayed = assert_error(r, 429, "rate_limit_error", REJECTED).await;
+    assert!(!relayed.contains("sensitive provider echo"));
+    assert_error(
         h.request("/v1/messages", &h.key, message("redirect", false))
-            .await
-            .status(),
-        502
-    );
+            .await,
+        502,
+        "api_error",
+        REJECTED,
+    )
+    .await;
     assert_eq!(h.mock.requests.load(Ordering::SeqCst), 2);
 }
+
+/// Message of an upstream error status relayed to the client.
+const REJECTED: &str = "Claude rejected the request";
 
 #[tokio::test]
 async fn unexpected_serving_model_is_recorded_and_response_rejected() {
@@ -173,7 +173,7 @@ async fn unexpected_serving_model_is_recorded_and_response_rejected() {
     let response = h
         .request("/v1/messages", &h.key, message("wrong-model", false))
         .await;
-    assert_eq!(response.status(), 502);
+    assert_error(response, 502, "api_error", FAILED).await;
     let row = sqlx::query("SELECT outcome,response_model,usage_state FROM request_usage")
         .fetch_one(&h.state.db)
         .await
@@ -280,9 +280,13 @@ async fn unreviewed_betas_are_rejected_before_upstream() {
         ][..],
     ] {
         let response = with_headers(&h, extra).await;
-        assert_eq!(response.status(), 400);
-        let body = json_body(response).await;
-        assert_eq!(body["error"]["type"], "invalid_request_error");
+        assert_error(
+            response,
+            400,
+            "invalid_request_error",
+            "This beta feature has not been reviewed",
+        )
+        .await;
     }
     let outcomes: Vec<(String, i64)> =
         sqlx::query_as("SELECT outcome,http_status FROM request_usage")
@@ -309,11 +313,8 @@ async fn upstream_statuses_keep_their_anthropic_error_type() {
                 message(&format!("status-{status}"), false),
             )
             .await;
-        assert_eq!(response.status(), status);
-        let body = json_body(response).await;
-        assert_eq!(body["type"], "error");
-        assert_eq!(body["error"]["type"], kind, "status {status}");
-        assert!(!body.to_string().contains("secret upstream text"));
+        let relayed = assert_error(response, status, kind, REJECTED).await;
+        assert!(!relayed.contains("secret upstream text"));
     }
 }
 
@@ -336,18 +337,25 @@ async fn router_generated_errors_use_the_anthropic_envelope() {
     let h = Harness::new().await;
     let auth = [("x-api-key", h.key.as_str())];
     let oversized = vec![b' '; proxy::MAX_REQUEST_BODY_BYTES + 1];
-    for (response, status, kind) in [
-        (h.get("/v1/unknown", &auth).await, 404, "not_found_error"),
+    for (response, status, kind, message) in [
+        (
+            h.get("/v1/unknown", &auth).await,
+            404,
+            "not_found_error",
+            "Not found",
+        ),
         (
             h.request("/v1/messages/batches", &h.key, message("hello", false))
                 .await,
             404,
             "not_found_error",
+            "Not found",
         ),
         (
             h.get("/v1/messages", &auth).await,
             405,
             "invalid_request_error",
+            "Method not allowed",
         ),
         (
             h.send(
@@ -359,13 +367,10 @@ async fn router_generated_errors_use_the_anthropic_envelope() {
             .await,
             413,
             "request_too_large",
+            "Request body is too large",
         ),
     ] {
-        assert_eq!(response.status(), status);
-        assert_eq!(response.headers()["content-type"], "application/json");
-        let body = json_body(response).await;
-        assert_eq!(body["type"], "error");
-        assert_eq!(body["error"]["type"], kind, "status {status}");
+        assert_error(response, status, kind, message).await;
     }
     assert_eq!(h.mock.requests.load(Ordering::SeqCst), 0);
 }
@@ -390,9 +395,7 @@ async fn keys_are_checked_before_the_request_body_is_read() {
         )
         .await
         .expect("rejected without reading the body");
-        assert_eq!(response.status(), 401);
-        let body = json_body(response).await;
-        assert_eq!(body["error"]["type"], "authentication_error");
+        assert_error(response, 401, "authentication_error", AUTH_REQUIRED).await;
     }
     let rows: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM request_usage")
         .fetch_one(&h.state.db)
@@ -405,19 +408,21 @@ async fn keys_are_checked_before_the_request_body_is_read() {
 async fn malformed_bodies_and_content_types_are_invalid_requests() {
     let h = Harness::new().await;
     let valid = message("hello", false).to_string();
+    let not_json = "Expected an application/json request body";
     for path in ["/v1/messages", "/v1/messages/count_tokens"] {
-        for (content_type, body) in [
-            (Some("application/json"), "{not json".to_owned()),
-            (Some("text/plain"), valid.clone()),
-            (None, valid.clone()),
+        for (content_type, body, message) in [
+            (
+                Some("application/json"),
+                "{not json".to_owned(),
+                "Invalid JSON body",
+            ),
+            (Some("text/plain"), valid.clone(), not_json),
+            (None, valid.clone(), not_json),
         ] {
             let mut headers = vec![("x-api-key", h.key.as_str())];
             headers.extend(content_type.map(|v| ("content-type", v)));
             let response = h.send("POST", path, &headers, body).await;
-            assert_eq!(response.status(), 400, "{path} {content_type:?}");
-            let body = json_body(response).await;
-            assert_eq!(body["type"], "error");
-            assert_eq!(body["error"]["type"], "invalid_request_error");
+            assert_error(response, 400, "invalid_request_error", message).await;
         }
     }
     let charset = h
@@ -444,12 +449,14 @@ async fn hold_stream(h: &Harness, key: &str) -> Body {
     response.into_body()
 }
 
-async fn assert_busy(response: Response) {
-    assert_eq!(response.status(), 429);
+/// Message when every global admission permit is taken.
+const ROUTER_BUSY: &str = "The router is busy";
+/// Message when one key has used all of its own admission permits.
+const KEY_BUSY: &str = "This key has too many requests in progress";
+
+async fn assert_busy(response: Response, message: &str) {
     assert_eq!(response.headers()["retry-after"], "1");
-    let body = json_body(response).await;
-    assert_eq!(body["type"], "error");
-    assert_eq!(body["error"]["type"], "rate_limit_error");
+    assert_error(response, 429, "rate_limit_error", message).await;
 }
 
 fn count_body() -> Value {
@@ -468,6 +475,7 @@ async fn one_key_cannot_take_every_admission_permit() {
     assert_busy(
         h.request("/v1/messages", &h.key, message("hello", false))
             .await,
+        KEY_BUSY,
     )
     .await;
     let counted = h
@@ -511,11 +519,13 @@ async fn saturated_admission_is_denied_before_upstream() {
     assert_busy(
         h.request("/v1/messages", &h.key, message("hello", true))
             .await,
+        ROUTER_BUSY,
     )
     .await;
     assert_busy(
         h.request("/v1/messages/count_tokens", &h.key, count_body())
             .await,
+        ROUTER_BUSY,
     )
     .await;
     drop((messages, counts));
@@ -578,10 +588,14 @@ async fn an_upstream_401_refreshes_once_and_never_replays_messages() {
     let response = h
         .request("/v1/messages", &h.key, message("expired-token", false))
         .await;
-    assert_eq!(response.status(), 503);
-    let body = json_body(response).await;
-    assert_eq!(body["error"]["type"], "api_error");
-    assert!(!body.to_string().contains("owner-secret"));
+    let reply = assert_error(
+        response,
+        503,
+        "api_error",
+        "The router renewed its Claude session. Retry the request",
+    )
+    .await;
+    assert!(!reply.contains("owner-secret"));
     // The message was sent once; the refresh left the credential connected.
     assert_eq!(h.mock.requests.load(Ordering::SeqCst), 1);
     assert_eq!(h.mock.refreshes.load(Ordering::SeqCst), 1);
@@ -613,11 +627,9 @@ async fn a_rejected_refresh_after_a_401_requires_reconnect() {
     let response = h
         .request("/v1/messages", &h.key, message("expired-token", false))
         .await;
-    assert_eq!(response.status(), 503);
-    let body = json_body(response).await;
-    assert_eq!(body["error"]["type"], "authentication_error");
-    assert!(!body.to_string().contains("owner-secret"));
-    assert!(!body.to_string().contains("must not leak"));
+    let reply = assert_error(response, 503, "authentication_error", RECONNECT).await;
+    assert!(!reply.contains("owner-secret"));
+    assert!(!reply.contains("must not leak"));
     assert_eq!(credential(&h).await, ("needs_reauth".into(), 1));
     assert_eq!(h.mock.requests.load(Ordering::SeqCst), 1);
 }
@@ -628,10 +640,8 @@ async fn upstream_403s_disconnect_only_for_authentication_errors() {
     let response = h
         .request("/v1/messages", &h.key, message("status-403", false))
         .await;
-    assert_eq!(response.status(), 403);
-    let body = json_body(response).await;
-    assert_eq!(body["error"]["type"], "permission_error");
-    assert!(!body.to_string().contains("secret upstream text"));
+    let relayed = assert_error(response, 403, "permission_error", REJECTED).await;
+    assert!(!relayed.contains("secret upstream text"));
     assert_eq!(credential(&h).await, ("connected".into(), 1));
     let response = h
         .request("/v1/messages", &h.key, message("hello", false))
@@ -642,10 +652,8 @@ async fn upstream_403s_disconnect_only_for_authentication_errors() {
     let response = h
         .request("/v1/messages", &h.key, message("forbidden-auth", false))
         .await;
-    assert_eq!(response.status(), 503);
-    let body = json_body(response).await;
-    assert_eq!(body["error"]["type"], "authentication_error");
-    assert!(!body.to_string().contains("owner-secret"));
+    let reply = assert_error(response, 503, "authentication_error", RECONNECT).await;
+    assert!(!reply.contains("owner-secret"));
     assert_eq!(credential(&h).await, ("needs_reauth".into(), 1));
     assert_eq!(h.mock.refreshes.load(Ordering::SeqCst), 0);
 }
@@ -786,9 +794,7 @@ async fn invalid_upstream_replies_are_bad_gateways() {
     ] {
         let label = body.to_string();
         let response = h.request(path, &h.key, body).await;
-        assert_eq!(response.status(), 502, "{label}");
-        let body = json_body(response).await;
-        assert_eq!(body["error"]["type"], "api_error");
+        assert_error(response, 502, "api_error", FAILED).await;
         let expected = ("upstream_error".into(), Some(502), usage_state.into());
         assert_eq!(last_row(&h).await, expected, "{label}");
     }
@@ -808,8 +814,7 @@ async fn an_unreachable_upstream_is_a_bad_gateway() {
     let response = h
         .request("/v1/messages", &h.key, message("hello", false))
         .await;
-    assert_eq!(response.status(), 502);
-    assert_eq!(json_body(response).await["error"]["type"], "api_error");
+    assert_error(response, 502, "api_error", FAILED).await;
     let expected = ("upstream_error".into(), Some(502), "unknown".into());
     assert_eq!(last_row(&h).await, expected);
 }
@@ -990,10 +995,26 @@ async fn invalid_and_denied_requests_never_reach_upstream_on_either_endpoint() {
     let mut no_messages = message("hello", false);
     no_messages.as_object_mut().unwrap().remove("messages");
     let mut cases = vec![
-        ("/v1/messages/count_tokens", streaming_count, 400),
-        ("/v1/messages", no_messages, 400),
+        (
+            "/v1/messages/count_tokens",
+            streaming_count,
+            400,
+            "invalid_request_error",
+            "Token counting does not stream",
+        ),
+        (
+            "/v1/messages",
+            no_messages,
+            400,
+            "invalid_request_error",
+            "messages must be an array",
+        ),
     ];
-    for model in ["claude-fable-5-1", "claude-opus-5", "unknown"] {
+    for (model, denial) in [
+        ("claude-fable-5-1", crate::policy::FABLE_RESERVED),
+        ("claude-opus-5", NO_ACCESS),
+        ("unknown", NO_ACCESS),
+    ] {
         for path in ["/v1/messages", "/v1/messages/count_tokens"] {
             let mut body = if path == "/v1/messages" {
                 message("hello", false)
@@ -1001,21 +1022,13 @@ async fn invalid_and_denied_requests_never_reach_upstream_on_either_endpoint() {
                 count_body()
             };
             body["model"] = model.into();
-            cases.push((path, body, 403));
+            cases.push((path, body, 403, "permission_error", denial));
         }
     }
     let total = cases.len();
-    for (path, body, status) in cases {
-        let label = format!("{path} {body}");
+    for (path, body, status, kind, message) in cases {
         let response = h.request(path, &h.key, body).await;
-        assert_eq!(response.status(), status, "{label}");
-        let kind = json_body(response).await["error"]["type"].clone();
-        let expected = if status == 400 {
-            "invalid_request_error"
-        } else {
-            "permission_error"
-        };
-        assert_eq!(kind, expected, "{label}");
+        assert_error(response, status, kind, message).await;
     }
     let denied: i64 = sqlx::query_scalar(
         "SELECT COUNT(*) FROM request_usage WHERE outcome='denied' AND usage_state='not_applicable'",

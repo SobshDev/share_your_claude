@@ -4,7 +4,7 @@ use super::*;
 use crate::auth;
 
 #[tokio::test]
-async fn auth_conflicts_admin_isolation_and_revocation() {
+async fn conflicting_key_headers_are_rejected() {
     let h = Harness::new().await;
     let r = h
         .get(
@@ -15,11 +15,21 @@ async fn auth_conflicts_admin_isolation_and_revocation() {
             ],
         )
         .await;
-    assert_eq!(r.status(), 401);
+    assert_error(r, 401, "authentication_error", AUTH_REQUIRED).await;
+}
+
+#[tokio::test]
+async fn client_keys_cannot_use_the_admin_api() {
+    let h = Harness::new().await;
     let r = h
         .get("/admin/api/keys", &[("x-api-key", h.key.as_str())])
         .await;
-    assert_eq!(r.status(), 401);
+    assert_error(r, 401, "authentication_error", AUTH_REQUIRED).await;
+}
+
+#[tokio::test]
+async fn removed_grants_and_revoked_keys_are_denied_before_upstream() {
+    let h = Harness::new().await;
     assert_eq!(
         h.admin(
             &format!("/admin/api/keys/{}/models", h.key_id),
@@ -30,24 +40,28 @@ async fn auth_conflicts_admin_isolation_and_revocation() {
         .status(),
         204
     );
-    assert_eq!(
+    assert_error(
         h.request("/v1/messages", &h.key, message("hello", false))
-            .await
-            .status(),
-        403
-    );
+            .await,
+        403,
+        "permission_error",
+        NO_ACCESS,
+    )
+    .await;
     assert_eq!(
         h.admin(&format!("/admin/api/keys/{}", h.key_id), "DELETE", None)
             .await
             .status(),
         204
     );
-    assert_eq!(
+    assert_error(
         h.request("/v1/messages", &h.key, message("hello", false))
-            .await
-            .status(),
-        401
-    );
+            .await,
+        401,
+        "authentication_error",
+        AUTH_REQUIRED,
+    )
+    .await;
     assert_eq!(h.mock.requests.load(Ordering::SeqCst), 0);
 }
 
@@ -73,26 +87,37 @@ fn behind_proxy(h: &Harness) -> Router {
         .1
 }
 
+/// Checks a rejected password.
+async fn assert_wrong_password(response: Response) {
+    assert_error(response, 401, "authentication_error", AUTH_REQUIRED).await;
+}
+
+/// Checks a sign-in refused by the login throttle.
+async fn assert_throttled(response: Response) {
+    assert_error(
+        response,
+        429,
+        "rate_limit_error",
+        "Too many sign-in attempts",
+    )
+    .await;
+}
+
 #[tokio::test]
 async fn login_throttles_failures_per_client() {
     let h = Harness::new().await;
     let router = behind_proxy(&h);
     const A: &str = "198.51.100.1";
     for _ in 0..auth::LoginLimiter::CLIENT_FAILURES {
-        assert_eq!(login_from(&router, A, "wrong").await.status(), 401);
+        assert_wrong_password(login_from(&router, A, "wrong").await).await;
     }
-    let throttled = login_from(&router, A, ADMIN_PASSWORD).await;
-    assert_eq!(throttled.status(), 429);
-    assert_eq!(
-        json_body(throttled).await["error"]["type"],
-        "rate_limit_error"
-    );
+    assert_throttled(login_from(&router, A, ADMIN_PASSWORD).await).await;
     // Only the last hop is trusted, so a client cannot escape by prepending addresses.
     let spoofed = format!("203.0.113.7, {A}");
-    assert_eq!(login_from(&router, &spoofed, "wrong").await.status(), 429);
+    assert_throttled(login_from(&router, &spoofed, "wrong").await).await;
     // Another client is unaffected.
     const B: &str = "198.51.100.2";
-    assert_eq!(login_from(&router, B, "wrong").await.status(), 401);
+    assert_wrong_password(login_from(&router, B, "wrong").await).await;
     let response = login_from(&router, B, ADMIN_PASSWORD).await;
     assert_eq!(response.status(), 200);
     let cookie = response.headers()["set-cookie"].to_str().unwrap();
@@ -106,15 +131,15 @@ async fn successful_login_clears_the_clients_failures() {
     let router = behind_proxy(&h);
     const A: &str = "2001:db8::1";
     for _ in 1..auth::LoginLimiter::CLIENT_FAILURES {
-        assert_eq!(login_from(&router, A, "wrong").await.status(), 401);
+        assert_wrong_password(login_from(&router, A, "wrong").await).await;
     }
     assert_eq!(login_from(&router, A, ADMIN_PASSWORD).await.status(), 200);
     // Another address in the same IPv6 /64 is the same client.
     const SAME: &str = "2001:db8::2";
     for _ in 0..auth::LoginLimiter::CLIENT_FAILURES {
-        assert_eq!(login_from(&router, SAME, "wrong").await.status(), 401);
+        assert_wrong_password(login_from(&router, SAME, "wrong").await).await;
     }
-    assert_eq!(login_from(&router, A, ADMIN_PASSWORD).await.status(), 429);
+    assert_throttled(login_from(&router, A, ADMIN_PASSWORD).await).await;
 }
 
 #[test]
@@ -128,8 +153,12 @@ fn login_limiter_windows_global_ceiling_and_size_bound() {
     }
     assert!(!limiter.begin(a, 1059));
     assert!(limiter.begin(b, 1059));
-    // A client's window resets after WINDOW_SECS.
-    assert!(limiter.begin(a, 1000 + LoginLimiter::WINDOW_SECS));
+    // A client's window resets after WINDOW_SECS with a full new allowance.
+    let reset = 1000 + LoginLimiter::WINDOW_SECS;
+    for _ in 0..LoginLimiter::CLIENT_FAILURES {
+        assert!(limiter.begin(a, reset));
+    }
+    assert!(!limiter.begin(a, reset));
 
     // The global ceiling stops distributed guessing, and a success releases its reservation.
     let mut limiter = LoginLimiter::new(0);
@@ -209,18 +238,20 @@ async fn admin_writes_need_both_origin_and_csrf_token() {
     let h = Harness::new().await;
     let session = h.session().await;
     let csrf = session.csrf.as_str();
-    for (origin, token) in [
-        (Some(ORIGIN), None),
-        (Some(ORIGIN), Some("wrong-token")),
-        (Some("https://evil.example"), Some(csrf)),
-        (None, Some(csrf)),
+    for (origin, token, message) in [
+        (Some(ORIGIN), None, WRONG_CSRF),
+        (Some(ORIGIN), Some("wrong-token"), WRONG_CSRF),
+        (Some("https://evil.example"), Some(csrf), WRONG_ORIGIN),
+        (None, Some(csrf), WRONG_ORIGIN),
+        (None, None, WRONG_ORIGIN),
     ] {
-        let response = create_person(&h, origin, token).await;
-        assert_eq!(response.status(), 403, "origin {origin:?} token {token:?}");
-        assert_eq!(
-            json_body(response).await["error"]["type"],
-            "permission_error"
-        );
+        assert_error(
+            create_person(&h, origin, token).await,
+            403,
+            "permission_error",
+            message,
+        )
+        .await;
     }
     let people: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM person")
         .fetch_one(&h.state.db)
@@ -254,8 +285,8 @@ async fn login_requires_the_dashboard_origin() {
                 json!({"password":ADMIN_PASSWORD}).to_string(),
             )
             .await;
-        assert_eq!(response.status(), 403);
         assert!(response.headers().get("set-cookie").is_none());
+        assert_error(response, 403, "permission_error", WRONG_ORIGIN).await;
     }
 }
 
@@ -298,12 +329,13 @@ async fn sessions_expire_log_out_and_use_the_configured_cookie() {
                     Body::empty(),
                 )
                 .await
-                .status()
             }
         };
-        assert_eq!(me(cookie.clone()).await, 200);
-        assert_eq!(me(format!("{other}={token}")).await, 401);
-        assert_eq!(me(format!("{cookie}; {cookie}")).await, 401);
+        let signed_out =
+            |response| assert_error(response, 401, "authentication_error", AUTH_REQUIRED);
+        assert_eq!(me(cookie.clone()).await.status(), 200);
+        signed_out(me(format!("{other}={token}")).await).await;
+        signed_out(me(format!("{cookie}; {cookie}")).await).await;
         let two_headers = send_to(
             &router,
             "GET",
@@ -312,7 +344,7 @@ async fn sessions_expire_log_out_and_use_the_configured_cookie() {
             Body::empty(),
         )
         .await;
-        assert_eq!(two_headers.status(), 401);
+        signed_out(two_headers).await;
 
         // Logout deletes the session and clears the cookie.
         let session = sign_in(&router).await;
@@ -321,7 +353,7 @@ async fn sessions_expire_log_out_and_use_the_configured_cookie() {
         let cleared = response.headers()["set-cookie"].to_str().unwrap();
         assert!(cleared.starts_with(&format!("{name}=;")));
         assert!(cleared.contains("Max-Age=0"));
-        assert_eq!(me(session.cookie.clone()).await, 401);
+        signed_out(me(session.cookie.clone()).await).await;
 
         // An expired session is rejected, and the dashboard sends the owner to sign in.
         sqlx::query("UPDATE admin_session SET expires_at=? WHERE token_hash=?")
@@ -330,7 +362,7 @@ async fn sessions_expire_log_out_and_use_the_configured_cookie() {
             .execute(&h.state.db)
             .await
             .unwrap();
-        assert_eq!(me(cookie.clone()).await, 401);
+        signed_out(me(cookie.clone()).await).await;
         let page = send_to(
             &router,
             "GET",
@@ -342,6 +374,50 @@ async fn sessions_expire_log_out_and_use_the_configured_cookie() {
         assert!(page.status().is_redirection());
         assert_eq!(page.headers()["location"], "/admin/login");
     }
+}
+
+/// Twelve hours, the lifetime of an admin session.
+const SESSION_SECS: i64 = 12 * 3600;
+
+#[tokio::test]
+async fn sessions_last_twelve_hours_and_end_when_the_clock_reaches_expiry() {
+    let h = Harness::new().await;
+    // The login reads the clock between these two readings, so its expiry lies between
+    // them plus the lifetime. Both readings are whole seconds and nearly always equal.
+    let before = db::epoch();
+    let response = h.login(ADMIN_PASSWORD).await;
+    let after = db::epoch();
+    assert_eq!(response.status(), 200);
+    let set_cookie = response.headers()["set-cookie"].to_str().unwrap();
+    let max_age = format!("Max-Age={SESSION_SECS}");
+    assert!(
+        set_cookie.split("; ").any(|attribute| attribute == max_age),
+        "{set_cookie}"
+    );
+    let cookie = set_cookie.split(';').next().unwrap().to_owned();
+    let token = cookie.split_once('=').unwrap().1;
+    let expires_at = |value: i64| {
+        sqlx::query("UPDATE admin_session SET expires_at=? WHERE token_hash=?")
+            .bind(value)
+            .bind(auth::hash(token))
+            .execute(&h.state.db)
+    };
+    let stored: i64 = sqlx::query_scalar("SELECT expires_at FROM admin_session WHERE token_hash=?")
+        .bind(auth::hash(token))
+        .fetch_one(&h.state.db)
+        .await
+        .unwrap();
+    assert!(
+        (before + SESSION_SECS..=after + SESSION_SECS).contains(&stored),
+        "{before} {stored} {after}"
+    );
+    let headers = [("cookie", cookie.as_str())];
+    let me = || h.get("/admin/api/me", &headers);
+    // Move the expiry instead of waiting: a session is valid until the clock reaches it.
+    expires_at(db::epoch() + 60).await.unwrap();
+    assert_eq!(me().await.status(), 200);
+    expires_at(db::epoch()).await.unwrap();
+    assert_error(me().await, 401, "authentication_error", AUTH_REQUIRED).await;
 }
 
 #[tokio::test]
@@ -365,7 +441,7 @@ async fn changing_the_owner_password_revokes_sessions() {
         Body::empty(),
     )
     .await;
-    assert_eq!(me.status(), 401);
+    assert_error(me, 401, "authentication_error", AUTH_REQUIRED).await;
     let write = admin_as(
         &router,
         &session,
@@ -374,7 +450,7 @@ async fn changing_the_owner_password_revokes_sessions() {
         Some(json!({"name":"Sam"})),
     )
     .await;
-    assert_eq!(write.status(), 401);
+    assert_error(write, 401, "authentication_error", AUTH_REQUIRED).await;
     let response = send_to(
         &router,
         "POST",

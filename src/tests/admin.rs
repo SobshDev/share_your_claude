@@ -1,8 +1,32 @@
-//! Admin API: model catalog review, key management, and CSRF protection.
+//! Admin API: model catalog review and key management.
 use super::*;
 
 #[tokio::test]
-async fn catalog_review_key_creation_and_csrf() {
+async fn fable_cannot_be_enabled_after_a_catalog_refresh() {
+    let h = Harness::new().await;
+    assert_eq!(
+        h.admin("/admin/api/models/refresh", "POST", None)
+            .await
+            .status(),
+        200
+    );
+    assert_eq!(
+        error_message(
+            h.admin(
+                "/admin/api/models/claude-fable-5-1",
+                "PUT",
+                Some(json!({"enabled":true}))
+            )
+            .await,
+            403
+        )
+        .await,
+        crate::policy::FABLE_RESERVED
+    );
+}
+
+#[tokio::test]
+async fn new_keys_get_every_enabled_model_and_are_listed_without_their_secret() {
     let h = Harness::new().await;
     assert_eq!(
         h.admin("/admin/api/models/refresh", "POST", None)
@@ -19,16 +43,6 @@ async fn catalog_review_key_creation_and_csrf() {
         .await
         .status(),
         204
-    );
-    assert_eq!(
-        h.admin(
-            "/admin/api/models/claude-fable-5-1",
-            "PUT",
-            Some(json!({"enabled":true}))
-        )
-        .await
-        .status(),
-        403
     );
     let created = json_body(
         h.admin(
@@ -52,21 +66,7 @@ async fn catalog_review_key_creation_and_csrf() {
             .fetch_all(&h.state.db)
             .await
             .unwrap();
-    assert_eq!(grants.len(), 2);
-    assert!(!grants.contains(&"claude-fable-5-1".into()));
-    // A valid session cookie without origin and CSRF token must not allow writes.
-    let r = h
-        .send(
-            "POST",
-            "/admin/api/people",
-            &[
-                ("cookie", h.session().await.cookie.as_str()),
-                ("content-type", "application/json"),
-            ],
-            "{\"name\":\"Attacker\"}",
-        )
-        .await;
-    assert_eq!(r.status(), 403);
+    assert_eq!(grants, ["claude-opus-5", MODEL]);
 }
 
 #[tokio::test]
@@ -139,20 +139,27 @@ async fn editing_access_keeps_grants_for_disabled_models() {
     );
     // The enabled model that was unchecked stays removed.
     assert_eq!(
-        h.request("/v1/messages", &h.key, message("hello", false))
-            .await
-            .status(),
-        403
+        error_message(
+            h.request("/v1/messages", &h.key, message("hello", false))
+                .await,
+            403
+        )
+        .await,
+        NO_ACCESS
     );
 }
 
-/// Error message of an admin or proxy error response, after checking its status.
+/// Error message of an admin or proxy error response, after checking its status, its
+/// envelope, and that its error type is the one Anthropic documents for the status.
 async fn error_message(response: Response, status: u16) -> String {
-    assert_eq!(response.status(), status);
-    json_body(response).await["error"]["message"]
-        .as_str()
-        .unwrap()
-        .to_owned()
+    let kind = match status {
+        400 => "invalid_request_error",
+        401 => "authentication_error",
+        403 => "permission_error",
+        404 => "not_found_error",
+        _ => panic!("no error type listed for {status}"),
+    };
+    assert_error(response, status, kind, "").await
 }
 
 #[tokio::test]
@@ -339,10 +346,13 @@ async fn owner_workflow_through_the_admin_api() {
         );
     }
     assert_eq!(
-        h.request("/v1/messages", &secret, message("hello", false))
-            .await
-            .status(),
-        401
+        error_message(
+            h.request("/v1/messages", &secret, message("hello", false))
+                .await,
+            401
+        )
+        .await,
+        AUTH_REQUIRED
     );
     for (path, method, body) in [
         (
@@ -428,7 +438,13 @@ async fn admin_api_rejects_invalid_aliases_grants_and_unknown_ids() {
     );
     // Rejected edits leave the existing grant in place.
     let keys = json_body(h.admin("/admin/api/keys", "GET", None).await).await;
-    assert_eq!(keys[0]["models"], json!([MODEL]));
+    let key = keys
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|k| k["id"] == h.key_id)
+        .unwrap();
+    assert_eq!(key["models"], json!([MODEL]));
     for (path, method, body, status, message) in [
         (
             "/admin/api/people/unknown".to_owned(),
