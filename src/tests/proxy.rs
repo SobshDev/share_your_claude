@@ -100,7 +100,7 @@ async fn stream_usage_is_cumulative_and_tool_names_round_trip() {
     assert_eq!(row.get::<i64, _>("cache_read_tokens"), 20);
     assert_eq!(row.get::<i64, _>("cache_write_tokens"), 30);
     let captures = h.mock.captures.lock().await;
-    let (headers, body) = &captures[0];
+    let Capture { headers, body, .. } = &captures[0];
     assert_eq!(
         headers["authorization"],
         "Bearer owner-access-must-not-leak"
@@ -248,7 +248,13 @@ async fn reviewed_betas_are_normalized_and_sent_once() {
     let captures = h.mock.captures.lock().await;
     let sent: Vec<Vec<_>> = captures
         .iter()
-        .map(|(headers, _)| headers.get_all("anthropic-beta").iter().cloned().collect())
+        .map(|c| {
+            c.headers
+                .get_all("anthropic-beta")
+                .iter()
+                .cloned()
+                .collect()
+        })
         .collect();
     let merged = format!("{},prompt-caching-2024-07-31", oauth::BETA);
     assert_eq!(
@@ -640,4 +646,85 @@ async fn upstream_403s_disconnect_only_for_authentication_errors() {
     assert!(!body.to_string().contains("owner-secret"));
     assert_eq!(credential(&h).await, ("needs_reauth".into(), 1));
     assert_eq!(h.mock.refreshes.load(Ordering::SeqCst), 0);
+}
+
+#[tokio::test]
+async fn outbound_requests_carry_the_compatibility_headers() {
+    let h = Harness::new().await;
+    let sent = [
+        ("/v1/messages", message("hello", false), "application/json"),
+        ("/v1/messages", message("hello", true), "text/event-stream"),
+        (
+            "/v1/messages/count_tokens",
+            count_body(),
+            "application/json",
+        ),
+    ];
+    for (path, body, _) in &sent {
+        let response = h.request(path, &h.key, body.clone()).await;
+        assert_eq!(response.status(), 200);
+        text_body(response).await;
+    }
+    let captures = h.mock.captures.lock().await;
+    assert_eq!(captures.len(), sent.len());
+    for (capture, (path, _, accept)) in captures.iter().zip(&sent) {
+        assert_eq!(capture.uri, *path);
+        let headers = &capture.headers;
+        for (name, value) in [
+            ("authorization", "Bearer owner-access-must-not-leak"),
+            ("anthropic-version", "2023-06-01"),
+            ("anthropic-beta", oauth::BETA),
+            ("content-type", "application/json"),
+            ("accept", accept),
+            ("x-app", "cli"),
+            ("user-agent", "@anthropic-ai/sdk/0.74.0"),
+            ("x-stainless-retry-count", "0"),
+        ] {
+            assert_eq!(
+                headers.get_all(name).iter().collect::<Vec<_>>(),
+                [value],
+                "{name}"
+            );
+        }
+        for name in ["x-claude-code-session-id", "x-client-request-id"] {
+            assert!(headers.contains_key(name), "{name}");
+        }
+        assert!(!headers.contains_key("x-api-key"));
+        assert!(!headers.contains_key("cookie"));
+    }
+    let ids: Vec<Option<String>> =
+        sqlx::query_scalar("SELECT upstream_request_id FROM request_usage")
+            .fetch_all(&h.state.db)
+            .await
+            .unwrap();
+    assert_eq!(ids, vec![Some(REQUEST_ID.to_owned()); sent.len()]);
+}
+
+#[tokio::test]
+async fn catalog_refresh_follows_pages_and_rejects_a_repeated_cursor() {
+    let h = Harness::new().await;
+    h.mock.models_page_size.store(1, Ordering::SeqCst);
+    let response = h.admin("/admin/api/models/refresh", "POST", None).await;
+    assert_eq!(response.status(), 200);
+    assert_eq!(json_body(response).await["discovered"], 3);
+    let pages: Vec<String> = h
+        .mock
+        .captures
+        .lock()
+        .await
+        .iter()
+        .map(|c| c.uri.clone())
+        .collect();
+    assert_eq!(
+        pages,
+        [
+            "/v1/models?limit=100".to_owned(),
+            format!("/v1/models?limit=100&after_id={MODEL}"),
+            "/v1/models?limit=100&after_id=claude-opus-5".to_owned(),
+        ]
+    );
+    h.mock.models_repeat_cursor.store(true, Ordering::SeqCst);
+    let response = h.admin("/admin/api/models/refresh", "POST", None).await;
+    assert_eq!(response.status(), 502);
+    assert_eq!(json_body(response).await["error"]["type"], "api_error");
 }
