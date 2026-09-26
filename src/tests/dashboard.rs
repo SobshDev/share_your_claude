@@ -28,6 +28,13 @@ fn assert_page_headers(response: &Response, content_type: &str) {
     assert_security_headers(response);
 }
 
+/// Assets requested without the current `?v=` version must be revalidated, never stored long.
+fn assert_asset_headers(response: &Response, content_type: &str) {
+    assert_eq!(header_value(response, "content-type"), content_type);
+    assert_eq!(header_value(response, "cache-control"), "no-cache");
+    assert_security_headers_except_caching(response);
+}
+
 #[tokio::test]
 async fn every_response_carries_the_security_headers() {
     let h = Harness::new().await;
@@ -114,7 +121,7 @@ async fn assets_are_served_with_their_content_types() {
         // Assets load on the login page too, so they must not require a session.
         let response = h.get(path, &[]).await;
         assert_eq!(response.status(), 200, "{path}");
-        assert_page_headers(&response, content_type);
+        assert_asset_headers(&response, content_type);
         assert_eq!(text_body(response).await, body, "{path}");
     }
     // Every asset a template references is served with the type its extension implies.
@@ -123,7 +130,7 @@ async fn assets_are_served_with_their_content_types() {
             let response = h.get(&path, &[]).await;
             assert_eq!(response.status(), 200, "{name} references {path}");
             let expected = if path.ends_with(".js") { JS } else { CSS };
-            assert_page_headers(&response, expected);
+            assert_asset_headers(&response, expected);
         }
     }
 }

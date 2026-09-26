@@ -309,6 +309,19 @@ pub(super) async fn assert_error(
 
 /// Checks the headers the router adds to every response, whatever route produced it.
 pub(super) fn assert_security_headers(response: &Response) {
+    assert_eq!(
+        response
+            .headers()
+            .get("cache-control")
+            .map(|v| v.to_str().unwrap()),
+        Some("no-store")
+    );
+    assert_security_headers_except_caching(response);
+}
+
+/// Like `assert_security_headers`, for responses such as static assets that set their own
+/// caching policy.
+pub(super) fn assert_security_headers_except_caching(response: &Response) {
     let headers = response.headers();
     let value = |name: &str| {
         headers
@@ -317,7 +330,6 @@ pub(super) fn assert_security_headers(response: &Response) {
             .to_str()
             .unwrap()
     };
-    assert_eq!(value("cache-control"), "no-store");
     assert_eq!(value("x-content-type-options"), "nosniff");
     assert_eq!(value("referrer-policy"), "no-referrer");
     let csp = value("content-security-policy");

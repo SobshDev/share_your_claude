@@ -173,7 +173,13 @@ async fn unexpected_serving_model_is_recorded_and_response_rejected() {
     let response = h
         .request("/v1/messages", &h.key, message("wrong-model", false))
         .await;
-    assert_error(response, 502, "api_error", FAILED).await;
+    assert_error(
+        response,
+        502,
+        "api_error",
+        "Claude answered with a different model than requested",
+    )
+    .await;
     let row = sqlx::query("SELECT outcome,response_model,usage_state FROM request_usage")
         .fetch_one(&h.state.db)
         .await
