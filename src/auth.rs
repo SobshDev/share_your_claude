@@ -4,8 +4,8 @@ use crate::{
 };
 use argon2::{Argon2, PasswordHash, PasswordVerifier};
 use axum::{
-    Json,
-    extract::{Request, State},
+    Extension, Json,
+    extract::{ConnectInfo, Request, State},
     http::{HeaderMap, StatusCode, header},
     middleware::Next,
     response::{IntoResponse, Response},
@@ -16,8 +16,15 @@ use serde::Deserialize;
 use serde_json::json;
 use sha2::{Digest, Sha256};
 use sqlx::Row;
-use std::sync::Arc;
+use std::{
+    collections::HashMap,
+    net::{IpAddr, SocketAddr},
+    sync::Arc,
+};
 use subtle::ConstantTimeEq;
+
+/// `api_key.last_used_at` is refreshed at most once per this many seconds.
+const LAST_USED_RESOLUTION_SECS: i64 = 60;
 
 pub fn random_secret() -> String {
     let mut bytes = [0; 32];
@@ -64,11 +71,23 @@ pub async fn api_key(headers: &HeaderMap, state: &AppState) -> Result<String> {
             .fetch_optional(&state.db)
             .await?;
     let id = id.ok_or_else(AppError::unauthorized)?;
-    sqlx::query("UPDATE api_key SET last_used_at=? WHERE id=?")
-        .bind(db::now())
-        .bind(&id)
-        .execute(&state.db)
-        .await?;
+    // `last_used_at` is informational: write it at most once a minute per key, and never fail
+    // an authenticated request because the write lost the race for SQLite's writer lock.
+    let now = chrono::Utc::now();
+    let cutoff = (now - chrono::Duration::seconds(LAST_USED_RESOLUTION_SECS))
+        .to_rfc3339_opts(chrono::SecondsFormat::Millis, true);
+    if sqlx::query(
+        "UPDATE api_key SET last_used_at=? WHERE id=? AND (last_used_at IS NULL OR last_used_at<?)",
+    )
+    .bind(now.to_rfc3339_opts(chrono::SecondsFormat::Millis, true))
+    .bind(&id)
+    .bind(cutoff)
+    .execute(&state.db)
+    .await
+    .is_err()
+    {
+        tracing::warn!("could not record key last use");
+    }
     Ok(id)
 }
 
@@ -110,14 +129,23 @@ pub fn session_token(headers: &HeaderMap, state: &AppState) -> Result<String> {
     result.ok_or_else(AppError::unauthorized)
 }
 
+/// Fingerprint of the configured owner password hash. Sessions are bound to it, so changing
+/// `ADMIN_PASSWORD_HASH` signs out every existing session.
+fn password_fingerprint(state: &AppState) -> Vec<u8> {
+    hash(&state.config.password_hash)
+}
+
 pub async fn session(headers: &HeaderMap, state: &AppState) -> Result<String> {
     let token = session_token(headers, state)?;
-    sqlx::query_scalar("SELECT csrf_token FROM admin_session WHERE token_hash=? AND expires_at>?")
-        .bind(hash(&token))
-        .bind(db::epoch())
-        .fetch_optional(&state.db)
-        .await?
-        .ok_or_else(AppError::unauthorized)
+    sqlx::query_scalar(
+        "SELECT csrf_token FROM admin_session WHERE token_hash=? AND expires_at>? AND password_fp=?",
+    )
+    .bind(hash(&token))
+    .bind(db::epoch())
+    .bind(password_fingerprint(state))
+    .fetch_optional(&state.db)
+    .await?
+    .ok_or_else(AppError::unauthorized)
 }
 
 pub async fn require_admin(
@@ -147,8 +175,147 @@ pub struct Login {
     password: String,
 }
 
+/// Failed sign-in throttling, kept per client address with a global backstop.
+///
+/// Each client may fail [`Self::CLIENT_FAILURES`] times per fixed [`Self::WINDOW_SECS`] window,
+/// and all clients together [`Self::GLOBAL_FAILURES`] times, so a stranger cannot lock the
+/// owner out and many addresses cannot guess quickly. An attempt reserves a failure before
+/// the password is checked, which keeps concurrent guesses from overrunning the limit; a
+/// successful sign-in releases the reservation and clears the caller's failures. At most
+/// [`Self::MAX_CLIENTS`] addresses are tracked: expired windows are pruned first, then the
+/// oldest window is evicted.
+///
+/// The client address is the socket peer, or, when `TRUSTED_PROXY_HOPS` is N > 0, the
+/// N-th `X-Forwarded-For` entry from the right (the address the outermost trusted proxy saw).
+/// IPv6 clients are grouped by /64. Requests without a usable address share one bucket.
+pub struct LoginLimiter {
+    pub(crate) trusted_proxy_hops: usize,
+    clients: HashMap<Option<IpAddr>, Window>,
+    global: Window,
+}
+
+#[derive(Clone, Copy, Default)]
+struct Window {
+    start: i64,
+    failures: u32,
+}
+impl Window {
+    fn current(&mut self, now: i64) -> &mut Self {
+        if now - self.start >= LoginLimiter::WINDOW_SECS {
+            *self = Self {
+                start: now,
+                failures: 0,
+            };
+        }
+        self
+    }
+}
+
+impl Default for LoginLimiter {
+    fn default() -> Self {
+        Self::new(0)
+    }
+}
+
+impl LoginLimiter {
+    pub const WINDOW_SECS: i64 = 60;
+    pub const CLIENT_FAILURES: u32 = 5;
+    pub const GLOBAL_FAILURES: u32 = 30;
+    pub const MAX_CLIENTS: usize = 4096;
+
+    pub fn new(trusted_proxy_hops: usize) -> Self {
+        Self {
+            trusted_proxy_hops,
+            clients: HashMap::new(),
+            global: Window::default(),
+        }
+    }
+
+    /// Reads `TRUSTED_PROXY_HOPS` (default 0). An invalid value is ignored with a warning,
+    /// which falls back to the socket peer address.
+    pub fn from_env() -> Self {
+        let hops = match std::env::var("TRUSTED_PROXY_HOPS") {
+            Err(_) => 0,
+            Ok(value) => value.trim().parse::<usize>().unwrap_or_else(|_| {
+                tracing::warn!("TRUSTED_PROXY_HOPS must be a non-negative integer; using 0");
+                0
+            }),
+        };
+        Self::new(hops)
+    }
+
+    /// The rate-limit key for a request.
+    pub fn client(&self, headers: &HeaderMap, peer: Option<SocketAddr>) -> Option<IpAddr> {
+        let address = if self.trusted_proxy_hops > 0 {
+            let entries: Vec<&str> = headers
+                .get_all("x-forwarded-for")
+                .iter()
+                .filter_map(|v| v.to_str().ok())
+                .flat_map(|v| v.split(','))
+                .map(str::trim)
+                .collect();
+            entries
+                .len()
+                .checked_sub(self.trusted_proxy_hops)
+                .and_then(|i| entries[i].parse().ok())
+                .or_else(|| peer.map(|p| p.ip()))
+        } else {
+            peer.map(|p| p.ip())
+        };
+        address.map(|ip| match ip.to_canonical() {
+            IpAddr::V6(v6) => IpAddr::V6((u128::from(v6) & (u128::MAX << 64)).into()),
+            v4 => v4,
+        })
+    }
+
+    /// Reserves one failed attempt for `client`, or returns false when it is throttled.
+    pub fn begin(&mut self, client: Option<IpAddr>, now: i64) -> bool {
+        if self.global.current(now).failures >= Self::GLOBAL_FAILURES
+            || self
+                .clients
+                .get_mut(&client)
+                .is_some_and(|w| w.current(now).failures >= Self::CLIENT_FAILURES)
+        {
+            return false;
+        }
+        if !self.clients.contains_key(&client) && self.clients.len() >= Self::MAX_CLIENTS {
+            self.clients
+                .retain(|_, w| now - w.start < Self::WINDOW_SECS);
+            if self.clients.len() >= Self::MAX_CLIENTS
+                && let Some(oldest) = self
+                    .clients
+                    .iter()
+                    .min_by_key(|(_, w)| w.start)
+                    .map(|(k, _)| *k)
+            {
+                self.clients.remove(&oldest);
+            }
+        }
+        self.clients
+            .entry(client)
+            .or_default()
+            .current(now)
+            .failures += 1;
+        self.global.failures += 1;
+        true
+    }
+
+    /// Releases the attempt reserved by `begin` and clears the client's failures.
+    pub fn succeeded(&mut self, client: Option<IpAddr>, now: i64) {
+        self.clients.remove(&client);
+        let global = self.global.current(now);
+        global.failures = global.failures.saturating_sub(1);
+    }
+
+    #[cfg(test)]
+    pub(crate) fn tracked_clients(&self) -> usize {
+        self.clients.len()
+    }
+}
+
 pub async fn login(
     State(state): State<Arc<AppState>>,
+    peer: Option<Extension<ConnectInfo<SocketAddr>>>,
     headers: HeaderMap,
     Json(input): Json<Login>,
 ) -> Result<Response> {
@@ -156,20 +323,18 @@ pub async fn login(
     if input.password.len() > 1024 {
         return Err(AppError::bad("Password is too long"));
     }
-    {
-        let mut limit = state.login_attempts.lock().await;
-        if db::epoch() - limit.0 >= 60 {
-            *limit = (db::epoch(), 0);
-        }
-        if limit.1 >= 5 {
+    let client = {
+        let mut oauth = state.oauth.lock().await;
+        let client = oauth.login.client(&headers, peer.map(|p| p.0.0));
+        if !oauth.login.begin(client, db::epoch()) {
             return Err(AppError(
                 StatusCode::TOO_MANY_REQUESTS,
                 "rate_limit_error",
                 "Too many sign-in attempts. Wait one minute",
             ));
         }
-        limit.1 += 1;
-    }
+        client
+    };
     let encoded = state.config.password_hash.clone();
     let password = zeroize::Zeroizing::new(input.password);
     let valid = tokio::task::spawn_blocking(move || {
@@ -184,19 +349,30 @@ pub async fn login(
     if !valid {
         return Err(AppError::unauthorized());
     }
+    state
+        .oauth
+        .lock()
+        .await
+        .login
+        .succeeded(client, db::epoch());
     let token = random_secret();
     let csrf = random_secret();
+    let fingerprint = password_fingerprint(&state);
     let mut tx = state.db.begin().await?;
-    sqlx::query("DELETE FROM admin_session WHERE expires_at<=?")
+    sqlx::query("DELETE FROM admin_session WHERE expires_at<=? OR password_fp<>?")
         .bind(db::epoch())
+        .bind(&fingerprint)
         .execute(&mut *tx)
         .await?;
-    sqlx::query("INSERT INTO admin_session VALUES(?,?,?)")
-        .bind(hash(&token))
-        .bind(&csrf)
-        .bind(db::epoch() + 43200)
-        .execute(&mut *tx)
-        .await?;
+    sqlx::query(
+        "INSERT INTO admin_session(token_hash,csrf_token,expires_at,password_fp) VALUES(?,?,?,?)",
+    )
+    .bind(hash(&token))
+    .bind(&csrf)
+    .bind(db::epoch() + 43200)
+    .bind(&fingerprint)
+    .execute(&mut *tx)
+    .await?;
     tx.commit().await?;
     let secure = if state.config.secure_cookie {
         "; Secure"
