@@ -136,7 +136,7 @@ It never falls back to other billing. Sign in, open **Claude connection**, and c
 
 **Sign-in or dashboard changes return 403 "This action must originate from the owner dashboard".** The browser origin differs from `PUBLIC_ORIGIN`. They must match exactly, including scheme and port.
 
-**Friends get 429 "The router is busy".** At most 8 upstream requests run at once across all keys, and extra requests are refused immediately rather than queued. Retry after running requests finish. A 429 that says "Claude rejected the request" comes from Claude itself, and its `retry-after` header is passed through.
+**Friends get 429 "The router is busy" or "This key has too many requests in progress".** Each key may run 3 `/v1/messages` requests at once, all keys together 8, and token counts 4 in their own pool. Extra requests are refused immediately rather than queued, with `retry-after: 1`. Retry after running requests finish; open streams hold their slots until they end. A 429 that says "Claude rejected the request" comes from Claude itself, and its `retry-after` header is passed through.
 
 **`/readyz` fails or the container is unhealthy.** `/readyz` runs one SQLite query. If nothing answers at all, the process did not start: check the logs for the first error. Common causes:
 

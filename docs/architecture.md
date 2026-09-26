@@ -7,7 +7,7 @@ Shared Router is a single Rust binary built on Axum, with one SQLite database. I
 | Module | Responsibility |
 |---|---|
 | [`main.rs`](../src/main.rs) | CLI entry point. `serve` (default) loads config, opens the database, and runs the server with graceful shutdown on Ctrl-C or SIGTERM. `generate-key`, `hash-password`, and `backup PATH` are one-shot helper commands. |
-| [`lib.rs`](../src/lib.rs) | `AppState` (config, SQLite pool, HTTP client, OAuth lock, login throttle, admission semaphore) and the router: health probes, friend routes, admin routes, the 32 MiB body limit, and security headers on every response. |
+| [`lib.rs`](../src/lib.rs) | `AppState` (config, SQLite pool, HTTP client, OAuth state with the login throttle, and the admission semaphores with their limits) and the router: health probes, friend routes, admin routes, the 32 MiB body limit, and security headers on every response. |
 | [`config.rs`](../src/config.rs) | Reads and validates environment variables at startup, and builds the upstream HTTP client with redirects and automatic retries disabled. |
 | [`db.rs`](../src/db.rs) | Opens SQLite in WAL mode, runs embedded migrations, and performs startup recovery: unfinished requests become `interrupted` and expired admin sessions are deleted. |
 | [`auth.rs`](../src/auth.rs) | Router key authentication (`x-api-key` or `Authorization: Bearer`, SHA-256 lookup), owner login with Argon2id and a login throttle, session cookies, the exact-origin check, and CSRF enforcement for admin mutations. |
@@ -30,7 +30,7 @@ sequenceDiagram
     participant A as auth
     participant U as usage (SQLite)
     participant Pol as policy
-    participant S as Admission semaphore (8)
+    participant S as Admission (3 per key, 8 global)
     participant O as oauth
     participant Up as api.anthropic.com
 
@@ -41,8 +41,8 @@ sequenceDiagram
     P->>Pol: validate(body), resolve(key, model), check anthropic-beta
     Pol-->>P: resolved model id, or 400/403 (row finished as denied)
     P->>Pol: ToolMap::prepare (hash custom tool names, prepend system block)
-    P->>S: try_acquire (no waiting)
-    S-->>P: permit, or immediate 429 "router is busy" (denied)
+    P->>S: try_acquire key permit, then global permit (no waiting)
+    S-->>P: permits, or immediate 429 with retry-after: 1 (denied)
     P->>O: access()
     O->>O: lock, decrypt, refresh if expiring within 5 minutes
     O-->>P: access token, or 503 reconnect Claude
@@ -76,7 +76,7 @@ The steps in order:
 2. **Usage row.** `usage::start` records the attempt as `in_progress`. A `RequestGuard` ensures the row reaches a terminal outcome even if the handler is cancelled.
 3. **Policy.** `policy::validate` enforces the request field allowlists (see the README's accepted request surface). `policy::resolve` maps the requested ID or explicit alias to a reviewed, enabled model granted to this unrevoked key and rejects Fable 5.1. Caller `anthropic-beta` values must all be on the allowlist in `proxy.rs`. Any failure finishes the row as `denied`.
 4. **Rewrite.** `ToolMap::prepare` renames custom tools and matching `tool_use` blocks to stable hashed `custom_` names and prepends the required system block. Server tools keep their names.
-5. **Admission.** A process-wide semaphore allows 8 concurrent upstream requests across all keys. The router does not queue: request 9 gets an immediate `429 rate_limit_error` ("The router is busy"). A streaming response holds its permit until the stream ends.
+5. **Admission.** `proxy::acquire` takes the key's permit first (`PER_KEY_CONCURRENCY`, 3 per key) and then a global one (`GLOBAL_CONCURRENCY`, 8 across all keys). Token counts take a permit from their own pool (`COUNT_TOKENS_CONCURRENCY`, 4) instead. The router does not queue: when a pool is full the request is finished as `denied` and gets an immediate `429 rate_limit_error` with `retry-after: 1`, saying "This key has too many requests in progress" for the per-key limit and "The router is busy" otherwise. A streaming response holds its permits until the stream ends.
 6. **Credential.** `oauth::access` decrypts the stored tokens. A token that expires more than 5 minutes from now is used without locking; otherwise one caller at a time refreshes it under the refresh lock, and a generation counter guards the write. A refresh rejected with 400, 401, or 403 marks the credential `needs_reauth`, and requests get `503` until the owner reconnects. A transient refresh failure starts a 30-second backoff, during which the current token is used while it is still valid. A credential that cannot be decrypted is also marked `needs_reauth`.
 7. **Upstream call.** The router sends one POST with the owner's token and fixed client headers. Incoming credentials are never forwarded. The HTTP client has retries and redirects disabled, and no code path replays a `/v1/messages` request, including after 429s, network errors, or a 401.
 8. **Upstream 401.** `oauth::force_refresh` refreshes the token once; if another request has already replaced that token generation, it reuses the newer token instead. A token count is sent again with the new token. A `/v1/messages` request is finished as `upstream_error` and its client gets a retryable `503 api_error` ("The router renewed its Claude session. Retry the request"). Only a rejected refresh, or a second 401 for the resent token count, marks the credential `needs_reauth`.

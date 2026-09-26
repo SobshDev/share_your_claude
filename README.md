@@ -112,7 +112,7 @@ Friend endpoints accept `x-api-key: sr_…` or `Authorization: Bearer sr_…`. C
 
 No batch, arbitrary forward-proxy, Files, Managed Agents, or provider-management routes are exposed to friends. Unreviewed request fields, beta headers, server tool types, and fallback/advisor routing are rejected. Custom client tools, images, thinking, and cache controls are supported. Incoming credentials are replaced with the owner’s upstream token. Inference requests are never automatically replayed, including after 429s, network errors, or an upstream 401.
 
-At most 8 upstream requests run at once across all keys. The router does not queue: a request beyond that limit is answered immediately with `429 rate_limit_error` ("The router is busy"), and a streaming response holds its slot until the stream ends. See [docs/architecture.md](docs/architecture.md) for the module map and the full request flow.
+Admission control keeps one friend from taking the whole router. Each key may have 3 `/v1/messages` requests in progress, and at most 8 run at once across all keys. Token counts use a separate pool of 4, so they never wait behind long streams. The router does not queue: a request beyond a limit is answered immediately with `429 rate_limit_error` and `retry-after: 1`, saying either "This key has too many requests in progress" or "The router is busy". A streaming response holds its slots until the stream ends. See [docs/architecture.md](docs/architecture.md) for the module map and the full request flow.
 
 ### Accepted request surface
 
