@@ -230,3 +230,246 @@ fn builtin_tools_keep_their_names_through_history() {
         "str_replace_editor"
     );
 }
+
+/// Enabled, reviewed, granted Fable rows, one per `blocked` branch, each with an alias:
+/// the exact id, a dated id filed under an ordinary group, and an ordinary id in the Fable
+/// group. Returns every name a friend could send.
+async fn force_fable_rows(h: &Harness) -> Vec<&'static str> {
+    for (id, group) in [
+        ("claude-fable-5-1", policy::FABLE_GROUP),
+        ("claude-fable-5-1-20260901", "claude"),
+        ("claude-reserved-1", policy::FABLE_GROUP),
+    ] {
+        sqlx::query("INSERT INTO model(id,display_name,model_group,enabled,reviewed_at) VALUES(?,?,?,1,?) ON CONFLICT(id) DO UPDATE SET model_group=excluded.model_group,enabled=1,reviewed_at=excluded.reviewed_at")
+            .bind(id)
+            .bind(id)
+            .bind(group)
+            .bind(db::now())
+            .execute(&h.state.db)
+            .await
+            .unwrap();
+        grant(&h.state, &h.key_id, id).await;
+        sqlx::query("INSERT INTO model_alias(alias,model_id) VALUES(?,?)")
+            .bind(format!("{id}-alias"))
+            .bind(id)
+            .execute(&h.state.db)
+            .await
+            .unwrap();
+    }
+    vec![
+        "claude-fable-5-1",
+        "claude-fable-5-1-alias",
+        "claude-fable-5-1-20260901",
+        "claude-fable-5-1-20260901-alias",
+        "claude-reserved-1",
+        "claude-reserved-1-alias",
+    ]
+}
+
+#[tokio::test]
+async fn fable_is_denied_on_every_friend_endpoint_before_upstream() {
+    let h = Harness::new().await;
+    let names = force_fable_rows(&h).await;
+    for endpoint in ["/v1/messages", "/v1/messages/count_tokens"] {
+        for name in &names {
+            let mut body = message("hello", false);
+            body["model"] = (*name).into();
+            let r = h.request(endpoint, &h.key, body).await;
+            assert_eq!(r.status(), 403, "{endpoint} {name}");
+            let error = json_body(r).await;
+            assert_eq!(error["error"]["type"], "permission_error");
+            assert_eq!(
+                error["error"]["message"],
+                policy::FABLE_RESERVED,
+                "{endpoint} {name}"
+            );
+        }
+    }
+    // Every attempt was recorded as denied and none reached the upstream.
+    let outcomes: Vec<(String, Option<i64>, Option<String>)> =
+        sqlx::query_as("SELECT outcome,http_status,resolved_model FROM request_usage")
+            .fetch_all(&h.state.db)
+            .await
+            .unwrap();
+    assert_eq!(outcomes.len(), names.len() * 2);
+    assert!(
+        outcomes
+            .iter()
+            .all(|row| *row == ("denied".to_owned(), Some(403), None))
+    );
+    assert_eq!(h.mock.requests.load(Ordering::SeqCst), 0);
+    let bearer = format!("Bearer {}", h.key);
+    let listed = json_body(
+        h.get("/v1/models", &[("authorization", bearer.as_str())])
+            .await,
+    )
+    .await;
+    assert_eq!(listed["data"].as_array().unwrap().len(), 1);
+    assert_eq!(listed["data"][0]["id"], MODEL);
+}
+
+#[tokio::test]
+async fn admin_mutations_never_grant_alias_or_configure_fable() {
+    let h = Harness::new().await;
+    force_fable_rows(&h).await;
+    for id in [
+        "claude-fable-5-1",
+        "claude-fable-5-1-20260901",
+        "claude-reserved-1",
+    ] {
+        let review = h
+            .admin(
+                &format!("/admin/api/models/{id}"),
+                "PUT",
+                Some(json!({"enabled":true})),
+            )
+            .await;
+        assert_eq!(review.status(), 403, "{id}");
+        assert_eq!(
+            json_body(review).await["error"]["message"],
+            policy::FABLE_RESERVED
+        );
+        let grants = h
+            .admin(
+                &format!("/admin/api/keys/{}/models", h.key_id),
+                "PUT",
+                Some(json!({"models":[MODEL,id]})),
+            )
+            .await;
+        assert_eq!(grants.status(), 400, "{id}");
+        assert_eq!(
+            json_body(grants).await["error"]["message"],
+            "Only reviewed, enabled models other than Fable 5.1 can be granted"
+        );
+        let alias = h
+            .admin(
+                &format!("/admin/api/models/{id}/aliases"),
+                "POST",
+                Some(json!({"alias":"innocent-name"})),
+            )
+            .await;
+        assert_eq!(alias.status(), 400, "{id}");
+        assert_eq!(
+            json_body(alias).await["error"]["message"],
+            "Choose a reviewed and enabled model"
+        );
+    }
+    for alias in ["claude-fable-5-1", "fable_5_1", "my/fable-5-1-latest"] {
+        let r = h
+            .admin(
+                &format!("/admin/api/models/{MODEL}/aliases"),
+                "POST",
+                Some(json!({"alias":alias})),
+            )
+            .await;
+        assert_eq!(r.status(), 400, "{alias}");
+        assert_eq!(
+            json_body(r).await["error"]["message"],
+            "Invalid or reserved alias"
+        );
+    }
+    // A new key receives every enabled model except the Fable rows.
+    let created = json_body(
+        h.admin(
+            "/admin/api/keys",
+            "POST",
+            Some(json!({"person_id":h.person,"label":"Fresh"})),
+        )
+        .await,
+    )
+    .await;
+    let keys = json_body(h.admin("/admin/api/keys", "GET", None).await).await;
+    let fresh = keys
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|k| k["id"] == created["id"])
+        .unwrap();
+    assert_eq!(fresh["models"], json!([MODEL]));
+    // The client config omits Fable even though the database grants it to this key.
+    let config = json_body(
+        h.admin(&format!("/admin/api/keys/{}/config", h.key_id), "GET", None)
+            .await,
+    )
+    .await;
+    assert_eq!(
+        config["providers"]["shared-claude"]["models"],
+        json!([MODEL])
+    );
+}
+
+/// Upstream that streams a successful reply whose serving model is Fable, either in
+/// `message_start` (content `start`) or only in the `message_delta` (anything else).
+async fn fable_stream(State(calls): State<Arc<AtomicUsize>>, Json(body): Json<Value>) -> Response {
+    calls.fetch_add(1, Ordering::SeqCst);
+    let fable_at_start = body.pointer("/messages/0/content") == Some(&json!("start"));
+    let start_model = if fable_at_start {
+        "claude-fable-5-1"
+    } else {
+        MODEL
+    };
+    let events = [
+        json!({"type":"message_start","message":{"id":"msg_1","type":"message","role":"assistant","model":start_model,"content":[],"usage":{"input_tokens":4,"output_tokens":0}}}),
+        json!({"type":"content_block_start","index":0,"content_block":{"type":"text","text":""}}),
+        json!({"type":"content_block_delta","index":0,"delta":{"type":"text_delta","text":"from fable"}}),
+        json!({"type":"content_block_stop","index":0}),
+        json!({"type":"message_delta","delta":{"stop_reason":"end_turn","model":"claude-fable-5-1"},"usage":{"output_tokens":2}}),
+        json!({"type":"message_stop"}),
+    ];
+    let stream: String = events
+        .iter()
+        .map(|e| format!("event: {}\ndata: {e}\n\n", e["type"].as_str().unwrap()))
+        .collect();
+    ([("content-type", "text/event-stream")], stream).into_response()
+}
+
+#[tokio::test]
+async fn streamed_reply_from_fable_is_rejected_and_recorded() {
+    let h = Harness::new().await;
+    let calls = Arc::new(AtomicUsize::new(0));
+    let (router, server) = with_upstream(
+        &h,
+        Router::new()
+            .route("/v1/messages", post(fable_stream))
+            .with_state(calls.clone()),
+    )
+    .await;
+    for scenario in ["start", "delta"] {
+        sqlx::query("DELETE FROM request_usage")
+            .execute(&h.state.db)
+            .await
+            .unwrap();
+        let request = Request::builder()
+            .method("POST")
+            .uri("/v1/messages")
+            .header("content-type", "application/json")
+            .header("x-api-key", h.key.as_str())
+            .body(Body::from(message(scenario, true).to_string()))
+            .unwrap();
+        let response = router.clone().oneshot(request).await.unwrap();
+        assert_eq!(response.status(), 200, "{scenario}");
+        let text = text_body(response).await;
+        assert!(text.contains("event: error"), "{scenario}: {text}");
+        assert!(!text.contains("message_stop"), "{scenario}: {text}");
+        if scenario == "start" {
+            assert!(!text.contains("from fable"), "{text}");
+        }
+        let row = sqlx::query("SELECT outcome,response_model FROM request_usage")
+            .fetch_one(&h.state.db)
+            .await
+            .unwrap();
+        assert_eq!(
+            row.get::<String, _>("outcome"),
+            "upstream_error",
+            "{scenario}"
+        );
+        assert_eq!(
+            row.get::<Option<String>, _>("response_model").as_deref(),
+            Some("claude-fable-5-1"),
+            "{scenario}"
+        );
+    }
+    // One upstream call per request: a rejected stream is never replayed.
+    assert_eq!(calls.load(Ordering::SeqCst), 2);
+    server.abort();
+}
