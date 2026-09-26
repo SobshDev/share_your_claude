@@ -811,3 +811,211 @@ async fn an_unreachable_upstream_is_a_bad_gateway() {
     let expected = ("upstream_error".into(), Some(502), "unknown".into());
     assert_eq!(last_row(&h).await, expected);
 }
+
+#[test]
+fn request_validation_rejects_each_unreviewed_shape() {
+    use crate::policy;
+    let valid = || message("hello", false);
+    let with = |field: &str, value: Value| {
+        let mut body = valid();
+        body[field] = value;
+        body
+    };
+    let without = |field: &str| {
+        let mut body = valid();
+        body.as_object_mut().unwrap().remove(field);
+        body
+    };
+    let tool = |tool: Value| with("tools", json!([tool]));
+    let cases = [
+        (json!([]), false, "Expected a JSON object"),
+        (
+            with("fallback", json!({"model": MODEL})),
+            false,
+            "Unsupported request field; fallback and alternate model routing are unavailable",
+        ),
+        (without("model"), false, "model is required"),
+        (with("model", json!(7)), false, "model is required"),
+        (with("model", json!("")), false, "Invalid model identifier"),
+        (
+            with("model", json!("m".repeat(201))),
+            false,
+            "Invalid model identifier",
+        ),
+        (without("messages"), false, "messages must be an array"),
+        (
+            with("messages", json!("hi")),
+            false,
+            "messages must be an array",
+        ),
+        (
+            without("max_tokens"),
+            false,
+            "max_tokens must be a positive integer",
+        ),
+        (
+            with("max_tokens", json!(0)),
+            false,
+            "max_tokens must be a positive integer",
+        ),
+        (
+            with("max_tokens", json!(-1)),
+            false,
+            "max_tokens must be a positive integer",
+        ),
+        (
+            with("max_tokens", json!("9")),
+            false,
+            "max_tokens must be a positive integer",
+        ),
+        (
+            with("stream", json!("yes")),
+            false,
+            "stream must be a boolean",
+        ),
+        (
+            with("stream", json!(true)),
+            true,
+            "Token counting does not stream",
+        ),
+        (with("tools", json!({})), false, "tools must be an array"),
+        (tool(json!("search")), false, "Invalid tool"),
+        (
+            tool(json!({"name":"a","model":"claude-fable-5-1"})),
+            false,
+            "Unsupported tool field; advisor and model-routing tools are unavailable",
+        ),
+        (
+            tool(json!({"name":"a","type":"advisor_20260901"})),
+            false,
+            "This server tool type has not been reviewed",
+        ),
+        (
+            tool(json!({"name":"a","type":7})),
+            false,
+            "This server tool type has not been reviewed",
+        ),
+        (tool(json!({"input_schema":{}})), false, "Invalid tool name"),
+        (tool(json!({"name":""})), false, "Invalid tool name"),
+        (
+            tool(json!({"name":"n".repeat(129)})),
+            false,
+            "Invalid tool name",
+        ),
+        (
+            with("thinking", json!("on")),
+            false,
+            "Invalid request control object",
+        ),
+        (
+            with("metadata", json!({"user_id":"u","route":"fable"})),
+            false,
+            "Unsupported request control field",
+        ),
+        (
+            with("output_config", json!({"effort":"high","model":"x"})),
+            false,
+            "Unsupported request control field",
+        ),
+    ];
+    for (body, counting, expected) in cases {
+        let error = policy::validate(&body, counting).expect_err(expected);
+        assert_eq!(
+            (error.0.as_u16(), error.1, error.2),
+            (400, "invalid_request_error", expected)
+        );
+    }
+    for (body, counting) in [
+        (valid(), false),
+        (without("max_tokens"), true),
+        (
+            tool(json!({"name":"web_search","type":"web_search_20250305","max_uses":3})),
+            false,
+        ),
+        (
+            with("thinking", json!({"type":"enabled","budget_tokens":1024})),
+            false,
+        ),
+        (
+            with("tool_choice", json!({"type":"tool","name":"a"})),
+            false,
+        ),
+    ] {
+        policy::validate(&body, counting).unwrap_or_else(|e| panic!("{body}: {}", e.2));
+    }
+
+    // ToolMap::prepare runs after validation; these reach its own checks directly.
+    for (body, expected) in [
+        (tool(json!({"input_schema":{}})), "Tool name missing"),
+        (
+            with("tools", json!([{"name":"a"},{"name":"a","type":"custom"}])),
+            "Duplicate tool name",
+        ),
+        (
+            with("system", json!(5)),
+            "system must be text or content blocks",
+        ),
+    ] {
+        let error = policy::ToolMap::prepare(&mut body.clone()).expect_err(expected);
+        assert_eq!((error.0.as_u16(), error.2), (400, expected));
+    }
+    let mut body = with("system", json!("be brief"));
+    body["tools"] = json!([{"name":"lookup"}]);
+    body["tool_choice"] = json!({"type":"tool","name":"lookup"});
+    policy::ToolMap::prepare(&mut body).unwrap();
+    assert_eq!(body["tool_choice"]["name"], body["tools"][0]["name"]);
+    assert_eq!(body["system"][0]["text"], oauth::SYSTEM);
+    assert_eq!(body["system"][1]["text"], "be brief");
+}
+
+#[tokio::test]
+async fn invalid_and_denied_requests_never_reach_upstream_on_either_endpoint() {
+    let h = Harness::new().await;
+    // Even an enabled, granted Fable model stays unreachable.
+    sqlx::query("UPDATE model SET enabled=1,reviewed_at=? WHERE id='claude-fable-5-1'")
+        .bind(db::now())
+        .execute(&h.state.db)
+        .await
+        .unwrap();
+    grant(&h.state, &h.key_id, "claude-fable-5-1").await;
+    let mut streaming_count = count_body();
+    streaming_count["stream"] = true.into();
+    let mut no_messages = message("hello", false);
+    no_messages.as_object_mut().unwrap().remove("messages");
+    let mut cases = vec![
+        ("/v1/messages/count_tokens", streaming_count, 400),
+        ("/v1/messages", no_messages, 400),
+    ];
+    for model in ["claude-fable-5-1", "claude-opus-5", "unknown"] {
+        for path in ["/v1/messages", "/v1/messages/count_tokens"] {
+            let mut body = if path == "/v1/messages" {
+                message("hello", false)
+            } else {
+                count_body()
+            };
+            body["model"] = model.into();
+            cases.push((path, body, 403));
+        }
+    }
+    let total = cases.len();
+    for (path, body, status) in cases {
+        let label = format!("{path} {body}");
+        let response = h.request(path, &h.key, body).await;
+        assert_eq!(response.status(), status, "{label}");
+        let kind = json_body(response).await["error"]["type"].clone();
+        let expected = if status == 400 {
+            "invalid_request_error"
+        } else {
+            "permission_error"
+        };
+        assert_eq!(kind, expected, "{label}");
+    }
+    let denied: i64 = sqlx::query_scalar(
+        "SELECT COUNT(*) FROM request_usage WHERE outcome='denied' AND usage_state='not_applicable'",
+    )
+    .fetch_one(&h.state.db)
+    .await
+    .unwrap();
+    assert_eq!(denied, total as i64);
+    assert_eq!(h.mock.requests.load(Ordering::SeqCst), 0);
+}
