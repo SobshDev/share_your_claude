@@ -17,6 +17,7 @@ use sha2::{Digest, Sha256};
 use sqlx::Row;
 use std::{sync::Arc, time::Duration};
 use subtle::ConstantTimeEq;
+use tokio::sync::Mutex;
 use zeroize::{Zeroize, ZeroizeOnDrop, Zeroizing};
 
 pub const CLIENT_ID: &str = "9d1c250a-e61b-44d9-88ed-5944d1962f5e";
@@ -25,10 +26,45 @@ pub const REDIRECT_URI: &str = "http://localhost:54545/callback";
 pub const BETA: &str = "claude-code-20250219,oauth-2025-04-20";
 pub const SYSTEM: &str = "You are a Claude agent, built on Anthropic's Claude Agent SDK.";
 
+/// Refresh when the access token expires within this many seconds.
+const REFRESH_MARGIN_SECS: i64 = 300;
+/// After a transient token endpoint failure, callers fail fast (or keep using the current,
+/// unexpired token) for this many seconds instead of calling the endpoint again.
+const REFRESH_BACKOFF_SECS: i64 = 30;
+/// Attempts to save a refreshed credential before keeping it in memory instead.
+const PERSIST_ATTEMPTS: u32 = 3;
+
+/// In-process owner authentication state. Every lock on `AppState::oauth` is short and never
+/// held across network or database I/O; refreshes are serialized by `refresh` instead.
 #[derive(Default)]
 pub struct OAuthState {
     pending: Option<Pending>,
+    refresh: Arc<Mutex<Refresh>>,
 }
+#[cfg(test)]
+impl OAuthState {
+    /// Ends the backoff after a transient refresh failure.
+    pub(crate) async fn clear_refresh_backoff(&self) {
+        self.refresh.lock().await.last_failure = None;
+    }
+}
+
+/// Serialized refresh bookkeeping; held for the whole refresh so only one caller refreshes.
+#[derive(Default)]
+struct Refresh {
+    /// Epoch second of the last transient token endpoint failure.
+    last_failure: Option<i64>,
+    /// A refreshed credential the database did not accept yet. The provider may already have
+    /// rotated the stored refresh token, so this copy must be saved before refreshing again.
+    unsaved: Option<Unsaved>,
+}
+struct Unsaved {
+    /// Generation of the row these tokens replace.
+    generation: i64,
+    encrypted: Vec<u8>,
+    expires: i64,
+}
+
 #[derive(Zeroize, ZeroizeOnDrop)]
 struct Pending {
     state: String,
@@ -138,25 +174,27 @@ pub async fn complete(
     let (code, returned_state) = redirect_params(&input.redirect_url)?;
     drop(input);
     let session_hash = auth::hash(&auth::session_token(&headers, &state)?);
-    let mut guard = state.oauth.lock().await;
-    let pending = guard
-        .pending
-        .as_ref()
-        .ok_or_else(|| AppError::bad("Start a new Claude connection first"))?;
-    if pending.expires < db::epoch()
-        || pending
-            .state
-            .as_bytes()
-            .ct_eq(returned_state.as_bytes())
-            .unwrap_u8()
-            != 1
-        || pending.session_hash != session_hash
-    {
-        return Err(AppError::bad(
-            "This connection expired or belongs to another session. Start again",
-        ));
-    }
-    let pending = guard.pending.take().expect("checked pending");
+    let pending = {
+        let mut guard = state.oauth.lock().await;
+        let pending = guard
+            .pending
+            .as_ref()
+            .ok_or_else(|| AppError::bad("Start a new Claude connection first"))?;
+        if pending.expires < db::epoch()
+            || pending
+                .state
+                .as_bytes()
+                .ct_eq(returned_state.as_bytes())
+                .unwrap_u8()
+                != 1
+            || pending.session_hash != session_hash
+        {
+            return Err(AppError::bad(
+                "This connection expired or belongs to another session. Start again",
+            ));
+        }
+        guard.pending.take().expect("checked pending")
+    };
     let request = TokenRequest {
         grant_type: "authorization_code",
         code: Some(&code),
@@ -165,7 +203,15 @@ pub async fn complete(
         code_verifier: Some(&pending.verifier),
         ..TokenRequest::default()
     };
-    let (tokens, expires) = exchange(&state, &request, None).await?;
+    let (tokens, expires) =
+        exchange(&state, &request, None)
+            .await
+            .map_err(|error| match error {
+                ExchangeError::Rejected => {
+                    AppError::bad("Claude rejected this authorization code. Start a new connection")
+                }
+                ExchangeError::Failed => AppError::upstream(),
+            })?;
     let encrypted = encrypt(&state.config.encryption_key, &tokens)?;
     sqlx::query("INSERT INTO claude_credential VALUES(1,?,?,1,'connected') ON CONFLICT(id) DO UPDATE SET encrypted_tokens=excluded.encrypted_tokens,expires_at=excluded.expires_at,generation=generation+1,state='connected'")
         .bind(encrypted).bind(expires).execute(&state.db).await?;
@@ -203,12 +249,19 @@ impl Default for TokenRequest<'_> {
     }
 }
 
+enum ExchangeError {
+    /// The token endpoint refused the grant (400, 401, or 403).
+    Rejected,
+    /// Network failure, another status, or an unusable reply.
+    Failed,
+}
+
 async fn exchange(
     state: &AppState,
     request: &TokenRequest<'_>,
     refresh_fallback: Option<&str>,
-) -> Result<(Tokens, i64)> {
-    let body = Zeroizing::new(serde_json::to_vec(request).map_err(|_| AppError::internal())?);
+) -> std::result::Result<(Tokens, i64), ExchangeError> {
+    let body = Zeroizing::new(serde_json::to_vec(request).map_err(|_| ExchangeError::Failed)?);
     let response = state
         .client
         .post(&state.token_endpoint)
@@ -217,13 +270,13 @@ async fn exchange(
         .body(Bytes::from_owner(body))
         .send()
         .await
-        .map_err(|_| AppError::upstream())?;
+        .map_err(|_| ExchangeError::Failed)?;
     let status = response.status();
     if !status.is_success() {
         return Err(if matches!(status.as_u16(), 400 | 401 | 403) {
-            AppError::reauth()
+            ExchangeError::Rejected
         } else {
-            AppError::upstream()
+            ExchangeError::Failed
         });
     }
     #[derive(Deserialize, Zeroize, ZeroizeOnDrop)]
@@ -232,14 +285,18 @@ async fn exchange(
         refresh_token: Option<String>,
         expires_in: i64,
     }
-    let body = Zeroizing::new(crate::proxy::limited_body(response, 65536).await?);
-    let mut reply: Reply = serde_json::from_slice(&body).map_err(|_| AppError::upstream())?;
+    let body = Zeroizing::new(
+        crate::proxy::limited_body(response, 65536)
+            .await
+            .map_err(|_| ExchangeError::Failed)?,
+    );
+    let mut reply: Reply = serde_json::from_slice(&body).map_err(|_| ExchangeError::Failed)?;
     if reply.access_token.is_empty() || reply.expires_in <= 0 || reply.expires_in > 31_536_000 {
-        return Err(AppError::upstream());
+        return Err(ExchangeError::Failed);
     }
     let refresh_token = match reply.refresh_token.take().filter(|v| !v.is_empty()) {
         Some(token) => token,
-        None => refresh_fallback.ok_or_else(AppError::upstream)?.to_owned(),
+        None => refresh_fallback.ok_or(ExchangeError::Failed)?.to_owned(),
     };
     Ok((
         Tokens {
@@ -255,9 +312,22 @@ pub struct Access {
     pub generation: i64,
 }
 
-pub async fn access(state: &AppState) -> Result<Access> {
-    // One service replica. The lock serializes login and refresh and re-reads the latest generation.
-    let _guard = state.oauth.lock().await;
+/// The stored credential, decrypted.
+struct Stored {
+    tokens: Tokens,
+    generation: i64,
+    expires: i64,
+}
+impl From<Stored> for Access {
+    fn from(stored: Stored) -> Self {
+        Self {
+            tokens: stored.tokens,
+            generation: stored.generation,
+        }
+    }
+}
+
+async fn load(state: &AppState) -> Result<Stored> {
     let row = sqlx::query("SELECT * FROM claude_credential WHERE id=1")
         .fetch_optional(&state.db)
         .await?
@@ -270,34 +340,130 @@ pub async fn access(state: &AppState) -> Result<Access> {
         &state.config.encryption_key,
         &row.get::<Vec<u8>, _>("encrypted_tokens"),
     )?;
-    if row.get::<i64, _>("expires_at") > db::epoch() + 300 {
-        return Ok(Access { tokens, generation });
+    Ok(Stored {
+        tokens,
+        generation,
+        expires: row.get("expires_at"),
+    })
+}
+
+/// Replaces the credential of `generation`. Retries transient database errors; returns
+/// `Ok(false)` when the credential was replaced by someone else in the meantime.
+async fn persist(
+    state: &AppState,
+    generation: i64,
+    encrypted: &[u8],
+    expires: i64,
+) -> std::result::Result<bool, sqlx::Error> {
+    let mut attempt = 1;
+    loop {
+        let result = sqlx::query("UPDATE claude_credential SET encrypted_tokens=?,expires_at=?,generation=generation+1 WHERE id=1 AND generation=?")
+            .bind(encrypted).bind(expires).bind(generation).execute(&state.db).await;
+        match result {
+            Ok(done) => return Ok(done.rows_affected() == 1),
+            Err(error) if attempt >= PERSIST_ATTEMPTS => return Err(error),
+            Err(_) => {
+                tokio::time::sleep(Duration::from_millis(50 * u64::from(attempt))).await;
+                attempt += 1;
+            }
+        }
+    }
+}
+
+/// Uses `stored` while its access token has not expired, otherwise fails as transient.
+fn unexpired(stored: Stored) -> Result<Access> {
+    if stored.expires > db::epoch() {
+        Ok(stored.into())
+    } else {
+        Err(AppError::upstream())
+    }
+}
+
+pub async fn access(state: &AppState) -> Result<Access> {
+    // One service replica. A credential that is not due for refresh is served without locking.
+    let stored = load(state).await?;
+    if stored.expires > db::epoch() + REFRESH_MARGIN_SECS {
+        return Ok(stored.into());
+    }
+    let refresh = state.oauth.lock().await.refresh.clone();
+    let mut refresh = refresh.lock().await;
+    // Another caller may have refreshed or reconnected while this one waited.
+    let stored = load(state).await?;
+    if let Some(unsaved) = refresh.unsaved.take()
+        && unsaved.generation == stored.generation
+    {
+        let tokens = decrypt(&state.config.encryption_key, &unsaved.encrypted)?;
+        return match persist(
+            state,
+            unsaved.generation,
+            &unsaved.encrypted,
+            unsaved.expires,
+        )
+        .await
+        {
+            Ok(true) => Ok(Access {
+                tokens,
+                generation: unsaved.generation + 1,
+            }),
+            Ok(false) => Ok(load(state).await?.into()),
+            Err(_) => {
+                tracing::error!("refreshed Claude credential still cannot be saved");
+                let generation = unsaved.generation;
+                refresh.unsaved = Some(unsaved);
+                Ok(Access { tokens, generation })
+            }
+        };
+    }
+    if stored.expires > db::epoch() + REFRESH_MARGIN_SECS {
+        return Ok(stored.into());
+    }
+    if refresh
+        .last_failure
+        .is_some_and(|at| db::epoch() - at < REFRESH_BACKOFF_SECS)
+    {
+        return unexpired(stored);
     }
     let request = TokenRequest {
         grant_type: "refresh_token",
-        refresh_token: Some(&tokens.refresh_token),
+        refresh_token: Some(&stored.tokens.refresh_token),
         ..TokenRequest::default()
     };
-    let result = exchange(state, &request, Some(&tokens.refresh_token)).await;
-    let (tokens, expires) = match result {
-        Ok(value) => value,
-        Err(error) => {
-            if error.0 == axum::http::StatusCode::SERVICE_UNAVAILABLE {
-                mark_reauth(state, generation).await?;
+    let (tokens, expires) =
+        match exchange(state, &request, Some(&stored.tokens.refresh_token)).await {
+            Ok(value) => value,
+            Err(ExchangeError::Rejected) => {
+                mark_reauth(state, stored.generation).await?;
+                return Err(AppError::reauth());
             }
-            return Err(error);
-        }
-    };
+            Err(ExchangeError::Failed) => {
+                refresh.last_failure = Some(db::epoch());
+                return unexpired(stored);
+            }
+        };
+    refresh.last_failure = None;
     let encrypted = encrypt(&state.config.encryption_key, &tokens)?;
-    let changed = sqlx::query("UPDATE claude_credential SET encrypted_tokens=?,expires_at=?,generation=generation+1 WHERE id=1 AND generation=?")
-        .bind(encrypted).bind(expires).bind(generation).execute(&state.db).await?.rows_affected();
-    if changed != 1 {
-        return Err(AppError::reauth());
+    match persist(state, stored.generation, &encrypted, expires).await {
+        Ok(true) => Ok(Access {
+            tokens,
+            generation: stored.generation + 1,
+        }),
+        // The owner reconnected during the refresh; the new credential wins.
+        Ok(false) => Ok(load(state).await?.into()),
+        Err(_) => {
+            // The provider may have rotated the refresh token already, so keep the new
+            // credential in memory and save it on the next call.
+            tracing::error!("refreshed Claude credential could not be saved; retrying on next use");
+            refresh.unsaved = Some(Unsaved {
+                generation: stored.generation,
+                encrypted,
+                expires,
+            });
+            Ok(Access {
+                tokens,
+                generation: stored.generation,
+            })
+        }
     }
-    Ok(Access {
-        tokens,
-        generation: generation + 1,
-    })
 }
 
 pub async fn mark_reauth(state: &AppState, generation: i64) -> Result<()> {
