@@ -211,6 +211,9 @@ nav a[aria-current="page"] {
 .connected .status-dot {
   background: var(--green);
 }
+.connected .needs-connection {
+  display: none;
+}
 main {
   padding: 52px 42px 24px;
   min-width: 0;

@@ -66,8 +66,11 @@ async function run(action, button) {
     await action();
   } catch (error) {
     notice(error.message || "Could not connect. Try again.", true);
+    // A reauth 503 means the server just marked Claude as disconnected.
+    if (error.status === 503 && error.type === "authentication_error")
+      await connection().catch(() => {});
   } finally {
-    if (button) button.disabled = false;
+    if (button) button.disabled = button.dataset.unavailable === "true";
   }
 }
 function button(label, action, className = "secondary") {
@@ -123,6 +126,8 @@ async function connection() {
   $("connect-claude").textContent = connected
     ? "Reconnect Claude"
     : "Connect Claude";
+  // run() restores this state after its own busy phase.
+  $("refresh-models").dataset.unavailable = String(!connected);
   $("refresh-models").disabled = !connected;
 }
 async function loadAccess() {
@@ -348,7 +353,7 @@ function renderModels() {
       );
     $("model-list").append(row);
   }
-  if (models.length < 2)
+  if (!models.some((m) => !m.blocked))
     $("model-list").append(
       node(
         "p",
@@ -437,6 +442,7 @@ async function initialize() {
   $("refresh-models").addEventListener("click", (event) =>
     run(async () => {
       const result = await api("models/refresh", "POST");
+      await connection();
       await loadAccess();
       notice(
         `${result.discovered} models discovered. Review new models below.`,
