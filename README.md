@@ -136,6 +136,8 @@ Usage states are `complete`, `partial`, `unknown`, and `not_applicable`. Stream 
 
 Prompts, completions, raw error bodies, API keys, and OAuth tokens are not logged or stored as usage. Only allowlisted numeric usage fields are persisted. Logs report operation failures without SQL values or provider response bodies. Do not enable HTTP body tracing or configure a reverse proxy to log credentials.
 
+Report suspected vulnerabilities privately as described in [SECURITY.md](SECURITY.md), never in a public issue.
+
 Terminal refresh failures mark the account as needing reconnection. Transient failures return an error without falling back to billed API access. The OAuth compatibility behavior is based on opencodex 2.49.0; live provider requirements can change. Model routing is restricted to the reviewed schema rather than passing new provider features through automatically.
 
 ## Backup and recovery
