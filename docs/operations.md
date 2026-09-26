@@ -78,6 +78,8 @@ Migrations are embedded in the binary. They run automatically every time the rou
 3. Deploy the new version (redeploy in Dokploy, or `docker compose up -d --build`).
 4. Check `/readyz` and the dashboard.
 
+Upgrading past migration `0003_admin_session_password.sql` deletes every existing dashboard session once, because older sessions cannot be tied to a password. Sign in again after that upgrade; friend keys and the Claude connection are not affected.
+
 To roll back, redeploy the previous version and restore the backup from step 1 using the restore procedure. Usage recorded since the upgrade is lost.
 
 ## Rotate the encryption key
@@ -108,16 +110,9 @@ Between steps 3 and 4, friend requests fail with 500 "The router could not compl
 
    Do not use `scripts/bootstrap-secrets.sh` for this: it also prints a new encryption key.
 2. Replace `ADMIN_PASSWORD_HASH` in Dokploy's **Environment** settings, keeping the single quotes, and redeploy.
-3. Invalidate existing dashboard sessions. They are stored in the database and are not tied to the password hash, so without this step a session opened with the old password stays valid for up to 12 hours, even after a restart. Delete all sessions while the router is stopped:
+3. Sign in with the new password.
 
-   ```bash
-   docker stop "$router_container"
-   docker run --rm -v "$router_volume":/data debian:bookworm-slim sh -c \
-     'apt-get update -qq && apt-get install -y -qq --no-install-recommends sqlite3 >/dev/null && sqlite3 /data/router.sqlite "DELETE FROM admin_session;" && chown 10001:10001 /data/router.sqlite*'
-   docker start "$router_container"
-   ```
-
-   Every browser, including yours, must sign in again. The helper container needs network access to install `sqlite3`.
+Each dashboard session is bound to the `ADMIN_PASSWORD_HASH` it was issued under. Once the router restarts with a different hash, every existing session is rejected, so every browser, including yours, must sign in again. No database step is needed. Any change to the value counts, including a fresh hash of the same password. To sign every session out without changing the password, generate a new hash of the current password and deploy it the same way.
 
 ## Troubleshooting
 

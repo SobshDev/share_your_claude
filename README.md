@@ -132,7 +132,7 @@ Anything outside these lists is rejected with a 400 `invalid_request_error`. The
 
 `model` is required (1–200 characters) and `messages` must be an array. `/v1/messages` requires a positive integer `max_tokens`; `stream` must be a boolean, and `count_tokens` refuses `stream: true`. Tool names must be 1–128 characters and unique within a request. The contents of messages, system blocks, and tool input schemas are passed through as data. The header may list several comma-separated betas, and every one must be on the list. The router always sends `claude-code-20250219,oauth-2025-04-20` upstream and appends accepted caller betas.
 
-The dashboard API uses session cookies, exact-origin checks, and `X-CSRF-Token` for mutations. `POST /admin/api/login` takes `{"password":"…"}`, requires the configured Origin, and returns the CSRF token; `GET /admin/api/me` returns it for an existing session. Sessions expire after twelve hours. Friend API keys never authorize admin operations.
+The dashboard API uses session cookies, exact-origin checks, and `X-CSRF-Token` for mutations. `POST /admin/api/login` takes `{"password":"…"}`, requires the configured Origin, and returns the CSRF token; `GET /admin/api/me` returns it for an existing session. Sessions expire after twelve hours. Each session is bound to the `ADMIN_PASSWORD_HASH` it was issued under, so changing that value and redeploying signs every dashboard session out. Friend API keys never authorize admin operations.
 
 Sign-in allows five failed attempts per client address per minute, and 30 failed attempts per minute across all clients, so a stranger guessing passwords cannot lock the owner out from another address. A successful sign-in does not count and clears that address's failures. Once an address reaches the limit, it gets 429 until its one-minute window ends, even with the right password. IPv6 addresses are grouped by /64. The counters live in memory and reset on restart. By default the client address is the TCP peer; behind a reverse proxy every request comes from the proxy, so set `TRUSTED_PROXY_HOPS` to the number of proxies in front of the router that append to `X-Forwarded-For` (`1` behind Dokploy's Traefik). The router then uses that entry counted from the right. Do not set it when clients connect directly, because they could then choose their own address.
 
@@ -202,7 +202,7 @@ To restore, stop the router and run `bash scripts/restore.sh BACKUP_FILE` on the
 
 Database migrations run automatically at every startup and are forward-only. Take a backup before each upgrade; rolling back means redeploying the previous version and restoring that backup.
 
-The [operations runbook](docs/operations.md) has copy-paste commands for finding the Compose volume, backing up, restoring, upgrading, rotating the encryption key or owner password (including invalidating existing sessions), and troubleshooting `needs_reauth`, sign-in throttling, and `/readyz` failures.
+The [operations runbook](docs/operations.md) has copy-paste commands for finding the Compose volume, backing up, restoring, upgrading, rotating the encryption key or owner password, and troubleshooting `needs_reauth`, sign-in throttling, and `/readyz` failures.
 
 ## Development and verification
 
