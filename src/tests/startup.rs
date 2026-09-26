@@ -280,7 +280,9 @@ async fn startup_upgrades_an_initial_database_and_recovers_it() {
         .fetch_all(&pool)
         .await
         .unwrap();
-    assert_eq!(sessions, [b"current".to_vec()]);
+    // Migration 0003 binds sessions to the password hash and clears every older session,
+    // so the unexpired session from 0001 is gone too.
+    assert!(sessions.is_empty());
     pool.close().await;
 }
 
