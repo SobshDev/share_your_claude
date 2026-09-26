@@ -728,3 +728,86 @@ async fn catalog_refresh_follows_pages_and_rejects_a_repeated_cursor() {
     assert_eq!(response.status(), 502);
     assert_eq!(json_body(response).await["error"]["type"], "api_error");
 }
+
+/// Outcome, HTTP status, and usage state of the most recent request.
+async fn last_row(h: &Harness) -> (String, Option<i64>, String) {
+    sqlx::query_as(
+        "SELECT outcome,http_status,usage_state FROM request_usage ORDER BY rowid DESC LIMIT 1",
+    )
+    .fetch_one(&h.state.db)
+    .await
+    .unwrap()
+}
+
+#[tokio::test]
+async fn malformed_upstream_streams_end_with_a_sanitized_error() {
+    let h = Harness::new().await;
+    for (scenario, usage_state) in [
+        ("stream-duplicate-start", "partial"),
+        ("stream-delta-first", "unknown"),
+        ("stream-stop-first", "unknown"),
+        ("stream-mismatch", "partial"),
+        ("stream-no-payload", "partial"),
+        ("stream-fallback", "partial"),
+        ("stream-reset", "partial"),
+        ("stream-oversized", "partial"),
+        ("stream-bad-utf8", "partial"),
+        ("wrong-model", "partial"),
+        ("truncated", "partial"),
+    ] {
+        let response = h
+            .request("/v1/messages", &h.key, message(scenario, true))
+            .await;
+        assert_eq!(response.status(), 200, "{scenario}");
+        let text = text_body(response).await;
+        let last = text.trim_end().rsplit("\n\n").next().unwrap();
+        let data: Value = serde_json::from_str(last.split_once("data: ").unwrap().1).unwrap();
+        assert_eq!(data["error"]["type"], "api_error", "{scenario}");
+        assert!(last.contains("stream was interrupted"), "{scenario}");
+        assert!(!text.contains("fallback") && !text.contains("claude-fable-5-1"));
+        let expected = ("upstream_error".into(), Some(200), usage_state.into());
+        assert_eq!(last_row(&h).await, expected, "{scenario}");
+    }
+}
+
+#[tokio::test]
+async fn invalid_upstream_replies_are_bad_gateways() {
+    let h = Harness::new().await;
+    let mut bad_count = count_body();
+    bad_count["messages"][0]["content"] = "bad-count".into();
+    for (path, body, usage_state) in [
+        ("/v1/messages", message("not-json", false), "unknown"),
+        ("/v1/messages", message("not-message", false), "unknown"),
+        ("/v1/messages", message("oversized-reply", false), "unknown"),
+        ("/v1/messages", message("stream-not-sse", true), "unknown"),
+        ("/v1/messages/count_tokens", bad_count, "not_applicable"),
+    ] {
+        let label = body.to_string();
+        let response = h.request(path, &h.key, body).await;
+        assert_eq!(response.status(), 502, "{label}");
+        let body = json_body(response).await;
+        assert_eq!(body["error"]["type"], "api_error");
+        let expected = ("upstream_error".into(), Some(502), usage_state.into());
+        assert_eq!(last_row(&h).await, expected, "{label}");
+    }
+}
+
+#[tokio::test]
+async fn an_unreachable_upstream_is_a_bad_gateway() {
+    let mut h = Harness::new().await;
+    let closed = std::net::TcpListener::bind("127.0.0.1:0")
+        .unwrap()
+        .local_addr()
+        .unwrap();
+    // The router holds the only other references to the state; rebuild it around the change.
+    h.router = Router::new();
+    Arc::get_mut(&mut h.state).unwrap().upstream = format!("http://{closed}");
+    h.router = app(h.state.clone());
+    let response = h
+        .request("/v1/messages", &h.key, message("hello", false))
+        .await;
+    assert_eq!(response.status(), 502);
+    assert_eq!(json_body(response).await["error"]["type"], "api_error");
+    let expected = ("upstream_error".into(), Some(502), "unknown".into());
+    assert_eq!(last_row(&h).await, expected);
+}

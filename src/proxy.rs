@@ -24,7 +24,7 @@ use tokio_stream::wrappers::ReceiverStream;
 /// Largest request body a friend may send to the two POST routes.
 pub const MAX_REQUEST_BODY_BYTES: usize = 32 * 1024 * 1024;
 /// Largest non-streaming upstream reply the router buffers.
-const MAX_RESPONSE_BODY_BYTES: usize = 32 * 1024 * 1024;
+pub(crate) const MAX_RESPONSE_BODY_BYTES: usize = 32 * 1024 * 1024;
 /// Largest upstream error body read to learn its error type.
 const MAX_ERROR_BODY_BYTES: usize = 64 * 1024;
 /// Largest server-sent event buffered from upstream before the stream counts as malformed.

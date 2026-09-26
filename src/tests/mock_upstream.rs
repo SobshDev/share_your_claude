@@ -7,8 +7,12 @@
 //! `forbidden-auth` (403 `authentication_error`),
 //! `redirect` (307), `status-NNN` (that status with an Anthropic error envelope),
 //! `disconnect` (stream that waits for the client to hang up), `no-final-usage`,
-//! `stream-error` (an `overloaded_error` event), `truncated`, `missing` (no usage), and
-//! `wrong-model` (serves `claude-fable-5-1`). Anything else succeeds.
+//! `stream-error` (an `overloaded_error` event), `truncated`, `missing` (no usage),
+//! `no-cache` (usage without cache counters), `wrong-model` (serves `claude-fable-5-1`),
+//! `slow` (never answers in time), `not-json`, `not-message`, and `oversized-reply`
+//! (one byte over the router's reply limit). Streams also accept the malformed scenarios listed
+//! in [`malformed_stream`] and `stream-not-sse` (a JSON reply). `count_tokens` accepts
+//! `expired-token` and `bad-count`. Anything else succeeds.
 use super::*;
 use axum::{
     extract::Query,
@@ -129,6 +133,18 @@ async fn mock_message(
             )
                 .into_response();
         }
+        "slow" => tokio::time::sleep(Duration::from_secs(30)).await,
+        "not-json" => {
+            return ([("content-type", "application/json")], "{\"type\":").into_response();
+        }
+        "not-message" => {
+            return Json(json!({"type":"completion","completion":"hi"})).into_response();
+        }
+        "oversized-reply" => {
+            let mut reply = vec![b' '; crate::proxy::MAX_RESPONSE_BODY_BYTES];
+            reply.push(b'{');
+            return ([("content-type", "application/json")], reply).into_response();
+        }
         _ => (),
     }
     if let Some(status) = content.strip_prefix("status-") {
@@ -158,6 +174,9 @@ async fn mock_message(
     if content == "missing" {
         response.as_object_mut().unwrap().remove("usage");
     }
+    if content == "no-cache" {
+        response["usage"] = json!({"input_tokens":10,"output_tokens":7});
+    }
     if content == "wrong-model" {
         response["model"] = "claude-fable-5-1".into();
     }
@@ -178,11 +197,14 @@ fn event(payload: Value) -> String {
 }
 
 fn stream_reply(mock: Arc<Mock>, content: &str, body: &Value) -> Response {
+    if content == "stream-not-sse" {
+        return Json(json!({"type":"message"})).into_response();
+    }
     let start = json!({"type":"message_start","message":{
         "id": "msg_test",
         "type": "message",
         "role": "assistant",
-        "model": MODEL,
+        "model": if content == "wrong-model" { "claude-fable-5-1" } else { MODEL },
         "content": [],
         "stop_reason": null,
         "stop_sequence": null,
@@ -190,6 +212,26 @@ fn stream_reply(mock: Arc<Mock>, content: &str, body: &Value) -> Response {
     }});
     // CRLF framing on the first event exercises the router's SSE line-ending handling.
     let prefix = format!("event: message_start\r\ndata: {start}\r\n\r\n");
+    if let Some(chunks) = malformed_stream(content, &prefix) {
+        return (
+            [("content-type", "text/event-stream")],
+            Body::from_stream(futures_util::stream::iter(chunks)),
+        )
+            .into_response();
+    }
+    if content == "stream-reset" {
+        // The error comes after the headers and first event, so upstream fails mid-stream.
+        let first = futures_util::stream::iter([Ok(bytes::Bytes::from(prefix))]);
+        let reset = futures_util::stream::once(async {
+            tokio::time::sleep(Duration::from_millis(50)).await;
+            Err(std::io::Error::other("connection reset"))
+        });
+        return (
+            [("content-type", "text/event-stream")],
+            Body::from_stream(first.chain(reset)),
+        )
+            .into_response();
+    }
     if content == "disconnect" {
         let (tx, rx) =
             tokio::sync::mpsc::channel::<std::result::Result<bytes::Bytes, std::io::Error>>(1);
@@ -252,6 +294,48 @@ fn stream_reply(mock: Arc<Mock>, content: &str, body: &Value) -> Response {
         .into_response()
 }
 
+/// Stream chunks for the scenarios whose upstream stream breaks the protocol, each after a valid
+/// `message_start` unless named otherwise: `stream-duplicate-start`, `stream-delta-first` and
+/// `stream-stop-first` (no start), `stream-mismatch` (event name differs from payload type),
+/// `stream-no-payload` (required event without JSON), `stream-fallback` (a fallback content
+/// block), `stream-oversized` (an event larger than the router's limit), and `stream-bad-utf8`.
+/// `stream-reset` (a connection error after the first event) is served by [`stream_reply`].
+fn malformed_stream(
+    content: &str,
+    prefix: &str,
+) -> Option<Vec<std::result::Result<bytes::Bytes, std::io::Error>>> {
+    let delta = event(json!({"type":"message_delta",
+        "delta":{"stop_reason":"end_turn","stop_sequence":null},"usage":{"output_tokens":1}}));
+    let bytes: Vec<u8> = match content {
+        "stream-duplicate-start" => [prefix, prefix].concat().into(),
+        "stream-delta-first" => delta.into(),
+        "stream-stop-first" => event(json!({"type":"message_stop"})).into(),
+        "stream-mismatch" => {
+            format!("{prefix}event: message_stop\ndata: {{\"type\":\"message_delta\"}}\n\n").into()
+        }
+        "stream-no-payload" => format!("{prefix}event: message_delta\ndata: not json\n\n").into(),
+        "stream-fallback" => [
+            prefix.to_owned(),
+            event(json!({"type":"content_block_start","index":0,
+                "content_block":{"type":"fallback","model":"claude-fable-5-1"}})),
+        ]
+        .concat()
+        .into(),
+        "stream-oversized" => {
+            let data = "x".repeat(crate::proxy::MAX_SSE_EVENT_BYTES);
+            format!("{prefix}event: ping\ndata: {data}").into()
+        }
+        "stream-bad-utf8" => [prefix.as_bytes(), b"event: ping\ndata: \xff\n\n"].concat(),
+        _ => return None,
+    };
+    Some(
+        bytes
+            .chunks(64 * 1024)
+            .map(|s| Ok(bytes::Bytes::copy_from_slice(s)))
+            .collect(),
+    )
+}
+
 async fn mock_count_tokens(
     State(mock): State<Arc<Mock>>,
     uri: Uri,
@@ -261,6 +345,9 @@ async fn mock_count_tokens(
     mock.record(&uri, &headers, &body).await;
     if let Some(rejected) = token_rejection(&headers, scenario(&body)) {
         return rejected;
+    }
+    if scenario(&body) == "bad-count" {
+        return Json(json!({"input_tokens":-1})).into_response();
     }
     Json(json!({"input_tokens":123})).into_response()
 }
