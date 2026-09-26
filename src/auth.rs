@@ -125,14 +125,23 @@ pub fn session_token(headers: &HeaderMap, state: &AppState) -> Result<String> {
     result.ok_or_else(AppError::unauthorized)
 }
 
+/// Fingerprint of the configured owner password hash. Sessions are bound to it, so changing
+/// `ADMIN_PASSWORD_HASH` signs out every existing session.
+fn password_fingerprint(state: &AppState) -> Vec<u8> {
+    hash(&state.config.password_hash)
+}
+
 pub async fn session(headers: &HeaderMap, state: &AppState) -> Result<String> {
     let token = session_token(headers, state)?;
-    sqlx::query_scalar("SELECT csrf_token FROM admin_session WHERE token_hash=? AND expires_at>?")
-        .bind(hash(&token))
-        .bind(db::epoch())
-        .fetch_optional(&state.db)
-        .await?
-        .ok_or_else(AppError::unauthorized)
+    sqlx::query_scalar(
+        "SELECT csrf_token FROM admin_session WHERE token_hash=? AND expires_at>? AND password_fp=?",
+    )
+    .bind(hash(&token))
+    .bind(db::epoch())
+    .bind(password_fingerprint(state))
+    .fetch_optional(&state.db)
+    .await?
+    .ok_or_else(AppError::unauthorized)
 }
 
 pub async fn require_admin(
@@ -201,17 +210,22 @@ pub async fn login(
     }
     let token = random_secret();
     let csrf = random_secret();
+    let fingerprint = password_fingerprint(&state);
     let mut tx = state.db.begin().await?;
-    sqlx::query("DELETE FROM admin_session WHERE expires_at<=?")
+    sqlx::query("DELETE FROM admin_session WHERE expires_at<=? OR password_fp<>?")
         .bind(db::epoch())
+        .bind(&fingerprint)
         .execute(&mut *tx)
         .await?;
-    sqlx::query("INSERT INTO admin_session VALUES(?,?,?)")
-        .bind(hash(&token))
-        .bind(&csrf)
-        .bind(db::epoch() + 43200)
-        .execute(&mut *tx)
-        .await?;
+    sqlx::query(
+        "INSERT INTO admin_session(token_hash,csrf_token,expires_at,password_fp) VALUES(?,?,?,?)",
+    )
+    .bind(hash(&token))
+    .bind(&csrf)
+    .bind(db::epoch() + 43200)
+    .bind(&fingerprint)
+    .execute(&mut *tx)
+    .await?;
     tx.commit().await?;
     let secure = if state.config.secure_cookie {
         "; Secure"

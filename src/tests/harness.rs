@@ -261,3 +261,96 @@ pub(super) async fn text_body(response: Response) -> String {
     )
     .unwrap()
 }
+
+impl Harness {
+    /// A second app over this harness's database and fake upstream, with a copy of the
+    /// harness configuration that `edit` may change (cookie mode, password hash, encryption
+    /// key, upstream or token endpoint). The harness's own router is unaffected.
+    pub(super) fn variant(&self, edit: impl FnOnce(&mut AppState)) -> (Arc<AppState>, Router) {
+        let current = &self.state.config;
+        let config = config::Config {
+            bind: current.bind,
+            database_url: current.database_url.clone(),
+            public_origin: current.public_origin.clone(),
+            password_hash: current.password_hash.clone(),
+            encryption_key: zeroize::Zeroizing::new(*current.encryption_key),
+            secure_cookie: current.secure_cookie,
+        };
+        let mut state = AppState::new(config, self.state.db.clone()).unwrap();
+        {
+            let inner = Arc::get_mut(&mut state).unwrap();
+            inner.upstream = self.state.upstream.clone();
+            inner.token_endpoint = self.state.token_endpoint.clone();
+            edit(inner);
+        }
+        let router = app(state.clone());
+        (state, router)
+    }
+}
+
+/// Sends one request to `router` with exactly the given headers.
+pub(super) async fn send_to(
+    router: &Router,
+    method: &str,
+    path: &str,
+    headers: &[(&str, &str)],
+    body: impl Into<Body>,
+) -> Response {
+    let mut request = Request::builder().method(method).uri(path);
+    for (name, value) in headers {
+        request = request.header(*name, *value);
+    }
+    router
+        .clone()
+        .oneshot(request.body(body.into()).unwrap())
+        .await
+        .unwrap()
+}
+
+/// Signs in to `router` with `ADMIN_PASSWORD` and returns a new session.
+pub(super) async fn sign_in(router: &Router) -> AdminSession {
+    let response = send_to(
+        router,
+        "POST",
+        "/admin/api/login",
+        &[("origin", ORIGIN), ("content-type", "application/json")],
+        json!({"password":ADMIN_PASSWORD}).to_string(),
+    )
+    .await;
+    assert_eq!(response.status(), StatusCode::OK);
+    let cookie = response.headers()[header::SET_COOKIE]
+        .to_str()
+        .unwrap()
+        .split(';')
+        .next()
+        .unwrap()
+        .to_owned();
+    let csrf = json_body(response).await["csrf_token"]
+        .as_str()
+        .unwrap()
+        .to_owned();
+    AdminSession { cookie, csrf }
+}
+
+/// Calls an admin route on `router` as `session`, with the right origin and CSRF token.
+pub(super) async fn admin_as(
+    router: &Router,
+    session: &AdminSession,
+    method: &str,
+    path: &str,
+    body: Option<Value>,
+) -> Response {
+    send_to(
+        router,
+        method,
+        path,
+        &[
+            ("content-type", "application/json"),
+            ("cookie", session.cookie.as_str()),
+            ("origin", ORIGIN),
+            ("x-csrf-token", session.csrf.as_str()),
+        ],
+        body.map(|b| b.to_string()).unwrap_or_default(),
+    )
+    .await
+}

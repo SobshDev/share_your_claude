@@ -63,6 +63,48 @@ async fn login_sets_cookie_and_throttles() {
     assert_eq!(h.login("wrong").await.status(), 429);
 }
 
+#[tokio::test]
+async fn changing_the_owner_password_revokes_sessions() {
+    use argon2::PasswordHasher;
+    let h = Harness::new().await;
+    let session = sign_in(&h.router).await;
+    let rotated = argon2::Argon2::default()
+        .hash_password(
+            b"a-different-test-password",
+            &argon2::password_hash::SaltString::encode_b64(b"other-salt-16-by").unwrap(),
+        )
+        .unwrap()
+        .to_string();
+    let (_, router) = h.variant(|state| state.config.password_hash = rotated);
+    let me = send_to(
+        &router,
+        "GET",
+        "/admin/api/me",
+        &[("cookie", session.cookie.as_str())],
+        Body::empty(),
+    )
+    .await;
+    assert_eq!(me.status(), 401);
+    let write = admin_as(
+        &router,
+        &session,
+        "POST",
+        "/admin/api/people",
+        Some(json!({"name":"Sam"})),
+    )
+    .await;
+    assert_eq!(write.status(), 401);
+    let response = send_to(
+        &router,
+        "POST",
+        "/admin/api/login",
+        &[("origin", ORIGIN), ("content-type", "application/json")],
+        json!({"password":"a-different-test-password"}).to_string(),
+    )
+    .await;
+    assert_eq!(response.status(), 200);
+}
+
 async fn last_used(h: &Harness) -> Option<String> {
     sqlx::query_scalar("SELECT last_used_at FROM api_key WHERE id=?")
         .bind(&h.key_id)
