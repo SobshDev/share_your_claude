@@ -42,6 +42,8 @@ pub struct AppState {
     // Only tests inside this crate can replace destinations. No environment/config overrides.
     pub(crate) upstream: String,
     pub(crate) token_endpoint: String,
+    /// How long a client may stop reading a stream; tests shorten it.
+    pub(crate) client_send_timeout: std::time::Duration,
 }
 
 impl AppState {
@@ -57,6 +59,7 @@ impl AppState {
             key_admission: std::sync::Mutex::new(HashMap::new()),
             upstream: "https://api.anthropic.com".into(),
             token_endpoint: "https://api.anthropic.com/v1/oauth/token".into(),
+            client_send_timeout: proxy::CLIENT_SEND_TIMEOUT,
         }))
     }
 }

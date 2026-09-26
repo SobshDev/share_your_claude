@@ -34,7 +34,7 @@ const MAX_UPSTREAM_REQUEST_ID_BYTES: usize = 200;
 /// Stream chunks buffered between the upstream reader and the client.
 const STREAM_CHANNEL_CAPACITY: usize = 4;
 /// How long a client may stop reading a stream before the router abandons it.
-const CLIENT_SEND_TIMEOUT: Duration = Duration::from_secs(120);
+pub const CLIENT_SEND_TIMEOUT: Duration = Duration::from_secs(120);
 /// How long the router tries to deliver the sanitized error event that ends a failed stream.
 const STREAM_ERROR_SEND_TIMEOUT: Duration = Duration::from_secs(5);
 /// Seconds a client should wait before retrying when admission is saturated.
@@ -430,11 +430,19 @@ async fn open_stream(
         let _permits = permits;
         let Admitted { model, mapping, .. } = admitted;
         let result = stream_response(&state, &id, &model, response, mapping, &tx, &mut guard).await;
-        if let Err(error) = result {
-            let event = interrupted_event(error.1);
-            let _ = tokio::time::timeout(STREAM_ERROR_SEND_TIMEOUT, tx.send(Ok(event))).await;
-            let _ = guard.finish("upstream_error", Some(200), false).await;
-        }
+        let (kind, outcome, status) = match result {
+            Ok(()) => return,
+            // The client is not reading, so no error event could reach it.
+            Err(StreamError::ClientStalled) => {
+                let _ = guard.finish("interrupted", Some(200), false).await;
+                return;
+            }
+            Err(StreamError::Upstream(kind)) => (kind, "upstream_error", 200),
+            Err(StreamError::Internal) => ("api_error", "interrupted", 500),
+        };
+        let event = interrupted_event(kind);
+        let _ = tokio::time::timeout(STREAM_ERROR_SEND_TIMEOUT, tx.send(Ok(event))).await;
+        let _ = guard.finish(outcome, Some(status), false).await;
     });
     Ok((
         [
@@ -520,6 +528,27 @@ async fn verify_response_model(
     Ok(())
 }
 
+/// Why a relayed stream ended before `message_stop`.
+enum StreamError {
+    /// Upstream sent malformed, truncated, or error data. Carries the error type to relay.
+    Upstream(&'static str),
+    /// The client stopped reading for longer than the send timeout.
+    ClientStalled,
+    /// The router itself failed, for example while writing a usage checkpoint.
+    Internal,
+}
+
+impl From<AppError> for StreamError {
+    fn from(error: AppError) -> Self {
+        // Database failures surface as internal errors; everything else came from upstream.
+        if error.0 == StatusCode::INTERNAL_SERVER_ERROR {
+            Self::Internal
+        } else {
+            Self::Upstream(error.1)
+        }
+    }
+}
+
 async fn stream_response(
     state: &AppState,
     id: &str,
@@ -528,7 +557,7 @@ async fn stream_response(
     mapping: ToolMap,
     tx: &mpsc::Sender<Chunk>,
     guard: &mut RequestGuard,
-) -> Result<()> {
+) -> std::result::Result<(), StreamError> {
     let mut stream = response.bytes_stream();
     let mut decoder = SseDecoder::default();
     let mut progress = StreamProgress::default();
@@ -538,18 +567,18 @@ async fn stream_response(
             chunk = stream.next() => chunk,
         };
         let Some(chunk) = chunk else {
-            return Err(AppError::upstream());
+            return Err(StreamError::Upstream("api_error"));
         };
         decoder.push(&chunk.map_err(|_| AppError::upstream())?)?;
         while let Some(event) = decoder.next_event()? {
             let (kind, bytes) = progress
                 .observe(state, id, model, event, &mapping, guard)
                 .await?;
-            if tokio::time::timeout(CLIENT_SEND_TIMEOUT, tx.send(Ok(bytes)))
+            if tokio::time::timeout(state.client_send_timeout, tx.send(Ok(bytes)))
                 .await
                 .is_err()
             {
-                return Err(AppError::upstream());
+                return Err(StreamError::ClientStalled);
             }
             if tx.is_closed() {
                 guard.finish("interrupted", Some(200), false).await?;

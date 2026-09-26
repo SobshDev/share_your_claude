@@ -525,3 +525,34 @@ async fn saturated_admission_is_denied_before_upstream() {
     );
     assert_eq!(h.mock.requests.load(Ordering::SeqCst), 0);
 }
+
+#[tokio::test]
+async fn a_client_that_stops_reading_is_interrupted_not_an_upstream_error() {
+    let mut h = Harness::new().await;
+    // The router holds the only other references to the state; rebuild it around the change.
+    h.router = Router::new();
+    Arc::get_mut(&mut h.state).unwrap().client_send_timeout = Duration::from_millis(50);
+    h.router = app(h.state.clone());
+    let response = h
+        .request("/v1/messages", &h.key, message("hello", true))
+        .await;
+    assert_eq!(response.status(), 200);
+    // The body is never polled, so the relay channel fills and a send times out.
+    let row = tokio::time::timeout(Duration::from_secs(3), async {
+        loop {
+            let row: (String, String) =
+                sqlx::query_as("SELECT outcome,usage_state FROM request_usage")
+                    .fetch_one(&h.state.db)
+                    .await
+                    .unwrap();
+            if row.0 != "in_progress" {
+                break row;
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+    })
+    .await
+    .unwrap();
+    assert_eq!(row, ("interrupted".into(), "partial".into()));
+    drop(response);
+}
