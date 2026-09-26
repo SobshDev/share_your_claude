@@ -1,6 +1,82 @@
 //! Proxying `/v1/messages`: streaming, cancellation, upstream errors, and served-model checks.
 use super::*;
-use crate::oauth;
+use crate::{oauth, proxy};
+
+/// Feeds `input` to a fresh decoder in `chunk`-byte pieces and returns `(kind, data)` pairs.
+fn decode(input: &[u8], chunk: usize) -> Vec<(String, Option<String>)> {
+    let mut decoder = proxy::SseDecoder::default();
+    let mut events = Vec::new();
+    for piece in input.chunks(chunk) {
+        decoder.push(piece).unwrap();
+        while let Some(event) = decoder.next_event().unwrap() {
+            events.push((event.kind, event.data));
+        }
+    }
+    events
+}
+
+#[test]
+fn sse_decoder_accepts_every_line_ending_split_anywhere() {
+    let expected = vec![
+        ("message_start".to_owned(), Some("{\"a\":1}".to_owned())),
+        ("message".to_owned(), Some("line one\nline two".to_owned())),
+        ("ping".to_owned(), None),
+    ];
+    for separator in ["\n", "\r\n", "\r"] {
+        let input = [
+            "event: message_start",
+            "data: {\"a\":1}",
+            "",
+            ": comment lines are ignored",
+            "data:line one",
+            "data: line two",
+            "",
+            "event:ping",
+            "",
+            "",
+        ]
+        .join(separator);
+        for chunk in [1, 2, 3, 7, input.len()] {
+            assert_eq!(
+                decode(input.as_bytes(), chunk),
+                expected,
+                "{separator:?} in {chunk}-byte chunks"
+            );
+        }
+    }
+    // Mixed endings, including `\r\n` followed by `\n` and a `\r` split from its `\n`.
+    let mixed = b"event: a\r\ndata: 1\r\n\nevent: b\rdata: 2\r\r\nevent: c\ndata: 3\n\r";
+    for chunk in [1, 2, 5, mixed.len()] {
+        let kinds: Vec<_> = decode(mixed, chunk)
+            .into_iter()
+            .map(|(kind, data)| format!("{kind}={}", data.unwrap()))
+            .collect();
+        assert_eq!(kinds, ["a=1", "b=2", "c=3"], "{chunk}-byte chunks");
+    }
+}
+
+#[test]
+fn sse_decoder_is_incremental_and_bounded() {
+    let mut decoder = proxy::SseDecoder::default();
+    let data = "x".repeat(proxy::MAX_SSE_EVENT_BYTES - 64);
+    let input = format!("event: big\ndata: {data}\n\n");
+    for piece in input.as_bytes().chunks(1024) {
+        decoder.push(piece).unwrap();
+        if let Some(event) = decoder.next_event().unwrap() {
+            assert_eq!(event.kind, "big");
+            assert_eq!(event.data.as_deref().map(str::len), Some(data.len()));
+        }
+    }
+    // Every byte is examined for a line ending about once, not once per chunk.
+    assert!(decoder.scanned <= input.len() + 8, "{}", decoder.scanned);
+
+    let mut decoder = proxy::SseDecoder::default();
+    decoder
+        .push(&vec![b'x'; proxy::MAX_SSE_EVENT_BYTES])
+        .unwrap();
+    assert!(decoder.next_event().unwrap().is_none());
+    assert!(decoder.push(b"\n\n").is_err());
+}
 
 #[tokio::test]
 async fn stream_usage_is_cumulative_and_tool_names_round_trip() {

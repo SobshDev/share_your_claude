@@ -20,6 +20,9 @@ use std::{io, sync::Arc};
 use tokio::sync::mpsc;
 use tokio_stream::wrappers::ReceiverStream;
 
+/// Largest server-sent event buffered from upstream before the stream counts as malformed.
+pub const MAX_SSE_EVENT_BYTES: usize = 4 * 1024 * 1024;
+
 pub async fn messages(
     State(state): State<Arc<AppState>>,
     headers: HeaderMap,
@@ -426,54 +429,115 @@ async fn stream_response(
     }
 }
 
+/// Incremental server-sent events decoder. Lines may end in `\n`, `\r\n`, or a bare `\r`, and a
+/// blank line ends an event. Each buffered byte is examined for a line ending once.
 #[derive(Default)]
 pub struct SseDecoder {
     buffer: Vec<u8>,
+    /// First buffered byte not yet examined for a line ending.
+    scan_from: usize,
+    /// Start of the line that contains `scan_from`.
+    line_start: usize,
+    /// The last line ended in `\r`, so a `\n` at `scan_from` belongs to that line ending.
+    after_cr: bool,
+    #[cfg(test)]
+    pub(crate) scanned: usize,
 }
 pub struct Event {
-    kind: String,
-    data: Option<String>,
-    raw: String,
+    pub(crate) kind: String,
+    pub(crate) data: Option<String>,
+    pub(crate) raw: String,
 }
 impl SseDecoder {
     pub fn push(&mut self, chunk: &[u8]) -> Result<()> {
-        if self.buffer.len() + chunk.len() > 4 * 1024 * 1024 {
+        if self.buffer.len() + chunk.len() > MAX_SSE_EVENT_BYTES {
             return Err(AppError::upstream());
         }
         self.buffer.extend_from_slice(chunk);
         Ok(())
     }
     pub fn next_event(&mut self) -> Result<Option<Event>> {
-        let boundary = self
-            .buffer
-            .windows(2)
-            .position(|b| b == b"\n\n")
-            .map(|i| (i, 2));
-        let crlf = self
-            .buffer
-            .windows(4)
-            .position(|b| b == b"\r\n\r\n")
-            .map(|i| (i, 4));
-        let end = match (boundary, crlf) {
-            (Some(a), Some(b)) => Some(if a.0 < b.0 { a } else { b }),
-            (a, b) => a.or(b),
-        };
-        let Some((index, len)) = end else {
-            return Ok(None);
-        };
-        let raw = String::from_utf8(self.buffer.drain(..index + len).collect())
-            .map_err(|_| AppError::upstream())?;
-        let mut kind = "message".to_owned();
-        let mut data = Vec::new();
-        for line in raw.lines() {
-            if let Some(v) = line.strip_prefix("event:") {
-                kind = v.strip_prefix(' ').unwrap_or(v).into();
+        loop {
+            if self.after_cr {
+                match self.buffer.get(self.scan_from) {
+                    None => return Ok(None),
+                    Some(b'\n') if self.scan_from == 0 => {
+                        self.buffer.remove(0);
+                    }
+                    Some(b'\n') => {
+                        self.scan_from += 1;
+                        self.line_start = self.scan_from;
+                    }
+                    Some(_) => (),
+                }
+                self.after_cr = false;
             }
-            if let Some(v) = line.strip_prefix("data:") {
-                data.push(v.strip_prefix(' ').unwrap_or(v));
+            let Some(offset) = self.buffer[self.scan_from..]
+                .iter()
+                .position(|b| matches!(b, b'\n' | b'\r'))
+            else {
+                #[cfg(test)]
+                {
+                    self.scanned += self.buffer.len() - self.scan_from;
+                }
+                self.scan_from = self.buffer.len();
+                return Ok(None);
+            };
+            let index = self.scan_from + offset;
+            #[cfg(test)]
+            {
+                self.scanned += offset + 1;
+            }
+            let ending = match (self.buffer[index], self.buffer.get(index + 1)) {
+                (b'\r', Some(b'\n')) => 2,
+                (b'\r', None) => {
+                    // The matching `\n`, if any, has not arrived yet.
+                    self.after_cr = true;
+                    1
+                }
+                _ => 1,
+            };
+            let blank = index == self.line_start;
+            self.scan_from = index + ending;
+            self.line_start = self.scan_from;
+            if !blank {
+                continue;
+            }
+            let end = self.scan_from;
+            self.scan_from = 0;
+            self.line_start = 0;
+            let raw = String::from_utf8(self.buffer.drain(..end).collect())
+                .map_err(|_| AppError::upstream())?;
+            if end == ending {
+                // A blank line with no fields before it dispatches nothing.
+                continue;
+            }
+            return Ok(Some(Event::parse(raw)));
+        }
+    }
+}
+impl Event {
+    fn parse(raw: String) -> Self {
+        let mut kind = String::new();
+        let mut data = Vec::new();
+        for line in raw.split(['\r', '\n']) {
+            if line.is_empty() || line.starts_with(':') {
+                continue;
+            }
+            let (field, value) = match line.split_once(':') {
+                Some((field, value)) => (field, value.strip_prefix(' ').unwrap_or(value)),
+                None => (line, ""),
+            };
+            match field {
+                "event" => value.clone_into(&mut kind),
+                "data" => data.push(value),
+                _ => (),
             }
         }
+        if kind.is_empty() {
+            kind.push_str("message");
+        }
         let data = (!data.is_empty()).then(|| data.join("\n"));
-        Ok(Some(Event { kind, data, raw }))
+        Self { kind, data, raw }
     }
 }
