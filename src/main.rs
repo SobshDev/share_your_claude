@@ -1,6 +1,6 @@
 use argon2::{Argon2, PasswordHasher, password_hash::SaltString};
 use base64::{Engine, engine::general_purpose::STANDARD};
-use rand::{RngCore, rngs::OsRng};
+use chacha20poly1305::aead::{OsRng, rand_core::RngCore};
 use shared_router::{AppState, config::Config, db};
 use std::io::{self, Read};
 
