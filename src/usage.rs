@@ -22,7 +22,8 @@ impl Usage {
             "cache_read_input_tokens",
             "cache_creation_input_tokens",
         ] {
-            if let Some(value) = object.get(key) {
+            // Anthropic declares several delta counters nullable; null means "not reported".
+            if let Some(value) = object.get(key).filter(|v| !v.is_null()) {
                 if let Some(n) = value.as_i64().filter(|n| *n >= 0) {
                     // A cumulative counter moving backwards makes final accounting uncertain.
                     if self

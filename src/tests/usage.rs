@@ -102,6 +102,30 @@ fn usage_merges_snapshots_and_rejects_invalid_values() {
     assert_eq!(u.state(true), "partial");
 }
 
+#[test]
+fn null_usage_counters_are_unreported_not_invalid() {
+    let mut u = usage::Usage::default();
+    u.merge(Some(
+        &json!({"input_tokens":10,"output_tokens":0,"cache_read_input_tokens":4}),
+    ));
+    u.merge(Some(&json!({
+        "input_tokens":null,
+        "output_tokens":7,
+        "cache_read_input_tokens":null,
+        "cache_creation_input_tokens":null
+    })));
+    assert_eq!(u.get("input_tokens"), Some(10));
+    assert_eq!(u.get("cache_read_input_tokens"), Some(4));
+    assert_eq!(u.get("cache_creation_input_tokens"), None);
+    assert_eq!(u.state(true), "complete");
+    for invalid in [json!({"output_tokens":"8"}), json!({"output_tokens":1.5})] {
+        let mut u = usage::Usage::default();
+        u.merge(Some(&json!({"input_tokens":10,"output_tokens":0})));
+        u.merge(Some(&invalid));
+        assert_eq!(u.state(true), "partial");
+    }
+}
+
 #[tokio::test]
 async fn missing_final_usage_never_appears_complete() {
     let h = Harness::new().await;
