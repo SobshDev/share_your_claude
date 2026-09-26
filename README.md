@@ -1,6 +1,6 @@
 # Shared Router
 
-A private Claude gateway for a small group. Friends use individual router keys in opencodex; the owner’s Claude OAuth credentials remain on the server. Fable 5.1 is reserved for the owner and cannot be enabled for friend keys.
+A private Claude gateway for a small group. Friends use individual router keys in opencodex; the owner’s Claude OAuth credentials remain on the server. Fable 5.1 is blocked for every router key and cannot be granted; the owner reaches it only through direct Claude access, outside this router.
 
 The Rust service includes an owner dashboard, model grants, streaming and non-streaming Messages API support, token counting, model discovery, encrypted OAuth credentials, coordinated refresh, and SQLite usage reports. It does **not** impose token budgets or convert token counts into subscription-limit percentages.
 
@@ -76,7 +76,7 @@ For local Compose use, copy `.env.example` to `.env` and fill in the same direct
 }
 ```
 
-The displayed configuration uses only models granted to that key. Even if a client invents another model name, the router checks access again before contacting Claude. Revocation blocks new requests; already-admitted requests can finish. A newly enabled model is granted automatically to future keys; existing keys are changed explicitly through **Edit access**.
+The displayed configuration uses only models granted to that key. Even if a client invents another model name, the router checks access again before contacting Claude. Revocation blocks new requests; already-admitted requests can finish. New keys start with every currently enabled model except Fable 5.1. Enabling a model later does not change existing keys; use **Edit access**.
 
 If friends previously received your actual account credentials, revoke those sessions/credentials before relying on router restrictions. Personal requests sent directly to Claude are outside this router’s per-person accounting. Blocking Fable does not reserve shared account capacity.
 
@@ -120,7 +120,7 @@ All charts and tables share the applied filters. Model reporting groups by the r
 
 ## Accounting and failure behavior
 
-SQLite stores people, hashed keys, reviewed models/aliases, grants, an encrypted credential, admin sessions, and per-request usage. The full schema is in `migrations/0001_initial.sql`.
+SQLite stores people, hashed keys, reviewed models/aliases, grants, an encrypted credential, admin sessions, and per-request usage. The schema is the ordered set of files in [`migrations/`](migrations/).
 
 ```text
 Person 1 ── N ApiKey N ── N Model (through KeyModelGrant)
