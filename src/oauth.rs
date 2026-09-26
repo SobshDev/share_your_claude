@@ -36,10 +36,20 @@ const PERSIST_ATTEMPTS: u32 = 3;
 
 /// In-process owner authentication state. Every lock on `AppState::oauth` is short and never
 /// held across network or database I/O; refreshes are serialized by `refresh` instead.
-#[derive(Default)]
 pub struct OAuthState {
     pending: Option<Pending>,
     refresh: Arc<Mutex<Refresh>>,
+    /// Admin sign-in throttling (kept here so it shares `AppState`'s existing lock).
+    pub(crate) login: auth::LoginLimiter,
+}
+impl Default for OAuthState {
+    fn default() -> Self {
+        Self {
+            pending: None,
+            refresh: Arc::default(),
+            login: auth::LoginLimiter::from_env(),
+        }
+    }
 }
 #[cfg(test)]
 impl OAuthState {
