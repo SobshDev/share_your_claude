@@ -6,7 +6,7 @@ use crate::{
 use askama::Template;
 use axum::{
     Json, Router,
-    extract::{DefaultBodyLimit, Path, State},
+    extract::{Path, State},
     http::{HeaderMap, StatusCode, header},
     middleware,
     response::{Html, IntoResponse, Redirect, Response},
@@ -78,7 +78,6 @@ pub fn routes(state: Arc<AppState>) -> Router<Arc<AppState>> {
                 )
             }),
         )
-        .layer(DefaultBodyLimit::max(64 * 1024))
 }
 
 #[derive(Template)]
