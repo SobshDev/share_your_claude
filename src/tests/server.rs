@@ -189,3 +189,91 @@ async fn stopping_interrupts_open_streams_and_keeps_their_usage() {
     assert!(input.is_some());
     assert!(finished.is_some());
 }
+/// Collects formatted log output of the current thread.
+#[derive(Clone, Default)]
+struct Logs(Arc<std::sync::Mutex<Vec<u8>>>);
+impl std::io::Write for Logs {
+    fn write(&mut self, bytes: &[u8]) -> std::io::Result<usize> {
+        self.0.lock().unwrap().extend_from_slice(bytes);
+        Ok(bytes.len())
+    }
+    fn flush(&mut self) -> std::io::Result<()> {
+        Ok(())
+    }
+}
+impl<'a> tracing_subscriber::fmt::MakeWriter<'a> for Logs {
+    type Writer = Logs;
+    fn make_writer(&'a self) -> Logs {
+        self.clone()
+    }
+}
+impl Logs {
+    fn text(&self) -> String {
+        String::from_utf8(self.0.lock().unwrap().clone()).unwrap()
+    }
+}
+
+#[tokio::test]
+async fn failures_log_one_sanitized_category_each() {
+    let logs = Logs::default();
+    let subscriber = tracing_subscriber::fmt()
+        .with_writer(logs.clone())
+        .with_ansi(false)
+        .with_max_level(tracing::Level::WARN)
+        .finish();
+    let _default = tracing::subscriber::set_default(subscriber);
+    let h = Harness::new().await;
+    let cases = [
+        ("wrong-model", false, "model_mismatch"),
+        ("not-json", false, "malformed"),
+        ("status-500", false, "status"),
+        ("truncated", true, "truncated"),
+        ("stream-error", true, "stream_error"),
+    ];
+    for (scenario, stream, _) in cases {
+        let mut body = message(scenario, stream);
+        body["system"] = json!("private-prompt-text");
+        let response = h.request("/v1/messages", &h.key, body).await;
+        text_body(response).await;
+        settled(&h).await;
+    }
+    let failure = sqlx::query("INSERT INTO person(id,name,created_at) VALUES(?,?,?)")
+        .bind(&h.person)
+        .bind("Duplicate")
+        .bind(db::now())
+        .execute(&h.state.db)
+        .await
+        .unwrap_err();
+    let _ = crate::error::AppError::from(failure);
+
+    let text = logs.text();
+    let failures: Vec<&str> = text
+        .lines()
+        .filter(|line| line.contains("upstream request failed"))
+        .collect();
+    assert_eq!(failures.len(), cases.len(), "{text}");
+    for ((scenario, _, category), line) in cases.iter().zip(&failures) {
+        assert!(
+            line.contains(&format!("category=\"{category}\"")),
+            "{scenario}: {line}"
+        );
+        assert!(line.contains("request_id="), "{line}");
+    }
+    let database = text
+        .lines()
+        .find(|line| line.contains("database operation failed"))
+        .unwrap_or_else(|| panic!("{text}"));
+    assert!(database.contains("kind=\"unique_violation\""), "{database}");
+    assert!(database.contains("at=src/tests/server.rs:"), "{database}");
+    for secret in [
+        h.key.as_str(),
+        "owner-access-must-not-leak",
+        "owner-refresh",
+        "private-prompt-text",
+        "INSERT",
+        "Duplicate",
+        "owner-secret",
+    ] {
+        assert!(!text.contains(secret), "logs contain {secret}: {text}");
+    }
+}

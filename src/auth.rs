@@ -78,7 +78,7 @@ pub async fn api_key(headers: &HeaderMap, state: &AppState) -> Result<String> {
     let now = chrono::Utc::now();
     let cutoff = (now - chrono::Duration::seconds(LAST_USED_RESOLUTION_SECS))
         .to_rfc3339_opts(chrono::SecondsFormat::Millis, true);
-    if sqlx::query(
+    if let Err(error) = sqlx::query(
         "UPDATE api_key SET last_used_at=? WHERE id=? AND (last_used_at IS NULL OR last_used_at<?)",
     )
     .bind(now.to_rfc3339_opts(chrono::SecondsFormat::Millis, true))
@@ -86,8 +86,8 @@ pub async fn api_key(headers: &HeaderMap, state: &AppState) -> Result<String> {
     .bind(cutoff)
     .execute(&state.db)
     .await
-    .is_err()
     {
+        crate::error::log_database_error(&error);
         tracing::warn!("could not record key last use");
     }
     Ok(id)

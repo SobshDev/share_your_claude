@@ -127,9 +127,44 @@ impl IntoResponse for AppError {
     }
 }
 impl From<sqlx::Error> for AppError {
-    fn from(_: sqlx::Error) -> Self {
-        // Database errors can contain values. Never log them or return them verbatim.
-        tracing::error!("database operation failed");
+    #[track_caller]
+    fn from(error: sqlx::Error) -> Self {
+        log_database_error(&error);
         Self::internal()
     }
+}
+
+/// Logs a sanitized category of a database failure and the source location of the caller
+/// (the `?` that converted it). Database messages can contain values, so only the error kind,
+/// SQLite's result code, and the I/O error kind are logged.
+#[track_caller]
+pub fn log_database_error(error: &sqlx::Error) {
+    use sqlx::error::ErrorKind;
+    let at = std::panic::Location::caller();
+    let (kind, code) = match error {
+        sqlx::Error::Database(error) => {
+            let kind = match error.kind() {
+                ErrorKind::UniqueViolation => "unique_violation",
+                ErrorKind::ForeignKeyViolation => "foreign_key_violation",
+                ErrorKind::NotNullViolation => "not_null_violation",
+                ErrorKind::CheckViolation => "check_violation",
+                _ => "database",
+            };
+            (kind, error.code().map(|code| code.into_owned()))
+        }
+        sqlx::Error::PoolTimedOut => ("pool_timed_out", None),
+        sqlx::Error::PoolClosed => ("pool_closed", None),
+        sqlx::Error::Io(error) => ("io", Some(format!("{:?}", error.kind()))),
+        sqlx::Error::RowNotFound => ("row_not_found", None),
+        sqlx::Error::ColumnNotFound(_)
+        | sqlx::Error::ColumnIndexOutOfBounds { .. }
+        | sqlx::Error::ColumnDecode { .. }
+        | sqlx::Error::Decode(_)
+        | sqlx::Error::TypeNotFound { .. } => ("decode", None),
+        sqlx::Error::Protocol(_) => ("protocol", None),
+        sqlx::Error::WorkerCrashed => ("worker_crashed", None),
+        sqlx::Error::Migrate(_) => ("migrate", None),
+        _ => ("other", None),
+    };
+    tracing::error!(kind, code = code.as_deref(), at = %at, "database operation failed");
 }
