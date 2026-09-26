@@ -199,8 +199,21 @@ async fn create_key(
     .bind(db::now())
     .execute(&mut *tx)
     .await?;
-    sqlx::query("INSERT INTO key_model_grant SELECT ?,id FROM model WHERE enabled=1 AND reviewed_at IS NOT NULL AND model_group!='fable-5.1' AND id!='claude-fable-5-1' AND id NOT LIKE 'claude-fable-5-1-%'")
-        .bind(&id).execute(&mut *tx).await?;
+    let enabled =
+        sqlx::query("SELECT id,model_group FROM model WHERE enabled=1 AND reviewed_at IS NOT NULL")
+            .fetch_all(&mut *tx)
+            .await?;
+    for row in &enabled {
+        let model: &str = row.get("id");
+        if policy::blocked(model, row.get("model_group")) {
+            continue;
+        }
+        sqlx::query("INSERT INTO key_model_grant(key_id,model_id) VALUES(?,?)")
+            .bind(&id)
+            .bind(model)
+            .execute(&mut *tx)
+            .await?;
+    }
     tx.commit().await?;
     Ok((
         StatusCode::CREATED,
@@ -343,11 +356,15 @@ async fn refresh_models(State(state): State<Arc<AppState>>) -> Result<Json<Value
                 .get("id")
                 .and_then(Value::as_str)
                 .ok_or_else(AppError::upstream)?;
+            // Variant spellings (`.`, `_`, `@`, uppercase) are kept so that policy can file
+            // them under the blocked group instead of silently dropping them.
             if id.len() > 150
-                || !id.starts_with("claude-")
+                || !id
+                    .get(..7)
+                    .is_some_and(|p| p.eq_ignore_ascii_case("claude-"))
                 || !id
                     .bytes()
-                    .all(|c| c.is_ascii_lowercase() || c.is_ascii_digit() || c == b'-')
+                    .all(|c| c.is_ascii_alphanumeric() || b"-._@".contains(&c))
             {
                 continue;
             }
@@ -380,13 +397,20 @@ async fn refresh_models(State(state): State<Arc<AppState>>) -> Result<Json<Value
     }
     let mut tx = state.db.begin().await?;
     for (id, name) in &candidates {
-        let group = if policy::blocked(id, "") {
-            "fable-5.1"
+        let group = policy::catalog_group(id, name);
+        // An existing row keeps its reviewed group unless policy now blocks the model; then it
+        // moves to the blocked group and is disabled.
+        let sql = if group == policy::FABLE_GROUP {
+            "INSERT INTO model(id,display_name,model_group) VALUES(?,?,?) ON CONFLICT(id) DO UPDATE SET display_name=excluded.display_name,model_group=excluded.model_group,enabled=0"
         } else {
-            "claude"
+            "INSERT INTO model(id,display_name,model_group) VALUES(?,?,?) ON CONFLICT(id) DO UPDATE SET display_name=excluded.display_name"
         };
-        sqlx::query("INSERT INTO model(id,display_name,model_group) VALUES(?,?,?) ON CONFLICT(id) DO UPDATE SET display_name=excluded.display_name")
-            .bind(id).bind(name).bind(group).execute(&mut *tx).await?;
+        sqlx::query(sql)
+            .bind(id)
+            .bind(name)
+            .bind(group)
+            .execute(&mut *tx)
+            .await?;
     }
     tx.commit().await?;
     Ok(Json(
@@ -410,7 +434,7 @@ async fn review_model(
     let group =
         group.ok_or_else(|| AppError::bad("Refresh the catalog to discover this model first"))?;
     if input.enabled && policy::blocked(&id, &group) {
-        return Err(AppError::forbidden("Fable 5.1 is reserved for the owner"));
+        return Err(AppError::forbidden(policy::FABLE_RESERVED));
     }
     sqlx::query("UPDATE model SET enabled=?,reviewed_at=? WHERE id=?")
         .bind(input.enabled)
