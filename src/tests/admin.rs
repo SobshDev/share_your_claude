@@ -1,8 +1,32 @@
-//! Admin API: model catalog review, key management, and CSRF protection.
+//! Admin API: model catalog review and key management.
 use super::*;
 
 #[tokio::test]
-async fn catalog_review_key_creation_and_csrf() {
+async fn fable_cannot_be_enabled_after_a_catalog_refresh() {
+    let h = Harness::new().await;
+    assert_eq!(
+        h.admin("/admin/api/models/refresh", "POST", None)
+            .await
+            .status(),
+        200
+    );
+    assert_eq!(
+        error_message(
+            h.admin(
+                "/admin/api/models/claude-fable-5-1",
+                "PUT",
+                Some(json!({"enabled":true}))
+            )
+            .await,
+            403
+        )
+        .await,
+        crate::policy::FABLE_RESERVED
+    );
+}
+
+#[tokio::test]
+async fn new_keys_get_every_enabled_model_and_are_listed_without_their_secret() {
     let h = Harness::new().await;
     assert_eq!(
         h.admin("/admin/api/models/refresh", "POST", None)
@@ -19,19 +43,6 @@ async fn catalog_review_key_creation_and_csrf() {
         .await
         .status(),
         204
-    );
-    assert_eq!(
-        error_message(
-            h.admin(
-                "/admin/api/models/claude-fable-5-1",
-                "PUT",
-                Some(json!({"enabled":true}))
-            )
-            .await,
-            403
-        )
-        .await,
-        crate::policy::FABLE_RESERVED
     );
     let created = json_body(
         h.admin(
@@ -55,21 +66,7 @@ async fn catalog_review_key_creation_and_csrf() {
             .fetch_all(&h.state.db)
             .await
             .unwrap();
-    assert_eq!(grants.len(), 2);
-    assert!(!grants.contains(&"claude-fable-5-1".into()));
-    // A valid session cookie without origin and CSRF token must not allow writes.
-    let r = h
-        .send(
-            "POST",
-            "/admin/api/people",
-            &[
-                ("cookie", h.session().await.cookie.as_str()),
-                ("content-type", "application/json"),
-            ],
-            "{\"name\":\"Attacker\"}",
-        )
-        .await;
-    assert_eq!(error_message(r, 403).await, WRONG_ORIGIN);
+    assert_eq!(grants, ["claude-opus-5", MODEL]);
 }
 
 #[tokio::test]

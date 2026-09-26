@@ -4,7 +4,7 @@ use super::*;
 use crate::auth;
 
 #[tokio::test]
-async fn auth_conflicts_admin_isolation_and_revocation() {
+async fn conflicting_key_headers_are_rejected() {
     let h = Harness::new().await;
     let r = h
         .get(
@@ -16,10 +16,20 @@ async fn auth_conflicts_admin_isolation_and_revocation() {
         )
         .await;
     assert_error(r, 401, "authentication_error", AUTH_REQUIRED).await;
+}
+
+#[tokio::test]
+async fn client_keys_cannot_use_the_admin_api() {
+    let h = Harness::new().await;
     let r = h
         .get("/admin/api/keys", &[("x-api-key", h.key.as_str())])
         .await;
     assert_error(r, 401, "authentication_error", AUTH_REQUIRED).await;
+}
+
+#[tokio::test]
+async fn removed_grants_and_revoked_keys_are_denied_before_upstream() {
+    let h = Harness::new().await;
     assert_eq!(
         h.admin(
             &format!("/admin/api/keys/{}/models", h.key_id),
@@ -233,6 +243,7 @@ async fn admin_writes_need_both_origin_and_csrf_token() {
         (Some(ORIGIN), Some("wrong-token"), WRONG_CSRF),
         (Some("https://evil.example"), Some(csrf), WRONG_ORIGIN),
         (None, Some(csrf), WRONG_ORIGIN),
+        (None, None, WRONG_ORIGIN),
     ] {
         assert_error(
             create_person(&h, origin, token).await,
