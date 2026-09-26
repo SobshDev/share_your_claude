@@ -50,6 +50,8 @@ Compose exposes port 8080 only to the container network, with no host-port bindi
 
 The router runs as UID 10001 with a read-only root filesystem and a persistent `router_data` volume at `/data`. Run **one router process/replica per database**: refresh coordination and admission control are process-local, and startup recovers unfinished requests. Preserve this volume across redeployments.
 
+`compose.yaml` also caps the container's resources: Docker's `json-file` logs rotate at 10 MB and keep five files, memory is limited to 512 MB, and the process count to 256. Logging defaults to `RUST_LOG=shared_router=info`; set `RUST_LOG` in Dokploy's Environment settings to override it, for example `shared_router=debug` while troubleshooting.
+
 To try the container locally, copy `.env.example` to `.env`, set `PUBLIC_ORIGIN=http://localhost:8080`, and fill in `ENCRYPTION_KEY` and `ADMIN_PASSWORD_HASH` with the values from `scripts/bootstrap-secrets.sh`. Keep the single quotes around the password hash in `.env`; when exporting it in a shell, quote it there as well. Then start the stack with the local override, which publishes the router on `127.0.0.1:8080` only, and open http://localhost:8080/admin:
 
 ```bash
