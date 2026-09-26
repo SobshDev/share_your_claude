@@ -196,6 +196,8 @@ The script writes `router-<UTC timestamp>.sqlite` (mode 600) to `./backups` and 
 BACKUP_DIR=/srv/router-backups BACKUP_KEEP=14 bash scripts/backup.sh
 ```
 
+To restore, stop the router and run `bash scripts/restore.sh BACKUP_FILE` on the Docker host. It saves the current database as `pre-restore-<timestamp>.sqlite` in `BACKUP_DIR` before replacing it; the runbook below covers the full procedure.
+
 Database migrations run automatically at every startup and are forward-only. Take a backup before each upgrade; rolling back means redeploying the previous version and restoring that backup.
 
 The [operations runbook](docs/operations.md) has copy-paste commands for finding the Compose volume, backing up, restoring, upgrading, rotating the encryption key or owner password (including invalidating existing sessions), and troubleshooting `needs_reauth`, sign-in throttling, and `/readyz` failures.

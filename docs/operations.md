@@ -42,7 +42,15 @@ From a Compose directory that uses the same project name, `bash scripts/backup.s
    docker stop "$router_container"
    ```
 
-2. Replace the database. Run this from the directory that holds the backup file, with `router_backup` set to its file name. It deletes the old WAL and SHM files, which belong to the database being replaced; a stopped router can leave them behind, and SQLite would otherwise try to apply them to the restored file:
+2. Replace the database with `scripts/restore.sh`, from a checkout of this repository on the Docker host (any directory works):
+
+   ```bash
+   BACKUP_DIR=/srv/router-backups bash scripts/restore.sh /srv/router-backups/router-20260101T000000Z.sqlite
+   ```
+
+   The script finds the router container and its `/data` volume from the Compose labels (set `ROUTER_PROJECT=<project>` when several projects define a `router` service) and refuses to run while the router is up; `--force` stops it for you. Before replacing anything, it copies the current database, and its WAL file if present, to `BACKUP_DIR` (default `./backups`) as `pre-restore-<timestamp>.sqlite`, so a restore of the wrong file can be undone the same way. It then deletes the old WAL and SHM files, which belong to the database being replaced and which SQLite would otherwise apply to the restored file, and installs the backup owned by UID 10001 with mode 600. It leaves the router stopped. The helper containers use `debian:bookworm-slim` (override with `HELPER_IMAGE`), which Docker pulls on first use.
+
+   Without a checkout, the equivalent manual step is the following, run from the directory that holds the backup, with `router_backup` set to its file name. It skips the pre-restore copy:
 
    ```bash
    docker run --rm -v "$router_volume":/data -v "$PWD":/in:ro -e router_backup="$router_backup" debian:bookworm-slim \
