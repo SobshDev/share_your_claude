@@ -22,22 +22,41 @@ function notice(message, error = false) {
   box.hidden = !message;
 }
 async function api(path, method = "GET", body) {
-  const response = await fetch(`/admin/api/${path}`, {
-    method,
-    credentials: "same-origin",
-    headers: { "Content-Type": "application/json", "X-CSRF-Token": csrf },
-    ...(body === undefined ? {} : { body: JSON.stringify(body) }),
-  });
+  let response;
+  try {
+    response = await fetch(`/admin/api/${path}`, {
+      method,
+      credentials: "same-origin",
+      headers: { "Content-Type": "application/json", "X-CSRF-Token": csrf },
+      ...(body === undefined ? {} : { body: JSON.stringify(body) }),
+    });
+  } catch {
+    throw new Error(
+      "Could not reach the router. Check your connection and try again.",
+    );
+  }
   if (response.status === 401 && path !== "login") {
     location.assign("/admin/login");
     throw new Error("Your session expired. Sign in again.");
   }
-  const data =
-    response.status === 204 ? null : await response.json().catch(() => null);
-  if (!response.ok)
-    throw new Error(
+  // An empty body (204, 201) is null; a body that is not JSON is undefined.
+  const raw = await response.text().catch(() => "");
+  let data;
+  try {
+    data = raw ? JSON.parse(raw) : null;
+  } catch {
+    data = undefined;
+  }
+  if (!response.ok) {
+    const error = new Error(
       data?.error?.message || `Request failed (${response.status}). Try again.`,
     );
+    error.status = response.status;
+    error.type = data?.error?.type;
+    throw error;
+  }
+  if (data === undefined)
+    throw new Error("Unexpected response from the router. Try again.");
   return data;
 }
 async function run(action, button) {
@@ -349,7 +368,8 @@ async function initialize() {
         await api("login", "POST", { password: $("password").value });
         location.assign("/admin");
       } catch (error) {
-        $("login-error").textContent = error.message;
+        $("login-error").textContent =
+          error.status === 401 ? "That password is incorrect." : error.message;
       } finally {
         $("password").value = "";
         control.disabled = false;
