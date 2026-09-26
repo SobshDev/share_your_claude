@@ -203,7 +203,9 @@ async fn opencodex_adapter_smoke() {
     server.abort();
     assert!(
         output.status.success(),
-        "{}",
+        "opencodex smoke failed ({})\n--- stdout ---\n{}\n--- stderr ---\n{}",
+        output.status,
+        String::from_utf8_lossy(&output.stdout),
         String::from_utf8_lossy(&output.stderr)
     );
     assert_eq!(h.mock.requests.load(Ordering::SeqCst), 2);
