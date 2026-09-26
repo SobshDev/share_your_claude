@@ -18,7 +18,7 @@ Shared Router is a single Rust binary built on Axum, with one SQLite database. I
 | [`analytics.rs`](../src/analytics.rs) | Read-only usage reports for `/admin/api/usage` and `/admin/api/analytics`: filters, grouping, totals, and paginated request history. |
 | [`admin.rs`](../src/admin.rs) | Dashboard pages and static assets, `/readyz`, and the admin JSON API for people, keys, grants, the model catalog, and aliases. |
 | [`error.rs`](../src/error.rs) | `AppError`, the Anthropic-style JSON error envelope, and the database error conversion that logs only a fixed message. |
-| [`tests.rs`](../src/tests.rs) | Integration tests against temporary SQLite databases and mock upstream servers. |
+| [`tests/`](../src/tests/) | Integration tests against temporary SQLite databases and mock upstream servers: a shared harness (`harness.rs`), a mock Anthropic upstream (`mock_upstream.rs`), and one module per area. |
 
 ## Request flow for `/v1/messages`
 
@@ -34,9 +34,10 @@ sequenceDiagram
     participant O as oauth
     participant Up as api.anthropic.com
 
-    C->>P: POST /v1/messages (JSON body, at most 32 MiB)
-    P->>A: api_key(headers)
+    C->>P: POST /v1/messages
+    P->>A: proxy::authenticate: api_key(headers), before the body is read
     A-->>P: key id, or 401
+    P->>P: read and parse the JSON body (at most 32 MiB)
     P->>U: start: insert request_usage row (in_progress)
     P->>Pol: validate(body), resolve(key, model), check anthropic-beta
     Pol-->>P: resolved model id, or 400/403 (row finished as denied)
@@ -72,7 +73,7 @@ sequenceDiagram
 
 The steps in order:
 
-1. **Authentication.** `auth::api_key` accepts exactly one `x-api-key` or `Authorization: Bearer` value (both are allowed only if they match), requires the `sr_` format, looks up the SHA-256 hash among unrevoked keys, and updates `last_used_at`. Axum has already read and parsed the JSON body at this point, within the 32 MiB limit.
+1. **Authentication.** The `proxy::authenticate` middleware runs `auth::api_key` on the headers alone, before any of the body is read, so requests without a valid key never cause the router to buffer or parse up to 32 MiB. `api_key` accepts exactly one `x-api-key` or `Authorization: Bearer` value (both are allowed only if they match), requires the `sr_` format, looks up the SHA-256 hash among unrevoked keys, and updates `last_used_at` at most once a minute per key. Only then does the handler read and parse the JSON body, within the 32 MiB limit.
 2. **Usage row.** `usage::start` records the attempt as `in_progress`. A `RequestGuard` ensures the row reaches a terminal outcome even if the handler is cancelled.
 3. **Policy.** `policy::validate` enforces the request field allowlists (see the README's accepted request surface). `policy::resolve` maps the requested ID or explicit alias to a reviewed, enabled model granted to this unrevoked key and rejects Fable 5.1. Caller `anthropic-beta` values must all be in `proxy::CLIENT_BETAS` or the router's own `oauth::BETA`. Any failure finishes the row as `denied`.
 4. **Rewrite.** `ToolMap::prepare` renames custom tools and matching `tool_use` blocks to stable hashed `custom_` names and prepends the required system block. Server tools keep their names.
