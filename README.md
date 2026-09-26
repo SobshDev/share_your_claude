@@ -50,7 +50,13 @@ Compose exposes port 8080 only to the container network, with no host-port bindi
 
 The router runs as UID 10001 with a read-only root filesystem and a persistent `router_data` volume at `/data`. Run **one router process/replica per database**: refresh coordination and admission control are process-local, and startup recovers unfinished requests. Preserve this volume across redeployments.
 
-For local Compose use, copy `.env.example` to `.env` and fill in the same direct values. Preserve single quotes around the password hash in `.env`; when exporting it in a shell, quote it there as well.
+To try the container locally, copy `.env.example` to `.env`, set `PUBLIC_ORIGIN=http://localhost:8080`, and fill in `ENCRYPTION_KEY` and `ADMIN_PASSWORD_HASH` with the values from `scripts/bootstrap-secrets.sh`. Keep the single quotes around the password hash in `.env`; when exporting it in a shell, quote it there as well. Then start the stack with the local override, which publishes the router on `127.0.0.1:8080` only, and open http://localhost:8080/admin:
+
+```bash
+docker compose -f compose.yaml -f compose.local.yaml up --build
+```
+
+The production `compose.yaml` on its own publishes no host ports.
 
 `GET /healthz` checks the process; `GET /readyz` checks SQLite. Readiness does not require an active Claude login, so initial setup can be completed through the dashboard. The image's health check runs `shared-router healthcheck`, which requests `/readyz` on the configured port and exits nonzero when the router is not ready.
 
