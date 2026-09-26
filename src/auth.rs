@@ -19,6 +19,9 @@ use sqlx::Row;
 use std::sync::Arc;
 use subtle::ConstantTimeEq;
 
+/// `api_key.last_used_at` is refreshed at most once per this many seconds.
+const LAST_USED_RESOLUTION_SECS: i64 = 60;
+
 pub fn random_secret() -> String {
     let mut bytes = [0; 32];
     OsRng.fill_bytes(&mut bytes);
@@ -64,11 +67,23 @@ pub async fn api_key(headers: &HeaderMap, state: &AppState) -> Result<String> {
             .fetch_optional(&state.db)
             .await?;
     let id = id.ok_or_else(AppError::unauthorized)?;
-    sqlx::query("UPDATE api_key SET last_used_at=? WHERE id=?")
-        .bind(db::now())
-        .bind(&id)
-        .execute(&state.db)
-        .await?;
+    // `last_used_at` is informational: write it at most once a minute per key, and never fail
+    // an authenticated request because the write lost the race for SQLite's writer lock.
+    let now = chrono::Utc::now();
+    let cutoff = (now - chrono::Duration::seconds(LAST_USED_RESOLUTION_SECS))
+        .to_rfc3339_opts(chrono::SecondsFormat::Millis, true);
+    if sqlx::query(
+        "UPDATE api_key SET last_used_at=? WHERE id=? AND (last_used_at IS NULL OR last_used_at<?)",
+    )
+    .bind(now.to_rfc3339_opts(chrono::SecondsFormat::Millis, true))
+    .bind(&id)
+    .bind(cutoff)
+    .execute(&state.db)
+    .await
+    .is_err()
+    {
+        tracing::warn!("could not record key last use");
+    }
     Ok(id)
 }
 
