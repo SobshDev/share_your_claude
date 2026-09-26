@@ -34,7 +34,6 @@ pub struct AppState {
     pub db: sqlx::SqlitePool,
     pub client: reqwest::Client,
     pub oauth: Mutex<oauth::OAuthState>,
-    pub login_attempts: Mutex<(i64, u32)>,
     pub admission: Arc<Semaphore>,
     pub count_admission: Arc<Semaphore>,
     /// Per-key admission, keyed by key id. Idle entries are pruned on use.
@@ -53,7 +52,6 @@ impl AppState {
             db,
             client: config::http_client()?,
             oauth: Mutex::new(oauth::OAuthState::default()),
-            login_attempts: Mutex::new((0, 0)),
             admission: Arc::new(Semaphore::new(GLOBAL_CONCURRENCY)),
             count_admission: Arc::new(Semaphore::new(COUNT_TOKENS_CONCURRENCY)),
             key_admission: std::sync::Mutex::new(HashMap::new()),
