@@ -261,3 +261,70 @@ async fn analytics_empty_ranges_validation_and_pagination() {
     .await;
     assert_eq!(injection["total"][0]["requests"], 0);
 }
+
+#[tokio::test]
+async fn empty_filters_mean_no_filter() {
+    let h = Harness::new().await;
+    let second = add_person(&h.state, "Sam").await;
+    let (second_key, _) = add_key(&h.state, &second, "Phone").await;
+    for (index, key) in [h.key_id.as_str(), second_key.as_str()]
+        .into_iter()
+        .enumerate()
+    {
+        sqlx::query("INSERT INTO request_usage(id,key_id,endpoint,requested_model,resolved_model,started_at,finished_at,outcome,usage_state,input_tokens,output_tokens,raw_usage) VALUES(?,?,'/v1/messages',?,?,'2026-09-02T00:00:00.000Z','2026-09-02T00:00:01.000Z','completed','complete',5,5,'{}')")
+            .bind(format!("empty-{index}"))
+            .bind(key)
+            .bind(MODEL)
+            .bind(MODEL)
+            .execute(&h.state.db)
+            .await
+            .unwrap();
+    }
+    let range = "from=2026-09-01T00:00:00Z&to=2026-09-03T00:00:00Z";
+    let unfiltered = json_body(
+        h.admin(&format!("/admin/api/analytics?{range}"), "GET", None)
+            .await,
+    )
+    .await;
+    assert_eq!(unfiltered["total"][0]["requests"], 2);
+    let blank = h
+        .admin(
+            &format!("/admin/api/analytics?{range}&person_id=&key_id=&model=%20&group_by="),
+            "GET",
+            None,
+        )
+        .await;
+    assert_eq!(blank.status(), 200);
+    assert_eq!(json_body(blank).await, unfiltered);
+    let usage = json_body(
+        h.admin(&format!("/admin/api/usage?{range}"), "GET", None)
+            .await,
+    )
+    .await;
+    let blank = json_body(
+        h.admin(
+            &format!("/admin/api/usage?{range}&person_id=&key_id=&model=&group_by="),
+            "GET",
+            None,
+        )
+        .await,
+    )
+    .await;
+    assert_eq!(blank, usage);
+    assert_eq!(blank["group_by"], "person");
+    assert_eq!(blank["data"].as_array().unwrap().len(), 2);
+    // Blank dates fall back to the default range instead of failing to parse.
+    assert_eq!(
+        h.admin("/admin/api/analytics?from=&to=", "GET", None)
+            .await
+            .status(),
+        200
+    );
+    // "total" is internal to the analytics report, not a client grouping.
+    assert_eq!(
+        h.admin("/admin/api/usage?group_by=total", "GET", None)
+            .await
+            .status(),
+        400
+    );
+}
