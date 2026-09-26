@@ -143,8 +143,12 @@ fn login_limiter_windows_global_ceiling_and_size_bound() {
     }
     assert!(!limiter.begin(a, 1059));
     assert!(limiter.begin(b, 1059));
-    // A client's window resets after WINDOW_SECS.
-    assert!(limiter.begin(a, 1000 + LoginLimiter::WINDOW_SECS));
+    // A client's window resets after WINDOW_SECS with a full new allowance.
+    let reset = 1000 + LoginLimiter::WINDOW_SECS;
+    for _ in 0..LoginLimiter::CLIENT_FAILURES {
+        assert!(limiter.begin(a, reset));
+    }
+    assert!(!limiter.begin(a, reset));
 
     // The global ceiling stops distributed guessing, and a success releases its reservation.
     let mut limiter = LoginLimiter::new(0);
@@ -359,6 +363,50 @@ async fn sessions_expire_log_out_and_use_the_configured_cookie() {
         assert!(page.status().is_redirection());
         assert_eq!(page.headers()["location"], "/admin/login");
     }
+}
+
+/// Twelve hours, the lifetime of an admin session.
+const SESSION_SECS: i64 = 12 * 3600;
+
+#[tokio::test]
+async fn sessions_last_twelve_hours_and_end_when_the_clock_reaches_expiry() {
+    let h = Harness::new().await;
+    // The login reads the clock between these two readings, so its expiry lies between
+    // them plus the lifetime. Both readings are whole seconds and nearly always equal.
+    let before = db::epoch();
+    let response = h.login(ADMIN_PASSWORD).await;
+    let after = db::epoch();
+    assert_eq!(response.status(), 200);
+    let set_cookie = response.headers()["set-cookie"].to_str().unwrap();
+    let max_age = format!("Max-Age={SESSION_SECS}");
+    assert!(
+        set_cookie.split("; ").any(|attribute| attribute == max_age),
+        "{set_cookie}"
+    );
+    let cookie = set_cookie.split(';').next().unwrap().to_owned();
+    let token = cookie.split_once('=').unwrap().1;
+    let expires_at = |value: i64| {
+        sqlx::query("UPDATE admin_session SET expires_at=? WHERE token_hash=?")
+            .bind(value)
+            .bind(auth::hash(token))
+            .execute(&h.state.db)
+    };
+    let stored: i64 = sqlx::query_scalar("SELECT expires_at FROM admin_session WHERE token_hash=?")
+        .bind(auth::hash(token))
+        .fetch_one(&h.state.db)
+        .await
+        .unwrap();
+    assert!(
+        (before + SESSION_SECS..=after + SESSION_SECS).contains(&stored),
+        "{before} {stored} {after}"
+    );
+    let headers = [("cookie", cookie.as_str())];
+    let me = || h.get("/admin/api/me", &headers);
+    // Move the expiry instead of waiting: a session is valid until the clock reaches it.
+    expires_at(db::epoch() + 60).await.unwrap();
+    assert_eq!(me().await.status(), 200);
+    expires_at(db::epoch()).await.unwrap();
+    assert_error(me().await, 401, "authentication_error", AUTH_REQUIRED).await;
 }
 
 #[tokio::test]

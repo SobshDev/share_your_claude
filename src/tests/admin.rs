@@ -441,7 +441,13 @@ async fn admin_api_rejects_invalid_aliases_grants_and_unknown_ids() {
     );
     // Rejected edits leave the existing grant in place.
     let keys = json_body(h.admin("/admin/api/keys", "GET", None).await).await;
-    assert_eq!(keys[0]["models"], json!([MODEL]));
+    let key = keys
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|k| k["id"] == h.key_id)
+        .unwrap();
+    assert_eq!(key["models"], json!([MODEL]));
     for (path, method, body, status, message) in [
         (
             "/admin/api/people/unknown".to_owned(),

@@ -51,6 +51,15 @@ async fn people_totals_survive_key_rotation_and_exclude_estimates() {
     assert_eq!(rows[1]["observed_total_tokens"], 67);
 }
 
+/// Usage state and outcome of the most recent request. `rowid` follows insertion order, so
+/// requests that start in the same millisecond cannot swap places.
+async fn last_usage(h: &Harness) -> (String, String) {
+    sqlx::query_as("SELECT usage_state,outcome FROM request_usage ORDER BY rowid DESC LIMIT 1")
+        .fetch_one(&h.state.db)
+        .await
+        .unwrap()
+}
+
 #[tokio::test]
 async fn missing_error_and_interrupted_usage_remain_explicit() {
     let h = Harness::new().await;
@@ -60,6 +69,7 @@ async fn missing_error_and_interrupted_usage_remain_explicit() {
             .status(),
         200
     );
+    assert_eq!(last_usage(&h).await.0, "unknown");
     for scenario in ["truncated", "stream-error"] {
         let response = h
             .request("/v1/messages", &h.key, message(scenario, true))
@@ -67,15 +77,11 @@ async fn missing_error_and_interrupted_usage_remain_explicit() {
         let text = text_body(response).await;
         assert!(text.contains("stream was interrupted"));
         assert!(!text.contains("secret upstream text"));
-    }
-    let rows = sqlx::query("SELECT usage_state,outcome FROM request_usage ORDER BY started_at")
-        .fetch_all(&h.state.db)
-        .await
-        .unwrap();
-    assert_eq!(rows[0].get::<String, _>("usage_state"), "unknown");
-    for row in &rows[1..] {
-        assert_eq!(row.get::<String, _>("usage_state"), "partial");
-        assert_eq!(row.get::<String, _>("outcome"), "upstream_error");
+        assert_eq!(
+            last_usage(&h).await,
+            ("partial".into(), "upstream_error".into()),
+            "{scenario}"
+        );
     }
     let id = usage::start(&h.state.db, &h.key_id, "/v1/messages", MODEL)
         .await
