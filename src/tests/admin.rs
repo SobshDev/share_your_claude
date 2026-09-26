@@ -21,14 +21,17 @@ async fn catalog_review_key_creation_and_csrf() {
         204
     );
     assert_eq!(
-        h.admin(
-            "/admin/api/models/claude-fable-5-1",
-            "PUT",
-            Some(json!({"enabled":true}))
+        error_message(
+            h.admin(
+                "/admin/api/models/claude-fable-5-1",
+                "PUT",
+                Some(json!({"enabled":true}))
+            )
+            .await,
+            403
         )
-        .await
-        .status(),
-        403
+        .await,
+        crate::policy::FABLE_RESERVED
     );
     let created = json_body(
         h.admin(
@@ -66,7 +69,7 @@ async fn catalog_review_key_creation_and_csrf() {
             "{\"name\":\"Attacker\"}",
         )
         .await;
-    assert_eq!(r.status(), 403);
+    assert_eq!(error_message(r, 403).await, WRONG_ORIGIN);
 }
 
 #[tokio::test]
@@ -139,20 +142,27 @@ async fn editing_access_keeps_grants_for_disabled_models() {
     );
     // The enabled model that was unchecked stays removed.
     assert_eq!(
-        h.request("/v1/messages", &h.key, message("hello", false))
-            .await
-            .status(),
-        403
+        error_message(
+            h.request("/v1/messages", &h.key, message("hello", false))
+                .await,
+            403
+        )
+        .await,
+        NO_ACCESS
     );
 }
 
-/// Error message of an admin or proxy error response, after checking its status.
+/// Error message of an admin or proxy error response, after checking its status, its
+/// envelope, and that its error type is the one Anthropic documents for the status.
 async fn error_message(response: Response, status: u16) -> String {
-    assert_eq!(response.status(), status);
-    json_body(response).await["error"]["message"]
-        .as_str()
-        .unwrap()
-        .to_owned()
+    let kind = match status {
+        400 => "invalid_request_error",
+        401 => "authentication_error",
+        403 => "permission_error",
+        404 => "not_found_error",
+        _ => panic!("no error type listed for {status}"),
+    };
+    assert_error(response, status, kind, "").await
 }
 
 #[tokio::test]
@@ -339,10 +349,13 @@ async fn owner_workflow_through_the_admin_api() {
         );
     }
     assert_eq!(
-        h.request("/v1/messages", &secret, message("hello", false))
-            .await
-            .status(),
-        401
+        error_message(
+            h.request("/v1/messages", &secret, message("hello", false))
+                .await,
+            401
+        )
+        .await,
+        AUTH_REQUIRED
     );
     for (path, method, body) in [
         (

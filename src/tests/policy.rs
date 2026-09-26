@@ -131,7 +131,7 @@ async fn catalog_refresh_files_every_fable_spelling_under_the_blocked_group() {
                 Some(json!({"enabled":true})),
             )
             .await;
-        assert_eq!(review.status(), 403, "{id}");
+        assert_error(review, 403, "permission_error", policy::FABLE_RESERVED).await;
         // Even a forced database grant stays unreachable.
         sqlx::query("UPDATE model SET enabled=1,reviewed_at=? WHERE id=?")
             .bind(db::now())
@@ -143,12 +143,7 @@ async fn catalog_refresh_files_every_fable_spelling_under_the_blocked_group() {
         let mut body = message("hello", false);
         body["model"] = id.into();
         let r = h.request("/v1/messages", &h.key, body).await;
-        assert_eq!(r.status(), 403, "{id}");
-        assert_eq!(
-            json_body(r).await["error"]["message"],
-            policy::FABLE_RESERVED,
-            "{id}"
-        );
+        assert_error(r, 403, "permission_error", policy::FABLE_RESERVED).await;
     }
     let near_miss: String =
         sqlx::query_scalar("SELECT model_group FROM model WHERE id='claude-fable-5-10'")
@@ -175,23 +170,36 @@ async fn policy_blocks_before_upstream_and_models_are_filtered() {
     .execute(&h.state.db)
     .await
     .unwrap();
-    for model in [
-        "claude-fable-5-1",
-        "fable-latest",
-        "claude-fable-5-1-20260901",
-        "unknown",
+    for (model, denial) in [
+        ("claude-fable-5-1", policy::FABLE_RESERVED),
+        ("fable-latest", policy::FABLE_RESERVED),
+        ("claude-fable-5-1-20260901", NO_ACCESS),
+        ("unknown", NO_ACCESS),
     ] {
         let mut body = message("hello", false);
         body["model"] = model.into();
-        assert_eq!(h.request("/v1/messages", &h.key, body).await.status(), 403);
+        let response = h.request("/v1/messages", &h.key, body).await;
+        assert_error(response, 403, "permission_error", denial).await;
     }
     let mut body = message("hello", false);
     body["fallback"] = json!({"model":"claude-fable-5-1"});
-    assert_eq!(h.request("/v1/messages", &h.key, body).await.status(), 400);
+    assert_error(
+        h.request("/v1/messages", &h.key, body).await,
+        400,
+        "invalid_request_error",
+        "Unsupported request field",
+    )
+    .await;
     let mut body = message("hello", false);
     body["tools"] =
         json!([{"type":"advisor_20260901","name":"advisor","model":"claude-fable-5-1"}]);
-    assert_eq!(h.request("/v1/messages", &h.key, body).await.status(), 400);
+    assert_error(
+        h.request("/v1/messages", &h.key, body).await,
+        400,
+        "invalid_request_error",
+        "Unsupported tool field",
+    )
+    .await;
     let bearer = format!("Bearer {}", h.key);
     let r = h
         .get("/v1/models", &[("authorization", bearer.as_str())])
@@ -203,7 +211,7 @@ async fn policy_blocks_before_upstream_and_models_are_filtered() {
     let r = h
         .request("/v1/messages/batches", &h.key, message("hello", false))
         .await;
-    assert_eq!(r.status(), 404);
+    assert_error(r, 404, "not_found_error", "Not found").await;
 }
 
 #[test]
@@ -285,14 +293,7 @@ async fn fable_is_denied_on_every_friend_endpoint_before_upstream() {
             let mut body = message("hello", false);
             body["model"] = (*name).into();
             let r = h.request(endpoint, &h.key, body).await;
-            assert_eq!(r.status(), 403, "{endpoint} {name}");
-            let error = json_body(r).await;
-            assert_eq!(error["error"]["type"], "permission_error");
-            assert_eq!(
-                error["error"]["message"],
-                policy::FABLE_RESERVED,
-                "{endpoint} {name}"
-            );
+            assert_error(r, 403, "permission_error", policy::FABLE_RESERVED).await;
         }
     }
     // Every attempt was recorded as denied and none reached the upstream.
@@ -334,11 +335,7 @@ async fn admin_mutations_never_grant_alias_or_configure_fable() {
                 Some(json!({"enabled":true})),
             )
             .await;
-        assert_eq!(review.status(), 403, "{id}");
-        assert_eq!(
-            json_body(review).await["error"]["message"],
-            policy::FABLE_RESERVED
-        );
+        assert_error(review, 403, "permission_error", policy::FABLE_RESERVED).await;
         let grants = h
             .admin(
                 &format!("/admin/api/keys/{}/models", h.key_id),
@@ -346,11 +343,13 @@ async fn admin_mutations_never_grant_alias_or_configure_fable() {
                 Some(json!({"models":[MODEL,id]})),
             )
             .await;
-        assert_eq!(grants.status(), 400, "{id}");
-        assert_eq!(
-            json_body(grants).await["error"]["message"],
-            "Only reviewed, enabled models other than Fable 5.1 can be granted"
-        );
+        assert_error(
+            grants,
+            400,
+            "invalid_request_error",
+            "Only reviewed, enabled models other than Fable 5.1 can be granted",
+        )
+        .await;
         let alias = h
             .admin(
                 &format!("/admin/api/models/{id}/aliases"),
@@ -358,11 +357,13 @@ async fn admin_mutations_never_grant_alias_or_configure_fable() {
                 Some(json!({"alias":"innocent-name"})),
             )
             .await;
-        assert_eq!(alias.status(), 400, "{id}");
-        assert_eq!(
-            json_body(alias).await["error"]["message"],
-            "Choose a reviewed and enabled model"
-        );
+        assert_error(
+            alias,
+            400,
+            "invalid_request_error",
+            "Choose a reviewed and enabled model",
+        )
+        .await;
     }
     for alias in ["claude-fable-5-1", "fable_5_1", "my/fable-5-1-latest"] {
         let r = h
@@ -372,11 +373,7 @@ async fn admin_mutations_never_grant_alias_or_configure_fable() {
                 Some(json!({"alias":alias})),
             )
             .await;
-        assert_eq!(r.status(), 400, "{alias}");
-        assert_eq!(
-            json_body(r).await["error"]["message"],
-            "Invalid or reserved alias"
-        );
+        assert_error(r, 400, "invalid_request_error", "Invalid or reserved alias").await;
     }
     // A new key receives every enabled model except the Fable rows.
     let created = json_body(

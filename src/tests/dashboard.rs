@@ -1,5 +1,6 @@
-//! Smoke tests for the server-rendered admin dashboard pages, their static assets, and the
-//! markup rules the Content-Security-Policy depends on.
+//! Smoke tests for the server-rendered admin dashboard pages, their static assets, the
+//! security headers on every response, and the markup rules the Content-Security-Policy
+//! depends on.
 use super::*;
 
 const TEMPLATES: [(&str, &str); 2] = [
@@ -24,14 +25,48 @@ fn header_value<'a>(response: &'a Response, name: &str) -> &'a str {
 /// Checks the headers every dashboard response relies on.
 fn assert_page_headers(response: &Response, content_type: &str) {
     assert_eq!(header_value(response, "content-type"), content_type);
-    assert_eq!(header_value(response, "x-content-type-options"), "nosniff");
-    let csp = header_value(response, "content-security-policy");
-    for directive in [
-        "default-src 'none'",
-        "script-src 'self'",
-        "style-src 'self'",
+    assert_security_headers(response);
+}
+
+#[tokio::test]
+async fn every_response_carries_the_security_headers() {
+    let h = Harness::new().await;
+    let auth = [("x-api-key", h.key.as_str())];
+    let health = h.get("/healthz", &[]).await;
+    assert_eq!(health.status(), 200);
+    assert_security_headers(&health);
+    let models = h.get("/v1/models", &auth).await;
+    assert_eq!(models.status(), 200);
+    assert_security_headers(&models);
+    let login = h.get("/admin/login", &[]).await;
+    assert_eq!(login.status(), 200);
+    assert_security_headers(&login);
+    let redirect = h.get("/admin", &[]).await;
+    assert!(redirect.status().is_redirection());
+    assert_security_headers(&redirect);
+    // Errors from a handler, from the fallback, and from axum itself.
+    for (response, status, kind, message) in [
+        (
+            h.get("/v1/models", &[("x-api-key", "sr_wrong")]).await,
+            401,
+            "authentication_error",
+            "Authentication required",
+        ),
+        (
+            h.get("/v1/unknown", &auth).await,
+            404,
+            "not_found_error",
+            "Not found",
+        ),
+        (
+            h.get("/v1/messages", &auth).await,
+            405,
+            "invalid_request_error",
+            "Method not allowed",
+        ),
     ] {
-        assert!(csp.contains(directive), "{csp}");
+        assert_security_headers(&response);
+        assert_error(response, status, kind, message).await;
     }
 }
 

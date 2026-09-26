@@ -6,6 +6,18 @@ use crate::{auth, oauth};
 pub(super) const ADMIN_PASSWORD: &str = "a-long-test-password";
 /// Public origin configured for the harness; admin writes must send it.
 pub(super) const ORIGIN: &str = "http://localhost:8080";
+/// Message of every failed key or admin session check.
+pub(super) const AUTH_REQUIRED: &str = "Authentication required";
+/// Message when a key has no grant for the requested model, or the model does not exist.
+pub(super) const NO_ACCESS: &str = "This key does not have access to that model";
+/// Message when an admin write lacks the dashboard's origin.
+pub(super) const WRONG_ORIGIN: &str = "This action must originate from the owner dashboard";
+/// Message when an admin write lacks the session's CSRF token.
+pub(super) const WRONG_CSRF: &str = "Your session changed. Reload the dashboard and try again";
+/// Message when Claude could not be reached, sent an invalid reply, or could not refresh.
+pub(super) const FAILED: &str = "Claude could not complete this request";
+/// Message when the owner's Claude credential needs a new login.
+pub(super) const RECONNECT: &str = "The owner must reconnect Claude in the dashboard";
 
 /// Cookie pair and CSRF token of an admin session created through `/admin/api/login`.
 pub(super) struct AdminSession {
@@ -260,6 +272,63 @@ pub(super) async fn text_body(response: Response) -> String {
             .to_vec(),
     )
     .unwrap()
+}
+
+/// Checks that `response` is Anthropic's error envelope,
+/// `{"type":"error","error":{"type":kind,"message":...}}`, with `status` and a message
+/// containing `message`, and returns the full message. The message tells apart denials that
+/// share a status and type, such as a failed origin check and a failed CSRF check.
+pub(super) async fn assert_error(
+    response: Response,
+    status: u16,
+    kind: &str,
+    message: &str,
+) -> String {
+    let actual_status = response.status();
+    let content_type = response.headers().get(header::CONTENT_TYPE).cloned();
+    let text = text_body(response).await;
+    assert_eq!(
+        actual_status, status,
+        "expected {kind} {message:?}, got {text}"
+    );
+    assert_eq!(
+        content_type.as_ref().and_then(|v| v.to_str().ok()),
+        Some("application/json"),
+        "{text}"
+    );
+    let body: Value = serde_json::from_str(&text).unwrap_or_else(|_| panic!("not JSON: {text}"));
+    assert_eq!(body["type"], "error", "{body}");
+    assert_eq!(body["error"]["type"], kind, "{body}");
+    let actual = body["error"]["message"]
+        .as_str()
+        .unwrap_or_else(|| panic!("no error message: {body}"));
+    assert!(actual.contains(message), "expected {message:?} in {body}");
+    actual.to_owned()
+}
+
+/// Checks the headers the router adds to every response, whatever route produced it.
+pub(super) fn assert_security_headers(response: &Response) {
+    let headers = response.headers();
+    let value = |name: &str| {
+        headers
+            .get(name)
+            .unwrap_or_else(|| panic!("missing {name}"))
+            .to_str()
+            .unwrap()
+    };
+    assert_eq!(value("cache-control"), "no-store");
+    assert_eq!(value("x-content-type-options"), "nosniff");
+    assert_eq!(value("referrer-policy"), "no-referrer");
+    let csp = value("content-security-policy");
+    for directive in [
+        "default-src 'none'",
+        "script-src 'self'",
+        "style-src 'self'",
+        "frame-ancestors 'none'",
+        "base-uri 'none'",
+    ] {
+        assert!(csp.contains(directive), "{csp}");
+    }
 }
 
 impl Harness {

@@ -2,6 +2,13 @@
 use super::*;
 use crate::oauth;
 
+/// Message when a pasted redirect's state does not match this session's pending connection.
+const NOT_PENDING: &str = "This connection expired or belongs to another session. Start again";
+/// Message when a pasted redirect is not the expected callback URL.
+const UNEXPECTED_URL: &str = "Unexpected OAuth redirect URL";
+/// Message when a pasted redirect lacks exactly one code or one state.
+const ONE_CODE: &str = "Redirect must contain one code and one state";
+
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn concurrent_requests_refresh_once_and_persist_rotation() {
     let h = Harness::new().await;
@@ -43,20 +50,21 @@ async fn refresh_failure_requires_reconnect_without_secret_leaks() {
     let response = h
         .request("/v1/messages", &h.key, message("hello", false))
         .await;
-    assert_eq!(response.status(), 503);
-    let text = json_body(response).await.to_string();
-    assert!(!text.contains("must not leak"));
+    let reply = assert_error(response, 503, "authentication_error", RECONNECT).await;
+    assert!(!reply.contains("must not leak"));
     let state: String = sqlx::query_scalar("SELECT state FROM claude_credential")
         .fetch_one(&h.state.db)
         .await
         .unwrap();
     assert_eq!(state, "needs_reauth");
-    assert_eq!(
+    assert_error(
         h.request("/v1/messages", &h.key, message("hello", false))
-            .await
-            .status(),
-        503
-    );
+            .await,
+        503,
+        "authentication_error",
+        RECONNECT,
+    )
+    .await;
     assert_eq!(h.mock.refreshes.load(Ordering::SeqCst), 1);
 }
 
@@ -71,19 +79,23 @@ async fn oauth_state_is_session_bound_and_consumed_once() {
     let unsupported = json!({"redirect_url":format!(
         "http://127.0.0.1:54545/callback?code=abc&state={}", params["state"]
     )});
-    assert_eq!(
+    assert_error(
         h.admin("/admin/api/claude/complete", "POST", Some(unsupported))
-            .await
-            .status(),
-        400
-    );
+            .await,
+        400,
+        "invalid_request_error",
+        UNEXPECTED_URL,
+    )
+    .await;
     let wrong = json!({"redirect_url":format!("{}?code=abc&state=wrong",oauth::REDIRECT_URI)});
-    assert_eq!(
+    assert_error(
         h.admin("/admin/api/claude/complete", "POST", Some(wrong))
-            .await
-            .status(),
-        400
-    );
+            .await,
+        400,
+        "invalid_request_error",
+        NOT_PENDING,
+    )
+    .await;
     assert_eq!(h.mock.refreshes.load(Ordering::SeqCst), 0);
     let good =
         json!({"redirect_url":format!("{}?code=abc&state={}",oauth::REDIRECT_URI,params["state"])});
@@ -107,12 +119,14 @@ async fn oauth_state_is_session_bound_and_consumed_once() {
         );
         assert_eq!(challenge, params["code_challenge"]);
     }
-    assert_eq!(
+    assert_error(
         h.admin("/admin/api/claude/complete", "POST", Some(good))
-            .await
-            .status(),
-        400
-    );
+            .await,
+        400,
+        "invalid_request_error",
+        "Start a new Claude connection first",
+    )
+    .await;
 }
 
 #[test]
@@ -141,12 +155,14 @@ async fn stale_auth_failures_do_not_invalidate_a_new_login() {
         .unwrap();
     assert_eq!(state, "connected");
     // An upstream 401 refreshes the current generation once; messages are not replayed.
-    assert_eq!(
+    assert_error(
         h.request("/v1/messages", &h.key, message("unauthorized", false))
-            .await
-            .status(),
-        503
-    );
+            .await,
+        503,
+        "api_error",
+        "The router renewed its Claude session. Retry the request",
+    )
+    .await;
     assert_eq!(h.mock.refreshes.load(Ordering::SeqCst), 1);
     assert_eq!(
         h.request("/v1/messages", &h.key, message("hello", false))
@@ -305,7 +321,7 @@ async fn transient_refresh_failure_stays_connected_and_backs_off() {
         ask(&router, &h.key)
     );
     for response in [a, b, c] {
-        assert_eq!(response.status(), 502);
+        assert_error(response, 502, "api_error", FAILED).await;
     }
     assert_eq!(mock.calls(), 1, "one token call within the backoff window");
     let (status, generation, tokens) = credential(&h).await;
@@ -352,7 +368,7 @@ async fn refresh_rejects_an_invalid_expires_in() {
     expire_at(&h, 0).await;
     for expires_in in [0, -60, 31_536_001] {
         let (mock, _, router) = with_token_mock(&h, Reply::ExpiresIn(expires_in)).await;
-        assert_eq!(ask(&router, &h.key).await.status(), 502, "{expires_in}");
+        assert_error(ask(&router, &h.key).await, 502, "api_error", FAILED).await;
         assert_eq!(mock.calls(), 1);
         let (status, generation, tokens) = credential(&h).await;
         assert_eq!((status.as_str(), generation), ("connected", 1));
@@ -484,11 +500,13 @@ async fn rejected_authorization_code_keeps_the_credential() {
         Some(redirect),
     )
     .await;
-    assert_eq!(response.status(), 400);
-    assert_eq!(
-        json_body(response).await["error"]["message"],
-        "Claude rejected this authorization code. Start a new connection"
-    );
+    assert_error(
+        response,
+        400,
+        "invalid_request_error",
+        "Claude rejected this authorization code. Start a new connection",
+    )
+    .await;
     assert_eq!(mock.calls(), 1);
     let after: (Vec<u8>, i64) =
         sqlx::query_as("SELECT encrypted_tokens,generation FROM claude_credential")
@@ -550,11 +568,7 @@ async fn unreadable_credential_requires_reconnect_and_reconnecting_restores_it()
         state.token_endpoint = format!("{base}/v1/oauth/token");
     });
     let response = ask(&router, &h.key).await;
-    assert_eq!(response.status(), 503);
-    assert_eq!(
-        json_body(response).await["error"]["type"],
-        "authentication_error"
-    );
+    assert_error(response, 503, "authentication_error", RECONNECT).await;
     let session = sign_in(&router).await;
     let me = json_body(admin_as(&router, &session, "GET", "/admin/api/me", None).await).await;
     assert_eq!(me["claude"]["state"], "needs_reauth");
@@ -610,7 +624,7 @@ async fn oauth_state_is_bound_to_the_session_that_started_it() {
         Some(redirect.clone()),
     )
     .await;
-    assert_eq!(response.status(), 400);
+    assert_error(response, 400, "invalid_request_error", NOT_PENDING).await;
     assert_eq!(h.mock.refreshes.load(Ordering::SeqCst), 0);
     // The rejected attempt did not consume the pending connection.
     assert_eq!(
@@ -628,18 +642,33 @@ async fn malformed_or_expired_oauth_redirects_are_rejected() {
     let redirect = start_connection(&h.router, h.session().await, "abc").await;
     let good = redirect["redirect_url"].as_str().unwrap().to_owned();
     let state = good.split("state=").nth(1).unwrap().to_owned();
-    for url in [
-        format!("{}?code=abc&code=def&state={state}", oauth::REDIRECT_URI),
-        format!("{}?code=abc&state=", oauth::REDIRECT_URI),
-        format!("{}?code=&state={state}", oauth::REDIRECT_URI),
-        format!("{}?state={state}", oauth::REDIRECT_URI),
-        format!(
-            "{}?code=abc&state={state}&state={state}",
-            oauth::REDIRECT_URI
+    for (url, message) in [
+        (
+            format!("{}?code=abc&code=def&state={state}", oauth::REDIRECT_URI),
+            ONE_CODE,
         ),
-        format!("{good}#fragment"),
-        format!("http://user@localhost:54545/callback?code=abc&state={state}"),
-        "not a url".to_owned(),
+        (format!("{}?code=abc&state=", oauth::REDIRECT_URI), ONE_CODE),
+        (
+            format!("{}?code=&state={state}", oauth::REDIRECT_URI),
+            ONE_CODE,
+        ),
+        (format!("{}?state={state}", oauth::REDIRECT_URI), ONE_CODE),
+        (
+            format!(
+                "{}?code=abc&state={state}&state={state}",
+                oauth::REDIRECT_URI
+            ),
+            ONE_CODE,
+        ),
+        (format!("{good}#fragment"), UNEXPECTED_URL),
+        (
+            format!("http://user@localhost:54545/callback?code=abc&state={state}"),
+            UNEXPECTED_URL,
+        ),
+        (
+            "not a url".to_owned(),
+            "Paste the full redirect URL from your browser",
+        ),
     ] {
         let response = h
             .admin(
@@ -648,16 +677,12 @@ async fn malformed_or_expired_oauth_redirects_are_rejected() {
                 Some(json!({"redirect_url":url})),
             )
             .await;
-        assert_eq!(response.status(), 400, "{url}");
+        assert_error(response, 400, "invalid_request_error", message).await;
     }
     h.state.oauth.lock().await.expire_pending();
     let response = h
         .admin("/admin/api/claude/complete", "POST", Some(redirect))
         .await;
-    assert_eq!(response.status(), 400);
-    assert_eq!(
-        json_body(response).await["error"]["message"],
-        "This connection expired or belongs to another session. Start again"
-    );
+    assert_error(response, 400, "invalid_request_error", NOT_PENDING).await;
     assert_eq!(h.mock.refreshes.load(Ordering::SeqCst), 0);
 }
