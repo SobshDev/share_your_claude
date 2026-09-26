@@ -18,6 +18,8 @@ RUN apt-get update && apt-get install -y --no-install-recommends ca-certificates
     && groupadd --gid 10001 router \
     && useradd --uid 10001 --gid 10001 --no-create-home --shell /usr/sbin/nologin router \
     && install -d -o 10001 -g 10001 -m 0700 /data
+# The image distributes the binary, so it carries the license and third-party notices too.
+COPY LICENSE THIRD_PARTY_NOTICES.md THIRD_PARTY_NOTICES_CRATES.md /usr/share/doc/shared-router/
 COPY --from=build /shared-router /usr/local/bin/shared-router
 USER 10001:10001
 WORKDIR /data

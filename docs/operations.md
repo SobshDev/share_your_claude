@@ -17,7 +17,7 @@ echo "$router_volume"
 
 Each command must print exactly one name. If several Compose projects define a service called `router`, add `--filter label=com.docker.compose.project=<project>` to the first command. `docker compose ls` and `docker volume ls | grep router_data` list the candidates.
 
-The runtime image contains only the router binary and `ca-certificates`. It has no `curl` and no SQLite shell, so readiness checks below use the binary's `healthcheck` command, and offline database work uses a short-lived `debian:bookworm-slim` container with the volume mounted. The router runs as UID 10001, and every file it opens must belong to that user.
+The runtime image contains only the router binary, `ca-certificates`, and the license notices in `/usr/share/doc/shared-router/`. It has no `curl` and no SQLite shell, so readiness checks below use the binary's `healthcheck` command, and offline database work uses a short-lived `debian:bookworm-slim` container with the volume mounted. The router runs as UID 10001, and every file it opens must belong to that user.
 
 ## Back up
 
