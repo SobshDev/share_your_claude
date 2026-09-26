@@ -44,7 +44,7 @@ bash scripts/bootstrap-secrets.sh
 
 The bootstrap script asks for a password and prints ready-to-paste environment entries without creating files. `ENCRYPTION_KEY` is a random 32-byte key encoded as base64. `ADMIN_PASSWORD_HASH` is an Argon2id hash of the password you will use to sign in; it is not another random string. The binary's `generate-key` and `hash-password` commands generate these values individually too.
 
-Generate the encryption key once, keep it stable across redeployments, and back it up securely. Replacing it makes saved Claude credentials unreadable. Keep production values out of the repository. Remove the old `_SOURCE`/`_FILE` settings when upgrading this setup; the service now reads the two direct environment values only. If you already generated secret files, reuse their contents rather than regenerating the encryption key.
+Generate the encryption key once, keep it stable across redeployments, and back it up securely. Replacing it makes saved Claude credentials unreadable. Keep production values out of the repository.
 
 Compose exposes port 8080 only to the container network, with no host-port bindings. Configure the domain in Dokploy's UI; it adds the required routing labels and network automatically. See [Dokploy Compose domains](https://docs.dokploy.com/docs/core/docker-compose/domains). Keep streaming responses unbuffered if you add any custom proxy middleware.
 
@@ -53,6 +53,16 @@ The router runs as UID 10001 with a read-only root filesystem and a persistent `
 For local Compose use, copy `.env.example` to `.env` and fill in the same direct values. Preserve single quotes around the password hash in `.env`; when exporting it in a shell, quote it there as well.
 
 `GET /healthz` checks the process; `GET /readyz` checks SQLite. Readiness does not require an active Claude login, so initial setup can be completed through the dashboard.
+
+### Releases and upgrades
+
+Releases are tagged `vX.Y.Z`, and [CHANGELOG.md](CHANGELOG.md) lists what each one changes, including any configuration steps and new migrations. Read it before upgrading, and take a backup first (see the [operations runbook](docs/operations.md)).
+
+Deploying from `main` picks up every change as it lands. To deploy only releases from a GitHub source, keep **Auto Deploy** on in the Compose service and set its **Trigger Type** to **On Tag**; Dokploy then deploys the tagged commit whenever a new tag is pushed. Confirm after the first push that ordinary commits no longer deploy, because some Dokploy versions have ignored this setting. The tag trigger reacts to new tags and does not hold a deployment on one, so to stay on or return to a specific release, point a deployment branch at that tag and select the branch in Dokploy:
+
+```bash
+git push --force origin 'v0.1.0^{commit}:refs/heads/deploy'
+```
 
 ## First connection and friend setup
 
