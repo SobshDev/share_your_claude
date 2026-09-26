@@ -1,0 +1,7 @@
+# Local development override. Publishes the router on loopback only:
+#   docker compose -f compose.yaml -f compose.local.yaml up --build
+# Set PUBLIC_ORIGIN=http://localhost:8080 in .env for this setup.
+services:
+  router:
+    ports:
+      - '127.0.0.1:8080:8080'
