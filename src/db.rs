@@ -122,9 +122,23 @@ pub async fn backup(url: &str, destination: &Path) -> anyhow::Result<()> {
     result
 }
 
+/// Marks every request still `in_progress` as interrupted, keeping its last checkpointed
+/// counts. `finished_at` is recorded as given; `None` means the stop time is unknown.
+async fn interrupt(pool: &SqlitePool, finished_at: Option<String>) -> Result<u64, sqlx::Error> {
+    Ok(sqlx::query("UPDATE request_usage SET outcome='interrupted', finished_at=?, usage_state=CASE WHEN raw_usage IS NULL THEN 'unknown' ELSE 'partial' END WHERE outcome='in_progress'")
+        .bind(finished_at).execute(pool).await?.rows_affected())
+}
+
+/// Finalizes requests that are still open when a graceful shutdown gives up waiting for them,
+/// stamping them with the shutdown time. Returns how many requests were interrupted.
+pub async fn interrupt_in_flight(pool: &SqlitePool) -> Result<u64, sqlx::Error> {
+    interrupt(pool, Some(now())).await
+}
+
+/// Startup repair after an unclean stop. Leftover `in_progress` rows become interrupted with a
+/// NULL `finished_at`, because the time the process actually stopped is unknown.
 pub async fn recover(pool: &SqlitePool) -> Result<(), sqlx::Error> {
-    sqlx::query("UPDATE request_usage SET outcome='interrupted', finished_at=?, usage_state=CASE WHEN raw_usage IS NULL THEN 'unknown' ELSE 'partial' END WHERE outcome='in_progress'")
-        .bind(now()).execute(pool).await?;
+    interrupt(pool, None).await?;
     sqlx::query("DELETE FROM admin_session WHERE expires_at <= ?")
         .bind(epoch())
         .execute(pool)
