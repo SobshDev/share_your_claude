@@ -127,7 +127,7 @@ Router logs never contain prompts, tokens, or SQL values. Read them with `docker
 
 **Every friend request fails with 500 while the dashboard shows connected.** The stored tokens cannot be decrypted, almost always because `ENCRYPTION_KEY` changed. Restore the original key and redeploy, or connect Claude again to re-encrypt with the current key.
 
-**Sign-in returns 429 "Too many sign-in attempts".** The service allows five sign-in attempts per minute in total, from every source combined. Wait one minute and try again. Restarting the router also clears the counter. Repeated lockouts that you did not cause mean someone else is sending sign-in attempts to the dashboard.
+**Sign-in returns 429 "Too many sign-in attempts. Wait one minute".** Each client address may fail five times per minute, and all addresses together 30 times per minute. A successful sign-in clears that address's failures. Wait one minute and try again; restarting the router also clears the counters. If you are locked out without having mistyped your password five times, either someone else is sending sign-in attempts (the 30-per-minute total applies to everyone), or the router cannot tell clients apart: behind Dokploy's Traefik every request arrives from the proxy's address, so set `TRUSTED_PROXY_HOPS=1` in the Environment settings and redeploy.
 
 **Sign-in or dashboard changes return 403 "This action must originate from the owner dashboard".** The browser origin differs from `PUBLIC_ORIGIN`. They must match exactly, including scheme and port.
 

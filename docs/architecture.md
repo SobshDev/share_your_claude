@@ -81,7 +81,7 @@ The steps in order:
 
 ## Process-local coordination
 
-Three pieces of state live in the process: the OAuth mutex that serializes login and refresh, the admission semaphore, and the login throttle (five attempts per minute for the whole service). Pending OAuth logins live there too. Startup recovery also assumes that no other process is writing `in_progress` rows. A second replica on the same database would double the admission limit, race refresh-token rotation, and mark the other replica's live requests as interrupted when it starts. Run exactly one router process per database.
+Three pieces of state live in the process: the OAuth mutex that serializes login and refresh, the admission semaphores, and the login throttle (five failed sign-ins per client address and 30 in total per minute, with the client address taken from `X-Forwarded-For` only when `TRUSTED_PROXY_HOPS` is set). Pending OAuth logins live there too. Startup recovery also assumes that no other process is writing `in_progress` rows. A second replica on the same database would double the admission limit, race refresh-token rotation, and mark the other replica's live requests as interrupted when it starts. Run exactly one router process per database.
 
 ## Admin surface
 

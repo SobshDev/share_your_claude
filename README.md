@@ -31,7 +31,7 @@ Open http://localhost:8080/admin. Keep `PUBLIC_ORIGIN` identical to the browser 
 
 Create a **Docker Compose** service in Dokploy, connect this repository, and select `compose.yaml`. Use Compose mode rather than Docker Stack, since this file builds the included Dockerfile.
 
-1. Set `PUBLIC_ORIGIN=https://router.example.com` in the service's Environment settings, using your actual domain. This exact browser origin is used for secure cookies and CSRF checks.
+1. Set `PUBLIC_ORIGIN=https://router.example.com` in the service's Environment settings, using your actual domain. This exact browser origin is used for secure cookies and CSRF checks. Also set `TRUSTED_PROXY_HOPS=1`, so sign-in throttling counts each client separately instead of treating Traefik as the only client.
 2. Generate production secrets locally using the commands below, or the native binary commands in the local setup section.
 3. Paste the generated `ENCRYPTION_KEY` and `ADMIN_PASSWORD_HASH` lines directly into Dokploy's **Environment** settings. These are secret **values**, not paths. Keep the single quotes in the environment editor so the hash's `$` characters remain literal. No secret files or mounts are required.
 4. In **Domains**, add your domain for service **router**, container port **8080**, path **/**, and enable HTTPS. Dokploy supplies the proxy routing and certificate; the container serves HTTP internally.
@@ -132,7 +132,9 @@ Anything outside these lists is rejected with a 400 `invalid_request_error`. The
 
 `model` is required (1–200 characters) and `messages` must be an array. `/v1/messages` requires a positive integer `max_tokens`; `stream` must be a boolean, and `count_tokens` refuses `stream: true`. Tool names must be 1–128 characters and unique within a request. The contents of messages, system blocks, and tool input schemas are passed through as data. The header may list several comma-separated betas, and every one must be on the list. The router always sends `claude-code-20250219,oauth-2025-04-20` upstream and appends accepted caller betas.
 
-The dashboard API uses session cookies, exact-origin checks, and `X-CSRF-Token` for mutations. `POST /admin/api/login` takes `{"password":"…"}`, requires the configured Origin, and returns the CSRF token; `GET /admin/api/me` returns it for an existing session. Login is limited to five attempts per minute across this single-owner service. Sessions expire after twelve hours. Friend API keys never authorize admin operations.
+The dashboard API uses session cookies, exact-origin checks, and `X-CSRF-Token` for mutations. `POST /admin/api/login` takes `{"password":"…"}`, requires the configured Origin, and returns the CSRF token; `GET /admin/api/me` returns it for an existing session. Sessions expire after twelve hours. Friend API keys never authorize admin operations.
+
+Sign-in allows five failed attempts per client address per minute, and 30 failed attempts per minute across all clients, so a stranger guessing passwords cannot lock the owner out from another address. A successful sign-in does not count and clears that address's failures. Once an address reaches the limit, it gets 429 until its one-minute window ends, even with the right password. IPv6 addresses are grouped by /64. The counters live in memory and reset on restart. By default the client address is the TCP peer; behind a reverse proxy every request comes from the proxy, so set `TRUSTED_PROXY_HOPS` to the number of proxies in front of the router that append to `X-Forwarded-For` (`1` behind Dokploy's Traefik). The router then uses that entry counted from the right. Do not set it when clients connect directly, because they could then choose their own address.
 
 | Method | Path | Input / behavior |
 |---|---|---|
