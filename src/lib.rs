@@ -16,11 +16,18 @@ use axum::{
     middleware,
     routing::{get, post},
 };
-use std::sync::Arc;
+use std::{collections::HashMap, sync::Arc};
 use tokio::sync::{Mutex, Semaphore};
 
 /// Body limit for routes that do not declare their own.
 const DEFAULT_BODY_LIMIT_BYTES: usize = 64 * 1024;
+/// `/v1/messages` requests the router sends upstream at once, across all keys.
+pub const GLOBAL_CONCURRENCY: usize = 8;
+/// `/v1/messages` requests one key may have in flight, so one friend cannot hold every
+/// global permit.
+pub const PER_KEY_CONCURRENCY: usize = 3;
+/// Token counts use their own small pool so they never wait behind long streams.
+pub const COUNT_TOKENS_CONCURRENCY: usize = 4;
 
 pub struct AppState {
     pub config: config::Config,
@@ -29,6 +36,9 @@ pub struct AppState {
     pub oauth: Mutex<oauth::OAuthState>,
     pub login_attempts: Mutex<(i64, u32)>,
     pub admission: Arc<Semaphore>,
+    pub count_admission: Arc<Semaphore>,
+    /// Per-key admission, keyed by key id. Idle entries are pruned on use.
+    pub key_admission: std::sync::Mutex<HashMap<String, Arc<Semaphore>>>,
     // Only tests inside this crate can replace destinations. No environment/config overrides.
     pub(crate) upstream: String,
     pub(crate) token_endpoint: String,
@@ -42,7 +52,9 @@ impl AppState {
             client: config::http_client()?,
             oauth: Mutex::new(oauth::OAuthState::default()),
             login_attempts: Mutex::new((0, 0)),
-            admission: Arc::new(Semaphore::new(8)),
+            admission: Arc::new(Semaphore::new(GLOBAL_CONCURRENCY)),
+            count_admission: Arc::new(Semaphore::new(COUNT_TOKENS_CONCURRENCY)),
+            key_admission: std::sync::Mutex::new(HashMap::new()),
             upstream: "https://api.anthropic.com".into(),
             token_endpoint: "https://api.anthropic.com/v1/oauth/token".into(),
         }))

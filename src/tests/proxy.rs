@@ -426,3 +426,102 @@ async fn malformed_bodies_and_content_types_are_invalid_requests() {
     assert_eq!(charset.status(), 200);
     assert_eq!(h.mock.requests.load(Ordering::SeqCst), 1);
 }
+
+/// Opens a `disconnect` stream on `key`; it holds its admission permits until the body drops.
+async fn hold_stream(h: &Harness, key: &str) -> Body {
+    let response = h
+        .request("/v1/messages", key, message("disconnect", true))
+        .await;
+    assert_eq!(response.status(), 200);
+    response.into_body()
+}
+
+async fn assert_busy(response: Response) {
+    assert_eq!(response.status(), 429);
+    assert_eq!(response.headers()["retry-after"], "1");
+    let body = json_body(response).await;
+    assert_eq!(body["type"], "error");
+    assert_eq!(body["error"]["type"], "rate_limit_error");
+}
+
+fn count_body() -> Value {
+    json!({"model":MODEL,"messages":[{"role":"user","content":"hello"}]})
+}
+
+#[tokio::test]
+async fn one_key_cannot_take_every_admission_permit() {
+    let h = Harness::new().await;
+    let sam = add_person(&h.state, "Sam").await;
+    let (_, other) = add_key(&h.state, &sam, "Desktop").await;
+    let mut held = Vec::new();
+    for _ in 0..PER_KEY_CONCURRENCY {
+        held.push(hold_stream(&h, &h.key).await);
+    }
+    assert_busy(
+        h.request("/v1/messages", &h.key, message("hello", false))
+            .await,
+    )
+    .await;
+    let counted = h
+        .request("/v1/messages/count_tokens", &h.key, count_body())
+        .await;
+    assert_eq!(counted.status(), 200);
+    let response = h
+        .request("/v1/messages", &other, message("hello", false))
+        .await;
+    assert_eq!(response.status(), 200);
+    drop(held);
+    // The stream tasks release their permits once they notice the disconnects.
+    tokio::time::timeout(Duration::from_secs(3), async {
+        while h.state.admission.available_permits() < GLOBAL_CONCURRENCY {
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+    })
+    .await
+    .unwrap();
+    let response = h
+        .request("/v1/messages", &h.key, message("hello", false))
+        .await;
+    assert_eq!(response.status(), 200);
+}
+
+#[tokio::test]
+async fn saturated_admission_is_denied_before_upstream() {
+    let h = Harness::new().await;
+    let messages = h
+        .state
+        .admission
+        .clone()
+        .try_acquire_many_owned(GLOBAL_CONCURRENCY as u32)
+        .unwrap();
+    let counts = h
+        .state
+        .count_admission
+        .clone()
+        .try_acquire_many_owned(COUNT_TOKENS_CONCURRENCY as u32)
+        .unwrap();
+    assert_busy(
+        h.request("/v1/messages", &h.key, message("hello", true))
+            .await,
+    )
+    .await;
+    assert_busy(
+        h.request("/v1/messages/count_tokens", &h.key, count_body())
+            .await,
+    )
+    .await;
+    drop((messages, counts));
+    let rows: Vec<(String, String, i64)> =
+        sqlx::query_as("SELECT endpoint,outcome,http_status FROM request_usage ORDER BY endpoint")
+            .fetch_all(&h.state.db)
+            .await
+            .unwrap();
+    assert_eq!(
+        rows,
+        [
+            ("/v1/messages".into(), "denied".into(), 429),
+            ("/v1/messages/count_tokens".into(), "denied".into(), 429),
+        ]
+    );
+    assert_eq!(h.mock.requests.load(Ordering::SeqCst), 0);
+}
