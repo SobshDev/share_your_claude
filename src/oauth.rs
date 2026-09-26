@@ -6,6 +6,7 @@ use crate::{
 };
 use axum::{Json, extract::State, http::HeaderMap};
 use base64::{Engine, engine::general_purpose::URL_SAFE_NO_PAD};
+use bytes::Bytes;
 use chacha20poly1305::{
     XChaCha20Poly1305, XNonce,
     aead::{Aead, KeyInit, OsRng, rand_core::RngCore},
@@ -14,9 +15,9 @@ use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 use sha2::{Digest, Sha256};
 use sqlx::Row;
-use std::sync::Arc;
+use std::{sync::Arc, time::Duration};
 use subtle::ConstantTimeEq;
-use zeroize::{Zeroize, ZeroizeOnDrop};
+use zeroize::{Zeroize, ZeroizeOnDrop, Zeroizing};
 
 pub const CLIENT_ID: &str = "9d1c250a-e61b-44d9-88ed-5944d1962f5e";
 // The OAuth client registers localhost; the equivalent loopback IP is not accepted.
@@ -28,6 +29,7 @@ pub const SYSTEM: &str = "You are a Claude agent, built on Anthropic's Claude Ag
 pub struct OAuthState {
     pending: Option<Pending>,
 }
+#[derive(Zeroize, ZeroizeOnDrop)]
 struct Pending {
     state: String,
     verifier: String,
@@ -88,10 +90,44 @@ pub async fn begin(State(state): State<Arc<AppState>>, headers: HeaderMap) -> Re
     Ok(Json(json!({"authorize_url":url.as_str(),"expires_in":600})))
 }
 
-#[derive(Deserialize)]
+#[derive(Deserialize, Zeroize, ZeroizeOnDrop)]
 #[serde(deny_unknown_fields)]
 pub struct Completion {
     redirect_url: String,
+}
+
+/// Validates the pasted redirect URL and returns its `code` and `state`.
+fn redirect_params(redirect_url: &str) -> Result<(Zeroizing<String>, Zeroizing<String>)> {
+    let url = url::Url::parse(redirect_url)
+        .map_err(|_| AppError::bad("Paste the full redirect URL from your browser"))?;
+    let result = (|| {
+        let expected = url::Url::parse(REDIRECT_URI).expect("constant URL");
+        if url.origin() != expected.origin()
+            || url.path() != expected.path()
+            || !url.username().is_empty()
+            || url.password().is_some()
+            || url.fragment().is_some()
+        {
+            return Err(AppError::bad("Unexpected OAuth redirect URL"));
+        }
+        let unique = |name: &str| -> Result<Zeroizing<String>> {
+            let mut values: Vec<_> = url
+                .query_pairs()
+                .filter(|(k, _)| k == name)
+                .map(|(_, v)| Zeroizing::new(v.into_owned()))
+                .collect();
+            match values.pop() {
+                Some(value) if values.is_empty() && !value.is_empty() => Ok(value),
+                _ => Err(AppError::bad(
+                    "Redirect must contain one code and one state",
+                )),
+            }
+        };
+        Ok((unique("code")?, unique("state")?))
+    })();
+    // The parsed URL owns a copy of the authorization code.
+    drop(Zeroizing::new(String::from(url)));
+    result
 }
 
 pub async fn complete(
@@ -99,35 +135,14 @@ pub async fn complete(
     headers: HeaderMap,
     Json(input): Json<Completion>,
 ) -> Result<Json<Value>> {
-    let url = url::Url::parse(&input.redirect_url)
-        .map_err(|_| AppError::bad("Paste the full redirect URL from your browser"))?;
-    let expected = url::Url::parse(REDIRECT_URI).expect("constant URL");
-    if url.origin() != expected.origin()
-        || url.path() != expected.path()
-        || !url.username().is_empty()
-        || url.password().is_some()
-        || url.fragment().is_some()
-    {
-        return Err(AppError::bad("Unexpected OAuth redirect URL"));
-    }
-    let query: Vec<_> = url.query_pairs().collect();
-    let unique = |name: &str| -> Result<String> {
-        let values: Vec<_> = query.iter().filter(|(k, _)| k == name).collect();
-        if values.len() != 1 || values[0].1.is_empty() {
-            return Err(AppError::bad(
-                "Redirect must contain one code and one state",
-            ));
-        }
-        Ok(values[0].1.to_string())
-    };
-    let code = unique("code")?;
-    let returned_state = unique("state")?;
+    let (code, returned_state) = redirect_params(&input.redirect_url)?;
+    drop(input);
+    let session_hash = auth::hash(&auth::session_token(&headers, &state)?);
     let mut guard = state.oauth.lock().await;
     let pending = guard
         .pending
         .as_ref()
         .ok_or_else(|| AppError::bad("Start a new Claude connection first"))?;
-    let session_hash = auth::hash(&auth::session_token(&headers, &state)?);
     if pending.expires < db::epoch()
         || pending
             .state
@@ -142,23 +157,64 @@ pub async fn complete(
         ));
     }
     let pending = guard.pending.take().expect("checked pending");
-    let (tokens, expires) = exchange(&state, json!({"grant_type":"authorization_code","client_id":CLIENT_ID,"code":code,"state":pending.state,"redirect_uri":REDIRECT_URI,"code_verifier":pending.verifier}), None).await?;
+    let request = TokenRequest {
+        grant_type: "authorization_code",
+        code: Some(&code),
+        state: Some(&pending.state),
+        redirect_uri: Some(REDIRECT_URI),
+        code_verifier: Some(&pending.verifier),
+        ..TokenRequest::default()
+    };
+    let (tokens, expires) = exchange(&state, &request, None).await?;
     let encrypted = encrypt(&state.config.encryption_key, &tokens)?;
     sqlx::query("INSERT INTO claude_credential VALUES(1,?,?,1,'connected') ON CONFLICT(id) DO UPDATE SET encrypted_tokens=excluded.encrypted_tokens,expires_at=excluded.expires_at,generation=generation+1,state='connected'")
         .bind(encrypted).bind(expires).execute(&state.db).await?;
     Ok(Json(json!({"state":"connected"})))
 }
 
+/// Token endpoint request body. It borrows the secrets and is serialized into a buffer that
+/// is wiped when the request body is dropped.
+#[derive(Serialize)]
+struct TokenRequest<'a> {
+    grant_type: &'static str,
+    client_id: &'static str,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    code: Option<&'a str>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    state: Option<&'a str>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    redirect_uri: Option<&'static str>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    code_verifier: Option<&'a str>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    refresh_token: Option<&'a str>,
+}
+impl Default for TokenRequest<'_> {
+    fn default() -> Self {
+        Self {
+            grant_type: "",
+            client_id: CLIENT_ID,
+            code: None,
+            state: None,
+            redirect_uri: None,
+            code_verifier: None,
+            refresh_token: None,
+        }
+    }
+}
+
 async fn exchange(
     state: &AppState,
-    body: Value,
+    request: &TokenRequest<'_>,
     refresh_fallback: Option<&str>,
 ) -> Result<(Tokens, i64)> {
+    let body = Zeroizing::new(serde_json::to_vec(request).map_err(|_| AppError::internal())?);
     let response = state
         .client
         .post(&state.token_endpoint)
-        .timeout(std::time::Duration::from_secs(30))
-        .json(&body)
+        .timeout(Duration::from_secs(30))
+        .header(reqwest::header::CONTENT_TYPE, "application/json")
+        .body(Bytes::from_owner(body))
         .send()
         .await
         .map_err(|_| AppError::upstream())?;
@@ -170,26 +226,25 @@ async fn exchange(
             AppError::upstream()
         });
     }
-    #[derive(Deserialize)]
+    #[derive(Deserialize, Zeroize, ZeroizeOnDrop)]
     struct Reply {
         access_token: String,
         refresh_token: Option<String>,
         expires_in: i64,
     }
-    let reply: Reply = serde_json::from_slice(&crate::proxy::limited_body(response, 65536).await?)
-        .map_err(|_| AppError::upstream())?;
-    let refresh = reply
-        .refresh_token
-        .filter(|v| !v.is_empty())
-        .or_else(|| refresh_fallback.map(str::to_owned))
-        .ok_or_else(AppError::upstream)?;
+    let body = Zeroizing::new(crate::proxy::limited_body(response, 65536).await?);
+    let mut reply: Reply = serde_json::from_slice(&body).map_err(|_| AppError::upstream())?;
     if reply.access_token.is_empty() || reply.expires_in <= 0 || reply.expires_in > 31_536_000 {
         return Err(AppError::upstream());
     }
+    let refresh_token = match reply.refresh_token.take().filter(|v| !v.is_empty()) {
+        Some(token) => token,
+        None => refresh_fallback.ok_or_else(AppError::upstream)?.to_owned(),
+    };
     Ok((
         Tokens {
-            access_token: reply.access_token,
-            refresh_token: refresh,
+            access_token: std::mem::take(&mut reply.access_token),
+            refresh_token,
         },
         db::epoch() + reply.expires_in,
     ))
@@ -218,7 +273,12 @@ pub async fn access(state: &AppState) -> Result<Access> {
     if row.get::<i64, _>("expires_at") > db::epoch() + 300 {
         return Ok(Access { tokens, generation });
     }
-    let result = exchange(state, json!({"grant_type":"refresh_token","client_id":CLIENT_ID,"refresh_token":tokens.refresh_token}), Some(&tokens.refresh_token)).await;
+    let request = TokenRequest {
+        grant_type: "refresh_token",
+        refresh_token: Some(&tokens.refresh_token),
+        ..TokenRequest::default()
+    };
+    let result = exchange(state, &request, Some(&tokens.refresh_token)).await;
     let (tokens, expires) = match result {
         Ok(value) => value,
         Err(error) => {
@@ -266,14 +326,14 @@ pub fn upstream_headers(access: &Access) -> Result<reqwest::header::HeaderMap> {
         h.insert(k, HeaderValue::from_static(v));
     }
     // Token values must be valid headers; malformed upstream tokens are not sent.
-    let mut value = HeaderValue::from_str(&format!("Bearer {}", access.tokens.access_token))
-        .map_err(|_| AppError::reauth())?;
+    let bearer = Zeroizing::new(format!("Bearer {}", access.tokens.access_token));
+    let mut value = HeaderValue::from_str(&bearer).map_err(|_| AppError::reauth())?;
     value.set_sensitive(true);
     h.insert("authorization", value);
-    let mut session: [u8; 16] = Sha256::digest(format!(
-        "claude-code-session:{}",
-        access.tokens.access_token
-    ))[..16]
+    let mut session: [u8; 16] = Sha256::new()
+        .chain_update("claude-code-session:")
+        .chain_update(&access.tokens.access_token)
+        .finalize()[..16]
         .try_into()
         .expect("digest length");
     session[6] = (session[6] & 0x0f) | 0x40;
