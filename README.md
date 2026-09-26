@@ -208,6 +208,8 @@ cargo clippy --locked --all-targets -- -D warnings
 cargo test --locked
 ```
 
+CI runs fmt and clippy on a pinned toolchain, `dtolnay/rust-toolchain@1.97` in [`.github/workflows/ci.yml`](.github/workflows/ci.yml), which matches the `rust:1.97-bookworm` build image in the `Dockerfile`. Bump both together, so new clippy lints arrive through a deliberate change. A separate `msrv` job runs `cargo check --locked --all-targets` with Rust 1.88, the `rust-version` in `Cargo.toml`.
+
 Tests run against temporary SQLite databases and mock HTTP upstreams. They require loopback socket access and never use your real Claude credentials. They cover model denial, admin isolation, key rotation, token arithmetic, streaming cancellation, recovery, encrypted credentials, PKCE state, refresh concurrency, and sanitized failures.
 
 An optional compatibility test runs the actual installed opencodex adapter against the mock-backed router. It needs Bun and the unpacked opencodex package, without changing your existing opencodex configuration:
