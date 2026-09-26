@@ -218,6 +218,9 @@ async fn startup_upgrades_an_initial_database_and_recovers_it() {
     };
     // 0002
     assert_eq!(index("usage_endpoint_time").await.unwrap(), 1);
+    // 0004
+    assert_eq!(index("usage_model_time").await.unwrap(), 0);
+    assert_eq!(index("usage_endpoint_model_time").await.unwrap(), 1);
 
     let name: String = sqlx::query_scalar("SELECT name FROM person WHERE id='p'")
         .fetch_one(&pool)
@@ -269,5 +272,52 @@ async fn startup_upgrades_an_initial_database_and_recovers_it() {
         .await
         .unwrap();
     assert_eq!(sessions, [b"current".to_vec()]);
+    pool.close().await;
+}
+
+#[tokio::test]
+async fn model_filtered_reports_can_use_the_model_index() {
+    let dir = tempfile::tempdir().unwrap();
+    let (pool, _) = database_with_key(dir.path()).await;
+    let plan: Vec<String> = sqlx::query("EXPLAIN QUERY PLAN SELECT COUNT(*) FROM request_usage u WHERE u.endpoint='/v1/messages' AND COALESCE(u.resolved_model,u.requested_model)=? AND u.started_at>=? AND u.started_at<?")
+        .bind(MODEL)
+        .bind("2026-01-01")
+        .bind("2026-02-01")
+        .fetch_all(&pool)
+        .await
+        .unwrap()
+        .iter()
+        .map(|row| row.get("detail"))
+        .collect();
+    assert!(
+        plan.iter()
+            .any(|step| step.contains("usage_endpoint_model_time")),
+        "{plan:?}"
+    );
+    pool.close().await;
+}
+
+#[tokio::test]
+async fn database_rejects_key_labels_outside_the_length_limit() {
+    let dir = tempfile::tempdir().unwrap();
+    let (pool, key) = database_with_key(dir.path()).await;
+    let insert = |id: &'static str, label: String| {
+        sqlx::query("INSERT INTO api_key(id,person_id,label,prefix,secret_hash,created_at) VALUES(?,'p',?,'sr_test',?,'now')")
+            .bind(id)
+            .bind(label)
+            .bind(id.as_bytes())
+            .execute(&pool)
+    };
+    assert!(insert("empty", String::new()).await.is_err());
+    assert!(insert("long", "x".repeat(101)).await.is_err());
+    insert("limit", "é".repeat(100)).await.unwrap();
+    let rename = |label: String| {
+        sqlx::query("UPDATE api_key SET label=? WHERE id=?")
+            .bind(label)
+            .bind(&key)
+            .execute(&pool)
+    };
+    assert!(rename("x".repeat(101)).await.is_err());
+    rename("Desktop".into()).await.unwrap();
     pool.close().await;
 }
