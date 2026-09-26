@@ -1,4 +1,4 @@
-"use strict";
+import { $, api, button, node, number, run, state } from "./common.js";
 let analyticsReport = null;
 let analyticsParams = null;
 let analyticsVersion = 0;
@@ -17,14 +17,15 @@ function populateFilter(id, entries, placeholder) {
   }
   if ([...select.options].some((option) => option.value === previous)) select.value = previous;
 }
-function updateUsageFilters() {
+export function updateUsageFilters() {
+  const { people, models } = state;
   populateFilter("usage-person", people.map((p) => ({ id: p.id, label: p.name })), "All users");
   // Retain historical/unresolved models discovered in reports, even if absent from the catalog.
   const known = new Map([...$("usage-model").options].filter((o) => o.value).map((o) => [o.value, o.textContent]));
   for (const model of models) known.set(model.id, model.display_name);
   populateFilter("usage-model", [...known].map(([id, label]) => ({ id, label })), "All models");
 }
-async function selectUsagePerson(id) {
+export async function selectUsagePerson(id) {
   $("usage-person").value = id;
   location.hash = "overview";
   await loadUsage();
@@ -42,7 +43,7 @@ function pageHistory(control, offset) {
     (other.disabled ? $("history-title") : other).focus();
   });
 }
-function initializeAnalytics() {
+export function initializeAnalytics() {
   let chartWidth = 0;
   new ResizeObserver(([entry]) => {
     const width = Math.round(entry.contentRect.width);
@@ -63,7 +64,7 @@ function initializeAnalytics() {
     await loadUsage();
   }, control)));
 }
-async function loadUsage(offset = null) {
+export async function loadUsage(offset = null) {
   const version = ++analyticsVersion;
   $("analytics-status").classList.remove("sr-only");
   $("analytics-status").textContent = "Loading usage…";
@@ -111,7 +112,7 @@ async function loadUsage(offset = null) {
 function renderAnalytics() {
   const report = analyticsReport, total = report.total[0];
   const personId = analyticsParams.get("person_id");
-  $("scope-title").textContent = personId ? people.find((p) => p.id === personId)?.name || "Selected user" : "All users";
+  $("scope-title").textContent = personId ? state.people.find((p) => p.id === personId)?.name || "Selected user" : "All users";
   const through = new Date(new Date(report.to).getTime() - 1).toISOString().slice(0, 10);
   $("scope-period").textContent = `${report.from.slice(0, 10)} – ${through} · UTC${analyticsParams.get("model") ? ` · ${analyticsParams.get("model")}` : " · All models"}`;
   const summary = $("usage-summary");
