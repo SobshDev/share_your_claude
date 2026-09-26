@@ -92,6 +92,26 @@ Friend endpoints accept `x-api-key: sr_…` or `Authorization: Bearer sr_…`. C
 
 No batch, arbitrary forward-proxy, Files, Managed Agents, or provider-management routes are exposed to friends. Unreviewed request fields, beta headers, server tool types, and fallback/advisor routing are rejected. Custom client tools, images, thinking, and cache controls are supported. Incoming credentials are replaced with the owner’s upstream token. Inference requests are never automatically replayed, including after 429 or network errors.
 
+At most 8 upstream requests run at once across all keys. The router does not queue: a request beyond that limit is answered immediately with `429 rate_limit_error` ("The router is busy"), and a streaming response holds its slot until the stream ends. See [docs/architecture.md](docs/architecture.md) for the module map and the full request flow.
+
+### Accepted request surface
+
+Anything outside these lists is rejected with a 400 `invalid_request_error`. The allowlists live in [`src/policy.rs`](src/policy.rs) (`validate`) and [`src/proxy.rs`](src/proxy.rs) (`forward`), which are the source of truth.
+
+| Part | Accepted values |
+|---|---|
+| Top-level body fields | `model`, `messages`, `system`, `tools`, `tool_choice`, `max_tokens`, `stream`, `temperature`, `top_p`, `top_k`, `stop_sequences`, `metadata`, `thinking`, `output_config`, `cache_control`, `service_tier` |
+| `thinking` keys | `type`, `budget_tokens`, `display` |
+| `output_config` keys | `effort`, `format` |
+| `tool_choice` keys | `type`, `name`, `disable_parallel_tool_use` |
+| `metadata` keys | `user_id` |
+| `cache_control` keys (top level) | `type`, `ttl` |
+| Tool definition keys | `name`, `type`, `description`, `input_schema`, `cache_control`, `strict`, `defer_loading`, `allowed_callers`, `max_uses`, `allowed_domains`, `blocked_domains`, `user_location`, `citations`, `max_content_tokens`, `display_width_px`, `display_height_px`, `display_number` |
+| Tool `type` values | omitted or `custom`, `web_search_20250305`, `web_fetch_20250910`, `code_execution_20250522`, `code_execution_20250825`, `text_editor_20250124`, `text_editor_20250429`, `text_editor_20250728`, `computer_20250124`, `bash_20250124` |
+| `anthropic-beta` header values | `claude-code-20250219`, `oauth-2025-04-20`, `prompt-caching-2024-07-31`, `interleaved-thinking-2025-05-14`, `fine-grained-tool-streaming-2025-05-14` |
+
+`model` is required (1–200 characters) and `messages` must be an array. `/v1/messages` requires a positive integer `max_tokens`; `stream` must be a boolean, and `count_tokens` refuses `stream: true`. Tool names must be 1–128 characters and unique within a request. The contents of messages, system blocks, and tool input schemas are passed through as data. The header may list several comma-separated betas, and every one must be on the list. The router always sends `claude-code-20250219,oauth-2025-04-20` upstream and appends accepted caller betas.
+
 The dashboard API uses session cookies, exact-origin checks, and `X-CSRF-Token` for mutations. `POST /admin/api/login` takes `{"password":"…"}`, requires the configured Origin, and returns the CSRF token; `GET /admin/api/me` returns it for an existing session. Login is limited to five attempts per minute across this single-owner service. Sessions expire after twelve hours. Friend API keys never authorize admin operations.
 
 | Method | Path | Input / behavior |
