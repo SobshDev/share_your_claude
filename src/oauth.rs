@@ -53,6 +53,12 @@ impl Default for OAuthState {
 }
 #[cfg(test)]
 impl OAuthState {
+    /// Ages the pending PKCE login past its expiry.
+    pub(crate) fn expire_pending(&mut self) {
+        if let Some(pending) = &mut self.pending {
+            pending.expires = db::epoch() - 1;
+        }
+    }
     /// Ends the backoff after a transient refresh failure.
     pub(crate) async fn clear_refresh_backoff(&self) {
         self.refresh.lock().await.last_failure = None;

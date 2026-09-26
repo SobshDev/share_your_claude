@@ -507,3 +507,69 @@ async fn unreadable_credential_requires_reconnect_and_reconnecting_restores_it()
         .unwrap();
     assert!(oauth::decrypt(&state.config.encryption_key, &encrypted).is_ok());
 }
+
+#[tokio::test]
+async fn oauth_state_is_bound_to_the_session_that_started_it() {
+    let h = Harness::new().await;
+    let owner = h.session().await;
+    let other = sign_in(&h.router).await;
+    let redirect = start_connection(&h.router, owner, "abc").await;
+    let response = admin_as(
+        &h.router,
+        &other,
+        "POST",
+        "/admin/api/claude/complete",
+        Some(redirect.clone()),
+    )
+    .await;
+    assert_eq!(response.status(), 400);
+    assert_eq!(h.mock.refreshes.load(Ordering::SeqCst), 0);
+    // The rejected attempt did not consume the pending connection.
+    assert_eq!(
+        h.admin("/admin/api/claude/complete", "POST", Some(redirect))
+            .await
+            .status(),
+        200
+    );
+    assert_eq!(h.mock.refreshes.load(Ordering::SeqCst), 1);
+}
+
+#[tokio::test]
+async fn malformed_or_expired_oauth_redirects_are_rejected() {
+    let h = Harness::new().await;
+    let redirect = start_connection(&h.router, h.session().await, "abc").await;
+    let good = redirect["redirect_url"].as_str().unwrap().to_owned();
+    let state = good.split("state=").nth(1).unwrap().to_owned();
+    for url in [
+        format!("{}?code=abc&code=def&state={state}", oauth::REDIRECT_URI),
+        format!("{}?code=abc&state=", oauth::REDIRECT_URI),
+        format!("{}?code=&state={state}", oauth::REDIRECT_URI),
+        format!("{}?state={state}", oauth::REDIRECT_URI),
+        format!(
+            "{}?code=abc&state={state}&state={state}",
+            oauth::REDIRECT_URI
+        ),
+        format!("{good}#fragment"),
+        format!("http://user@localhost:54545/callback?code=abc&state={state}"),
+        "not a url".to_owned(),
+    ] {
+        let response = h
+            .admin(
+                "/admin/api/claude/complete",
+                "POST",
+                Some(json!({"redirect_url":url})),
+            )
+            .await;
+        assert_eq!(response.status(), 400, "{url}");
+    }
+    h.state.oauth.lock().await.expire_pending();
+    let response = h
+        .admin("/admin/api/claude/complete", "POST", Some(redirect))
+        .await;
+    assert_eq!(response.status(), 400);
+    assert_eq!(
+        json_body(response).await["error"]["message"],
+        "This connection expired or belongs to another session. Start again"
+    );
+    assert_eq!(h.mock.refreshes.load(Ordering::SeqCst), 0);
+}

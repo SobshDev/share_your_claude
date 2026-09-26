@@ -186,6 +186,164 @@ fn login_limiter_identifies_clients() {
     assert_eq!(LoginLimiter::new(1).client(&v6, None), ip("198.51.100.9"));
 }
 
+/// Creates a person as the harness session, sending only the given origin and CSRF token.
+async fn create_person(h: &Harness, origin: Option<&str>, csrf: Option<&str>) -> Response {
+    let session = h.session().await;
+    let mut headers = vec![
+        ("content-type", "application/json"),
+        ("cookie", session.cookie.as_str()),
+    ];
+    headers.extend(origin.map(|o| ("origin", o)));
+    headers.extend(csrf.map(|t| ("x-csrf-token", t)));
+    h.send(
+        "POST",
+        "/admin/api/people",
+        &headers,
+        json!({"name":"Sam"}).to_string(),
+    )
+    .await
+}
+
+#[tokio::test]
+async fn admin_writes_need_both_origin_and_csrf_token() {
+    let h = Harness::new().await;
+    let session = h.session().await;
+    let csrf = session.csrf.as_str();
+    for (origin, token) in [
+        (Some(ORIGIN), None),
+        (Some(ORIGIN), Some("wrong-token")),
+        (Some("https://evil.example"), Some(csrf)),
+        (None, Some(csrf)),
+    ] {
+        let response = create_person(&h, origin, token).await;
+        assert_eq!(response.status(), 403, "origin {origin:?} token {token:?}");
+        assert_eq!(
+            json_body(response).await["error"]["type"],
+            "permission_error"
+        );
+    }
+    let people: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM person")
+        .fetch_one(&h.state.db)
+        .await
+        .unwrap();
+    assert_eq!(people, 1);
+    assert_eq!(
+        create_person(&h, Some(ORIGIN), Some(csrf)).await.status(),
+        201
+    );
+    // Reads need neither.
+    assert_eq!(
+        h.get("/admin/api/me", &[("cookie", session.cookie.as_str())])
+            .await
+            .status(),
+        200
+    );
+}
+
+#[tokio::test]
+async fn login_requires_the_dashboard_origin() {
+    let h = Harness::new().await;
+    for origin in [Some("https://evil.example"), None] {
+        let mut headers = vec![("content-type", "application/json")];
+        headers.extend(origin.map(|o| ("origin", o)));
+        let response = h
+            .send(
+                "POST",
+                "/admin/api/login",
+                &headers,
+                json!({"password":ADMIN_PASSWORD}).to_string(),
+            )
+            .await;
+        assert_eq!(response.status(), 403);
+        assert!(response.headers().get("set-cookie").is_none());
+    }
+}
+
+#[tokio::test]
+async fn sessions_expire_log_out_and_use_the_configured_cookie() {
+    let h = Harness::new().await;
+    for secure in [false, true] {
+        let (_, router) = h.variant(|state| state.config.secure_cookie = secure);
+        let (name, other) = if secure {
+            ("__Host-router_session", "router_session")
+        } else {
+            ("router_session", "__Host-router_session")
+        };
+        let response = send_to(
+            &router,
+            "POST",
+            "/admin/api/login",
+            &[("origin", ORIGIN), ("content-type", "application/json")],
+            json!({"password":ADMIN_PASSWORD}).to_string(),
+        )
+        .await;
+        assert_eq!(response.status(), 200);
+        let set_cookie = response.headers()["set-cookie"]
+            .to_str()
+            .unwrap()
+            .to_owned();
+        assert!(set_cookie.starts_with(&format!("{name}=")), "{set_cookie}");
+        assert!(set_cookie.contains("; Path=/;"));
+        assert_eq!(set_cookie.ends_with("; Secure"), secure, "{set_cookie}");
+        let cookie = set_cookie.split(';').next().unwrap().to_owned();
+        let token = cookie.split_once('=').unwrap().1.to_owned();
+        let me = |cookie: String| {
+            let router = router.clone();
+            async move {
+                send_to(
+                    &router,
+                    "GET",
+                    "/admin/api/me",
+                    &[("cookie", &cookie)],
+                    Body::empty(),
+                )
+                .await
+                .status()
+            }
+        };
+        assert_eq!(me(cookie.clone()).await, 200);
+        assert_eq!(me(format!("{other}={token}")).await, 401);
+        assert_eq!(me(format!("{cookie}; {cookie}")).await, 401);
+        let two_headers = send_to(
+            &router,
+            "GET",
+            "/admin/api/me",
+            &[("cookie", &cookie), ("cookie", &cookie)],
+            Body::empty(),
+        )
+        .await;
+        assert_eq!(two_headers.status(), 401);
+
+        // Logout deletes the session and clears the cookie.
+        let session = sign_in(&router).await;
+        let response = admin_as(&router, &session, "POST", "/admin/api/logout", None).await;
+        assert_eq!(response.status(), 204);
+        let cleared = response.headers()["set-cookie"].to_str().unwrap();
+        assert!(cleared.starts_with(&format!("{name}=;")));
+        assert!(cleared.contains("Max-Age=0"));
+        assert_eq!(me(session.cookie.clone()).await, 401);
+
+        // An expired session is rejected, and the dashboard sends the owner to sign in.
+        sqlx::query("UPDATE admin_session SET expires_at=? WHERE token_hash=?")
+            .bind(db::epoch() - 1)
+            .bind(auth::hash(&token))
+            .execute(&h.state.db)
+            .await
+            .unwrap();
+        assert_eq!(me(cookie.clone()).await, 401);
+        let page = send_to(
+            &router,
+            "GET",
+            "/admin",
+            &[("cookie", &cookie)],
+            Body::empty(),
+        )
+        .await;
+        assert!(page.status().is_redirection());
+        assert_eq!(page.headers()["location"], "/admin/login");
+    }
+}
+
 #[tokio::test]
 async fn changing_the_owner_password_revokes_sessions() {
     use argon2::PasswordHasher;
