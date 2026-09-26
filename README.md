@@ -38,6 +38,22 @@ Open http://localhost:8080/admin. Keep `PUBLIC_ORIGIN` identical to the browser 
 
 Any other command, or extra arguments to one of the commands above, prints the usage to standard error and exits with status 2.
 
+### Configuration
+
+The router reads these environment variables at startup; `serve` refuses to start with a message naming the variable when a value is missing or invalid. The container column shows the value set by the `Dockerfile` or `compose.yaml` when the variable is not set in the environment.
+
+| Variable | Required | Default | Container | Notes |
+|---|---|---|---|---|
+| `PUBLIC_ORIGIN` | Yes | none | none | The exact browser origin, such as `https://router.example.com`: scheme, host, and port, with no path, query, or credentials. HTTPS is required except on `localhost`, `127.0.0.1`, and `[::1]`. Used for the Origin and CSRF checks; HTTPS also marks the session cookie `Secure`. |
+| `ENCRYPTION_KEY` | Yes | none | none | 32 random bytes, base64-encoded (`shared-router generate-key`). Encrypts the stored Claude tokens; changing it makes them unreadable and requires reconnecting Claude. |
+| `ADMIN_PASSWORD_HASH` | Yes | none | none | Argon2id hash in PHC format (`shared-router hash-password`, password 12 to 1024 bytes). Quote it in `.env` and Dokploy so its `$` characters stay literal. Changing it signs out every dashboard session. |
+| `BIND_ADDRESS` | No | `127.0.0.1:8080` | `0.0.0.0:8080` | IP address and port to listen on; host names are not accepted. `healthcheck` probes the same port. |
+| `DATABASE_URL` | No | `sqlite://data/router.sqlite` | `sqlite:///data/router.sqlite` | SQLite URL. `sqlite://` followed by a relative path is resolved against the working directory; three slashes make it absolute. Missing parent directories are created with mode 700. `backup` reads the same variable. |
+| `RUST_LOG` | No | `shared_router=info` | `shared_router=info` | [`tracing` filter](https://docs.rs/tracing-subscriber/latest/tracing_subscriber/filter/struct.EnvFilter.html) for log output. An invalid value falls back to the default. |
+| `TRUSTED_PROXY_HOPS` | No | `0` | `0` | Number of reverse proxies in front of the router that append to `X-Forwarded-For`. Sign-in throttling uses that entry, counted from the right, as the client address; `0` uses the TCP peer. Set `1` behind Dokploy's Traefik. An invalid value logs a warning and uses `0`. |
+
+`compose.yaml` forwards `PUBLIC_ORIGIN`, `ENCRYPTION_KEY`, `ADMIN_PASSWORD_HASH`, `RUST_LOG`, and `TRUSTED_PROXY_HOPS` from the Compose environment (Dokploy's Environment settings or `.env`); `BIND_ADDRESS` and `DATABASE_URL` come from the image. A variable reaches the container only if `compose.yaml` lists it under `environment`.
+
 ## Deploy on Dokploy
 
 Create a **Docker Compose** service in Dokploy, connect this repository, and select `compose.yaml`. Use Compose mode rather than Docker Stack, since this file builds the included Dockerfile.
