@@ -24,6 +24,8 @@ jobs:
       - run: cargo fmt --check
       - run: cargo clippy --locked --all-targets -- -D warnings
       - run: cargo test --locked
+      - name: Check dashboard JavaScript syntax
+        run: for f in static/*.js; do node --check "$f"; done
   msrv:
     runs-on: ubuntu-latest
     timeout-minutes: 20
