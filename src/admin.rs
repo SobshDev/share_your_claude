@@ -200,7 +200,8 @@ async fn create_key(
 ) -> Result<(StatusCode, Json<Value>)> {
     let label = valid_label(&input.label)?;
     let id = db::id();
-    let secret = format!("sr_{}", auth::random_secret());
+    // Wiped on drop; the one-time response below is the only copy that leaves this handler.
+    let secret = zeroize::Zeroizing::new(format!("sr_{}", auth::random_secret()));
     let prefix = &secret[..11];
     let mut tx = state.db.begin().await?;
     if sqlx::query_scalar::<_, i64>("SELECT count(*) FROM person WHERE id=?")
@@ -240,7 +241,7 @@ async fn create_key(
     tx.commit().await?;
     Ok((
         StatusCode::CREATED,
-        Json(json!({"id":id,"secret":secret,"prefix":prefix})),
+        Json(json!({"id":id,"secret":secret.as_str(),"prefix":prefix})),
     ))
 }
 async fn revoke_key(
