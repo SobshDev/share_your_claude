@@ -38,6 +38,13 @@ const CLIENT_SEND_TIMEOUT: Duration = Duration::from_secs(120);
 const STREAM_ERROR_SEND_TIMEOUT: Duration = Duration::from_secs(5);
 /// Sanitized event that replaces whatever went wrong in a stream.
 const STREAM_INTERRUPTED: &[u8] = b"event: error\ndata: {\"type\":\"error\",\"error\":{\"type\":\"api_error\",\"message\":\"The stream was interrupted. Usage may be incomplete.\"}}\n\n";
+/// Client-requested betas reviewed for pass-through. The router's own compatibility betas,
+/// [`oauth::BETA`], are always sent and may also be requested.
+pub const CLIENT_BETAS: &[&str] = &[
+    "prompt-caching-2024-07-31",
+    "interleaved-thinking-2025-05-14",
+    "fine-grained-tool-streaming-2025-05-14",
+];
 
 type Chunk = std::result::Result<Bytes, io::Error>;
 
@@ -203,26 +210,30 @@ async fn admit(
     })
 }
 
-/// Caller-supplied betas may enable routing features outside the reviewed schema.
-/// Clients can omit these headers; only the router's known compatibility betas go upstream.
+/// Caller-supplied betas may enable routing features outside the reviewed schema, so every
+/// token across all `anthropic-beta` lines must be reviewed. Returns the outbound value: the
+/// router's own betas followed by the client's, each once. `None` keeps the default.
 fn reviewed_betas(headers: &HeaderMap) -> Result<Option<HeaderValue>> {
-    let Some(betas) = headers.get("anthropic-beta") else {
-        return Ok(None);
-    };
-    let allowed = [
-        "claude-code-20250219",
-        "oauth-2025-04-20",
-        "prompt-caching-2024-07-31",
-        "interleaved-thinking-2025-05-14",
-        "fine-grained-tool-streaming-2025-05-14",
-    ];
-    let value = betas
-        .to_str()
-        .map_err(|_| AppError::bad("Invalid beta header"))?;
-    if value.split(',').any(|b| !allowed.contains(&b.trim())) {
-        return Err(AppError::bad("This beta feature has not been reviewed"));
+    let mut requested = Vec::new();
+    for line in headers.get_all("anthropic-beta") {
+        let line = line
+            .to_str()
+            .map_err(|_| AppError::bad("Invalid beta header"))?;
+        requested.extend(line.split(',').map(str::trim).filter(|b| !b.is_empty()));
     }
-    HeaderValue::from_str(&format!("{},{value}", oauth::BETA))
+    if requested.is_empty() {
+        return Ok(None);
+    }
+    let mut betas: Vec<&str> = oauth::BETA.split(',').collect();
+    for beta in requested {
+        if !betas.contains(&beta) {
+            if !CLIENT_BETAS.contains(&beta) {
+                return Err(AppError::bad("This beta feature has not been reviewed"));
+            }
+            betas.push(beta);
+        }
+    }
+    HeaderValue::from_str(&betas.join(","))
         .map(Some)
         .map_err(|_| AppError::bad("Invalid beta header"))
 }

@@ -208,3 +208,79 @@ async fn opencodex_adapter_smoke() {
     );
     assert_eq!(h.mock.requests.load(Ordering::SeqCst), 2);
 }
+
+/// Sends `message("hello", false)` to `/v1/messages` with extra request headers.
+async fn with_headers(h: &Harness, extra: &[(&str, &str)]) -> Response {
+    let mut headers = vec![
+        ("content-type", "application/json"),
+        ("x-api-key", h.key.as_str()),
+    ];
+    headers.extend_from_slice(extra);
+    h.send(
+        "POST",
+        "/v1/messages",
+        &headers,
+        message("hello", false).to_string(),
+    )
+    .await
+}
+
+#[tokio::test]
+async fn reviewed_betas_are_normalized_and_sent_once() {
+    let h = Harness::new().await;
+    for extra in [
+        &[("anthropic-beta", "prompt-caching-2024-07-31,")][..],
+        &[
+            (
+                "anthropic-beta",
+                " oauth-2025-04-20 , prompt-caching-2024-07-31",
+            ),
+            ("anthropic-beta", "prompt-caching-2024-07-31,,"),
+        ][..],
+    ] {
+        assert_eq!(with_headers(&h, extra).await.status(), 200);
+    }
+    // An empty header adds nothing, so the router's own betas go upstream unchanged.
+    assert_eq!(
+        with_headers(&h, &[("anthropic-beta", "")]).await.status(),
+        200
+    );
+    let captures = h.mock.captures.lock().await;
+    let sent: Vec<Vec<_>> = captures
+        .iter()
+        .map(|(headers, _)| headers.get_all("anthropic-beta").iter().cloned().collect())
+        .collect();
+    let merged = format!("{},prompt-caching-2024-07-31", oauth::BETA);
+    assert_eq!(
+        sent,
+        [
+            vec![merged.as_str()],
+            vec![merged.as_str()],
+            vec![oauth::BETA]
+        ]
+    );
+}
+
+#[tokio::test]
+async fn unreviewed_betas_are_rejected_before_upstream() {
+    let h = Harness::new().await;
+    for extra in [
+        &[("anthropic-beta", "context-management-2025-06-27")][..],
+        &[
+            ("anthropic-beta", "prompt-caching-2024-07-31"),
+            ("anthropic-beta", "files-api-2025-04-14"),
+        ][..],
+    ] {
+        let response = with_headers(&h, extra).await;
+        assert_eq!(response.status(), 400);
+        let body = json_body(response).await;
+        assert_eq!(body["error"]["type"], "invalid_request_error");
+    }
+    let outcomes: Vec<(String, i64)> =
+        sqlx::query_as("SELECT outcome,http_status FROM request_usage")
+            .fetch_all(&h.state.db)
+            .await
+            .unwrap();
+    assert_eq!(outcomes, [("denied".into(), 400), ("denied".into(), 400)]);
+    assert_eq!(h.mock.requests.load(Ordering::SeqCst), 0);
+}
