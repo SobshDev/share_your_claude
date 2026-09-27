@@ -62,8 +62,9 @@ This release needs operator action: it adds three migrations, a new setting for 
 - `anthropic-beta` values are combined across header lines and deduplicated; the caller allowlist is `proxy::CLIENT_BETAS` (#49).
 - Migration `0004_usage_model_index_and_label_check.sql` replaces the model usage index with one on the effective model and limits key labels to 1–100 characters (#55).
 - `compose.yaml` rotates logs at 10 MB × 5 files and limits the container to 512 MB of memory and 256 processes (#38).
+- Dependencies moved to askama 0.16, reqwest 0.13, sqlx 0.9, argon2 0.6, and chacha20poly1305 0.11. Outbound TLS still uses rustls with ring and the Mozilla root set. Stored Claude credentials and existing owner password hashes keep working; a fixture test pins both. The minimum supported Rust version is now 1.94, which sqlx 0.9 requires (#67).
 - The Docker build caches dependencies between builds, and the runtime image adds OCI labels (#68).
-- CI runs with read-only token permissions and pinned actions, pins the lint toolchain to Rust 1.97 alongside the Dockerfile, checks the 1.88 MSRV, builds and smoke-tests the Docker image, audits dependencies with `cargo-deny`, and checks dashboard JavaScript syntax. Dependabot tracks Cargo, GitHub Actions, and Docker base images. A manual workflow runs the opencodex smoke test against a pinned version (#31, #32, #33, #34, #35, #63).
+- CI runs with read-only token permissions and pinned actions, pins the lint toolchain to Rust 1.97 alongside the Dockerfile, checks the MSRV, builds and smoke-tests the Docker image, audits dependencies with `cargo-deny`, and checks dashboard JavaScript syntax. Dependabot tracks Cargo, GitHub Actions, and Docker base images. A manual workflow runs the opencodex smoke test against a pinned version (#31, #32, #33, #34, #35, #63).
 
 ### Fixed
 

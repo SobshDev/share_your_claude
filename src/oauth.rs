@@ -9,7 +9,7 @@ use base64::{Engine, engine::general_purpose::URL_SAFE_NO_PAD};
 use bytes::Bytes;
 use chacha20poly1305::{
     XChaCha20Poly1305, XNonce,
-    aead::{Aead, KeyInit, OsRng, rand_core::RngCore},
+    aead::{Aead, KeyInit},
 };
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
@@ -99,11 +99,11 @@ pub(crate) struct Tokens {
 pub(crate) fn encrypt(key: &[u8; 32], tokens: &Tokens) -> Result<Vec<u8>> {
     let cipher = XChaCha20Poly1305::new(key.into());
     let mut nonce = [0; 24];
-    OsRng.fill_bytes(&mut nonce);
+    getrandom::fill(&mut nonce).map_err(|_| AppError::internal())?;
     let plaintext =
         zeroize::Zeroizing::new(serde_json::to_vec(tokens).map_err(|_| AppError::internal())?);
     let ciphertext = cipher
-        .encrypt(XNonce::from_slice(&nonce), plaintext.as_slice())
+        .encrypt(&XNonce::from(nonce), plaintext.as_slice())
         .map_err(|_| AppError::internal())?;
     Ok([nonce.to_vec(), ciphertext].concat())
 }
@@ -112,9 +112,10 @@ pub(crate) fn decrypt(key: &[u8; 32], encrypted: &[u8]) -> Result<Tokens> {
         return Err(AppError::internal());
     }
     let cipher = XChaCha20Poly1305::new(key.into());
+    let nonce = XNonce::try_from(&encrypted[..24]).map_err(|_| AppError::internal())?;
     let plaintext = zeroize::Zeroizing::new(
         cipher
-            .decrypt(XNonce::from_slice(&encrypted[..24]), &encrypted[24..])
+            .decrypt(&nonce, &encrypted[24..])
             .map_err(|_| AppError::internal())?,
     );
     serde_json::from_slice(&plaintext).map_err(|_| AppError::internal())

@@ -11,7 +11,6 @@ use axum::{
     response::{IntoResponse, Response},
 };
 use base64::{Engine, engine::general_purpose::URL_SAFE_NO_PAD};
-use chacha20poly1305::aead::{OsRng, rand_core::RngCore};
 use serde::Deserialize;
 use serde_json::json;
 use sha2::{Digest, Sha256};
@@ -30,7 +29,7 @@ const SESSION_TTL_SECS: i64 = 43200;
 
 pub(crate) fn random_secret() -> String {
     let mut bytes = [0; 32];
-    OsRng.fill_bytes(&mut bytes);
+    getrandom::fill(&mut bytes).expect("operating system random number generator failed");
     URL_SAFE_NO_PAD.encode(bytes)
 }
 pub(crate) fn hash(secret: &str) -> Vec<u8> {

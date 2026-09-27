@@ -1,7 +1,6 @@
 use anyhow::Context;
-use argon2::{Argon2, PasswordHasher, password_hash::SaltString};
+use argon2::{Argon2, PasswordHasher};
 use base64::{Engine, engine::general_purpose::STANDARD};
-use chacha20poly1305::aead::{OsRng, rand_core::RngCore};
 use shared_router::{
     AppState, Phase,
     config::{self, Config},
@@ -77,7 +76,7 @@ async fn main() -> anyhow::Result<()> {
 
 fn generate_key() {
     let mut key = zeroize::Zeroizing::new([0u8; 32]);
-    OsRng.fill_bytes(key.as_mut());
+    getrandom::fill(key.as_mut()).expect("operating system random number generator failed");
     println!("{}", STANDARD.encode(*key));
 }
 
@@ -97,7 +96,7 @@ fn hash_password() -> anyhow::Result<()> {
         "Use a password of 12–1024 bytes"
     );
     let hash = Argon2::default()
-        .hash_password(password.as_bytes(), &SaltString::generate(&mut OsRng))
+        .hash_password(password.as_bytes())
         .map_err(|_| anyhow::anyhow!("Could not hash password"))?
         .to_string();
     println!("{hash}");

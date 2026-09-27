@@ -429,10 +429,7 @@ async fn changing_the_owner_password_revokes_sessions() {
     let h = Harness::new().await;
     let session = sign_in(&h.router).await;
     let rotated = argon2::Argon2::default()
-        .hash_password(
-            b"a-different-test-password",
-            &argon2::password_hash::SaltString::encode_b64(b"other-salt-16-by").unwrap(),
-        )
+        .hash_password_with_salt(b"a-different-test-password", b"other-salt-16-by")
         .unwrap()
         .to_string();
     let (_, router) = h.variant(|state| state.config.password_hash = rotated);

@@ -135,15 +135,12 @@ pub fn client_builder() -> anyhow::Result<reqwest::ClientBuilder> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use argon2::{Algorithm, Argon2, Params, PasswordHasher, Version, password_hash::SaltString};
+    use argon2::{Algorithm, Argon2, Params, PasswordHasher, Version};
     use std::collections::HashMap;
 
     fn hash(algorithm: Algorithm) -> String {
         Argon2::new(algorithm, Version::V0x13, Params::default())
-            .hash_password(
-                b"test-owner-password",
-                &SaltString::encode_b64(b"test-salt-16-byte").unwrap(),
-            )
+            .hash_password_with_salt(b"test-owner-password", b"test-salt-16-byte")
             .unwrap()
             .to_string()
     }

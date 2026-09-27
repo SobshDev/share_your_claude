@@ -203,10 +203,7 @@ pub(super) fn password_hash() -> String {
     static HASH: std::sync::LazyLock<String> = std::sync::LazyLock::new(|| {
         use argon2::PasswordHasher;
         argon2::Argon2::default()
-            .hash_password(
-                ADMIN_PASSWORD.as_bytes(),
-                &argon2::password_hash::SaltString::encode_b64(b"test-salt-16-byte").unwrap(),
-            )
+            .hash_password_with_salt(ADMIN_PASSWORD.as_bytes(), b"test-salt-16-byte")
             .unwrap()
             .to_string()
     });
