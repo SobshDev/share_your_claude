@@ -82,6 +82,12 @@ Upgrading past migration `0003_admin_session_password.sql` deletes every existin
 
 To roll back, redeploy the previous version and restore the backup from step 1 using the restore procedure. Usage recorded since the upgrade is lost.
 
+## Stop or restart
+
+`docker stop`, `docker compose down`, and Dokploy redeploys send SIGTERM. The router then answers `/readyz` with 503 so the proxy stops routing to it, and gives open requests up to 20 seconds to finish. After that, each open stream saves the usage it has seen, is recorded as `interrupted`, and ends with an error; within 3 more seconds every request still open is recorded as `interrupted` with the shutdown time, and the database is closed within 5 more seconds. The whole sequence takes at most 28 seconds, inside the 30-second `stop_grace_period` in `compose.yaml`. If you pass your own timeout, as in `docker stop -t`, keep it at 30 seconds or more. A process killed earlier leaves its open requests for the next startup, which records them as `interrupted` with an empty `finished_at`.
+
+Friends with a long stream open during a restart see it end early and must send the request again.
+
 ## Rotate the encryption key
 
 `ENCRYPTION_KEY` encrypts only the stored Claude OAuth tokens. The router has no re-encryption command, so rotation means discarding the saved Claude login and connecting again under the new key.

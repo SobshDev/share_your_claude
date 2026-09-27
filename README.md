@@ -89,7 +89,7 @@ The production `compose.yaml` on its own publishes no host ports.
 
 `GET /healthz` checks the process; `GET /readyz` checks SQLite. Readiness does not require an active Claude login, so initial setup can be completed through the dashboard. The image's health check runs `shared-router healthcheck`, which requests `/readyz` on the configured port and exits nonzero when the router is not ready.
 
-On SIGTERM the router reports `/readyz` as 503, lets open requests finish for up to 20 seconds, records any still open as `interrupted`, and then spends up to 5 seconds closing the database. `compose.yaml` sets `stop_grace_period: 30s` to cover this; keep it at 30 seconds or more so Docker does not kill the process first.
+On SIGTERM or Ctrl-C the router answers `/readyz` with 503 at once, so the proxy stops sending new requests, and lets open requests finish for up to 20 seconds. Then each open stream saves the usage seen so far, is recorded as `interrupted`, and ends with an error event. After up to 3 more seconds, any request still open is recorded as `interrupted` with the shutdown time, and the router spends up to 5 seconds closing the database. That adds up to 28 seconds; `compose.yaml` sets `stop_grace_period: 30s` to cover it, so keep it at 30 seconds or more or Docker will kill the process first.
 
 ### Releases and upgrades
 
@@ -207,7 +207,7 @@ AdminSession: hashed session token + CSRF token + expiry
 
 Usage states are `complete`, `partial`, `unknown`, and `not_applicable`. Stream cancellation aborts the upstream connection and preserves the last observed counts. Missing counters are never estimated from text. Reports include observed partial counts and show incomplete request counts; an em dash means unreported, not zero. Requests interrupted before the next checkpoint, or while the process is unavailable, cannot have exact totals reconstructed from the subscription. Completed usage describes what Anthropic reported, even if the final client delivery fails.
 
-On a clean shutdown, requests still open after the drain period are recorded as `interrupted` with the shutdown time. After a crash or kill, the next startup marks the leftover `in_progress` rows as `interrupted` and leaves their `finished_at` empty, because the time the process stopped is unknown. Both keep the last checkpointed counts.
+On a clean shutdown, requests still open after the 20-second drain period are recorded as `interrupted` with the shutdown time; open streams first save the counts they have seen. After a crash or kill, the next startup marks the leftover `in_progress` rows as `interrupted` and leaves their `finished_at` empty, because the time the process stopped is unknown. Both keep the last checkpointed counts.
 
 Prompts, completions, raw error bodies, API keys, and OAuth tokens are not logged or stored as usage. Only allowlisted numeric usage fields are persisted. Logs report operation failures without SQL values or provider response bodies. Do not enable HTTP body tracing or configure a reverse proxy to log credentials.
 

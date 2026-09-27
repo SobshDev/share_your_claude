@@ -20,6 +20,8 @@ services:
       - /tmp:size=16m,noexec,nosuid
     cap_drop: [ALL]
     security_opt: [no-new-privileges:true]
+    # Shutdown takes at most 28 s: a 20 s drain, 3 s to end open streams, and 5 s to close
+    # the database. Keep this at 30 s or more.
     stop_grace_period: 30s
     mem_limit: 512m
     pids_limit: 256

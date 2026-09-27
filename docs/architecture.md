@@ -6,7 +6,7 @@ Shared Router is a single Rust binary built on Axum, with one SQLite database. I
 
 | Module | Responsibility |
 |---|---|
-| [`main.rs`](../src/main.rs) | CLI entry point. `serve` (default) loads config, opens the database, and runs the server; on Ctrl-C or SIGTERM it reports `/readyz` as 503, drains open requests for up to 20 seconds, records the rest as `interrupted`, and closes the database. `generate-key`, `hash-password` (piped input only), `backup PATH`, `healthcheck`, and `help` are one-shot commands; stray arguments exit with status 2. |
+| [`main.rs`](../src/main.rs) | CLI entry point. `serve` (default) loads config, opens the database, and runs the server; on Ctrl-C or SIGTERM it runs the shutdown sequence below. `generate-key`, `hash-password` (piped input only), `backup PATH`, `healthcheck`, and `help` are one-shot commands; stray arguments exit with status 2. |
 | [`lib.rs`](../src/lib.rs) | `AppState` (config, SQLite pool, HTTP client, OAuth state with the login throttle, and the admission semaphores with their limits) and the router: health probes, friend routes, admin routes, the 32 MiB body limit, and security headers on every response. |
 | [`config.rs`](../src/config.rs) | Reads and validates environment variables at startup, and builds the upstream HTTP client with redirects and automatic retries disabled. |
 | [`db.rs`](../src/db.rs) | Creates the database file (mode 600) and missing parent directories (mode 700), opens SQLite in WAL mode, runs embedded migrations, and performs startup recovery: unfinished requests become `interrupted` with an empty `finished_at`, and expired admin sessions are deleted. Also writes owner-only `backup` copies. |
@@ -89,6 +89,16 @@ The steps in order:
 ## Process-local coordination
 
 Three pieces of state live in the process: the OAuth mutex that serializes login and refresh, the admission semaphores, and the login throttle (five failed sign-ins per client address and 30 in total per minute). The client address is the socket peer, or, when `TRUSTED_PROXY_HOPS` is N greater than 0, the N-th `X-Forwarded-For` entry from the right; `Config` reads the setting at startup and refuses to start when it is not a non-negative integer. Pending OAuth logins live there too. Startup recovery also assumes that no other process is writing `in_progress` rows. A second replica on the same database would double the admission limit, race refresh-token rotation, and mark the other replica's live requests as interrupted when it starts. Run exactly one router process per database.
+
+## Shutdown
+
+`main.rs` keeps the server phase in a watch channel on `AppState` and stops in fixed steps, all within the 30-second `stop_grace_period` in `compose.yaml`:
+
+1. **Draining.** On Ctrl-C or SIGTERM the phase becomes `Draining`. `/readyz` answers 503 "The router is shutting down", the server stops accepting connections, and open requests may finish for up to 20 seconds (`DRAIN_PERIOD`).
+2. **Stopping.** When the drain period ends, the phase becomes `Stopping`. Each open stream checkpoints the usage it has seen, sends an `api_error` event, ends, and is recorded as `interrupted`. The server gets up to 3 more seconds (`INTERRUPT_GRACE`) to close.
+3. **Closing.** `db::interrupt_in_flight` records every row still `in_progress`, such as a non-streaming call, as `interrupted` with the shutdown time. The pool then gets up to 5 seconds (`CLOSE_TIMEOUT`) to close, which also merges the WAL.
+
+If the process is killed instead, startup recovery marks the leftover rows `interrupted` with an empty `finished_at`.
 
 ## Admin surface
 
