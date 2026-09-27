@@ -10,242 +10,188 @@
   <body>
     <a class="skip-link" href="#main">Skip to content</a>
     <div class="app-shell">
-      <aside class="sidebar">
-        <a class="wordmark" href="#overview"
-          >Shared Router<span class="mark" aria-hidden="true"></span
-        ></a>
+      <aside class="rail">
+        <a class="wordmark" href="#overview"><span class="mark" aria-hidden="true"></span>Shared Router</a>
         <nav aria-label="Dashboard">
-          <a href="#overview" data-page="overview">Usage overview</a
-          ><a href="#keys" data-page="keys">Friends &amp; keys</a
-          ><a href="#connection" data-page="connection">Claude connection</a>
+          <p class="rail-label" aria-hidden="true">Usage</p>
+          <a href="#overview" data-page="overview">
+            <svg viewBox="0 0 16 16" aria-hidden="true"><path d="M2.5 13.5h11M4 11V7M8 11V3.5M12 11V6" /></svg>Overview</a>
+          <a href="#requests" data-page="requests">
+            <svg viewBox="0 0 16 16" aria-hidden="true"><path d="M3 4h10M3 8h10M3 12h6" /></svg>Requests</a>
+          <p class="rail-label" aria-hidden="true">Access</p>
+          <a href="#people" data-page="people">
+            <svg viewBox="0 0 16 16" aria-hidden="true"><circle cx="6" cy="5.5" r="2.3" /><path d="M2 13c.5-2.2 2.1-3.4 4-3.4s3.5 1.2 4 3.4M10.5 3.4a2.2 2.2 0 0 1 0 4.2M12 9.8c1 .5 1.7 1.6 2 3.2" /></svg>People &amp; keys</a>
+          <a href="#models" data-page="models">
+            <svg viewBox="0 0 16 16" aria-hidden="true"><path d="M8 2 13.5 5v6L8 14 2.5 11V5zM2.5 5 8 8l5.5-3M8 8v6" /></svg>Models</a>
+          <a href="#connection" data-page="connection">
+            <svg viewBox="0 0 16 16" aria-hidden="true"><path d="M6 10 10 6M7 4.5 8.4 3a2.6 2.6 0 0 1 3.7 3.7L10.6 8M9 11.5 7.6 13a2.6 2.6 0 0 1-3.7-3.7L5.4 8" /></svg>Claude connection</a>
         </nav>
-        <div class="sidebar-bottom">
-          <p>
-            <span class="status-dot" aria-hidden="true"></span
-            ><span id="connection-label">Checking connection…</span>
-          </p>
-          <button id="signout" class="text-button">Sign out</button>
+        <div class="rail-footer">
+          <a id="rail-status" class="rail-status" href="#connection"><span class="dot" aria-hidden="true"></span><span id="rail-status-label">Checking Claude…</span></a>
+          <button id="signout" class="link-button" type="button">Sign out</button>
         </div>
       </aside>
       <main id="main" tabindex="-1">
-        <div id="notice" class="notice" role="status"></div>
-        <div id="notice-error" class="notice error" role="alert"></div>
-        <section id="page-overview" class="page">
+        <p id="notice" class="sr-only" role="status"></p>
+        <p id="notice-error" class="toast" role="alert"></p>
+
+        <section id="page-overview" class="page" aria-labelledby="overview-title">
           <header class="page-header">
-            <div>
-              <h1 tabindex="-1">Usage overview</h1>
-              <p>See what each person uses, across all of their keys.</p>
-            </div>
-            <button id="refresh-usage" class="secondary">Refresh usage</button>
+            <h1 id="overview-title" tabindex="-1">Overview</h1>
+            <div class="header-slot" data-filters></div>
           </header>
-          <form id="usage-filter" class="filter-bar">
-            <label>User<select id="usage-person"><option value="">All users</option></select></label>
-            <label>Model<select id="usage-model"><option value="">All models</option></select></label>
-            <label>From<input type="date" id="date-from" required /></label>
-            <label>Through<input type="date" id="date-to" required /></label>
-            <button type="submit" class="secondary">Apply filters</button>
-            <div class="date-presets" aria-label="Date shortcuts">
-              <button type="button" class="text-button" data-days="7">7 days</button>
-              <button type="button" class="text-button" data-days="30">30 days</button>
-              <button type="button" class="text-button" data-days="90">90 days</button>
-            </div>
-          </form>
-          <p id="analytics-status" role="status">Loading usage…</p>
-          <div id="analytics-content" hidden>
-            <div class="report-heading scope-heading"><h2 id="scope-title" tabindex="-1">All users</h2><p id="scope-period"></p></div>
-            <dl id="usage-summary" class="usage-summary"></dl>
-            <p id="measurement-note" class="helper"></p>
-            <section class="trend-section" aria-labelledby="trend-title">
-              <div class="report-heading">
-                <div><h2 id="trend-title">Usage over time</h2><p>Daily totals · UTC</p></div>
-                <label>Chart metric<select id="chart-metric"><option value="observed_total_tokens">Observed tokens</option><option value="requests">Requests</option><option value="errors">Errors &amp; interruptions</option></select></label>
+          <div id="welcome" class="checklist" hidden></div>
+          <div id="overview-content" hidden>
+            <dl class="figures">
+              <div class="figure-main"><dt>Tokens</dt><dd id="fig-tokens">—</dd></div>
+              <div><dt>Requests</dt><dd id="fig-requests">—</dd></div>
+              <div><dt>Errors</dt><dd id="fig-errors" class="fail">—</dd></div>
+              <div><dt>Unmeasured</dt><dd id="fig-unmeasured" class="partial">—</dd></div>
+            </dl>
+            <section class="block" aria-labelledby="daily-title">
+              <div class="block-head">
+                <h2 id="daily-title" class="label">Per day</h2>
+                <div class="segmented" role="radiogroup" aria-label="Chart metric" id="chart-metric">
+                  <button type="button" role="radio" aria-checked="true" data-metric="observed_total_tokens">Tokens</button>
+                  <button type="button" role="radio" aria-checked="false" data-metric="requests">Requests</button>
+                  <button type="button" role="radio" aria-checked="false" data-metric="errors">Errors</button>
+                </div>
               </div>
-              <div id="time-chart" class="time-chart"></div>
-              <details><summary>View daily values</summary><div class="table-wrap"><table><caption class="sr-only">Daily usage in UTC</caption><thead><tr><th scope="col">Day</th><th scope="col">Observed tokens</th><th scope="col">Requests</th><th scope="col">Errors</th><th scope="col">Incomplete</th></tr></thead><tbody id="daily-rows"></tbody></table></div></details>
+              <div id="daily-chart" class="bars"></div>
+              <table class="sr-only"><caption>Daily values (UTC)</caption><thead><tr><th scope="col">Day</th><th scope="col">Tokens</th><th scope="col">Requests</th><th scope="col">Errors</th></tr></thead><tbody id="daily-rows"></tbody></table>
             </section>
-            <div class="chart-grid">
-              <section aria-labelledby="model-chart-title"><h2 id="model-chart-title">Model share</h2><p class="helper">Resolved model, or requested model when unresolved.</p><div id="model-chart" class="share-chart"></div></section>
-              <section aria-labelledby="person-chart-title"><h2 id="person-chart-title">User share</h2><p class="helper" id="person-chart-note">Select a user to explore their activity.</p><div id="person-chart" class="share-chart"></div></section>
-              <section aria-labelledby="token-chart-title"><h2 id="token-chart-title">Token breakdown</h2><p class="helper">Share of observed tokens by category.</p><div id="token-chart" class="share-chart"></div></section>
-              <section aria-labelledby="outcome-chart-title"><h2 id="outcome-chart-title">Request outcomes</h2><p class="helper">Includes denied and in-progress requests.</p><div id="outcome-chart" class="share-chart"></div></section>
+            <div class="block breakdown">
+              <section aria-labelledby="people-share-title"><h2 id="people-share-title" class="label">People</h2><ul id="people-share" class="shares"></ul></section>
+              <section aria-labelledby="models-share-title"><h2 id="models-share-title" class="label">Models</h2><ul id="models-share" class="shares"></ul></section>
             </div>
-          <div class="report-heading">
-            <h2>Token ledger</h2>
-            <label>Group by<select id="group-by"><option value="person">User</option><option value="key">API key</option><option value="model">Model</option><option value="day">Day</option></select></label>
-            <p id="report-caption">Loading your report…</p>
+            <section class="block" aria-labelledby="mix-title">
+              <h2 id="mix-title" class="label">Token mix</h2>
+              <div id="mix-bar" class="mix-bar" aria-hidden="true"></div>
+              <ul id="mix-legend" class="mix-legend"></ul>
+            </section>
           </div>
+        </section>
+
+        <section id="page-requests" class="page" aria-labelledby="requests-title" hidden>
+          <header class="page-header">
+            <h1 id="requests-title" tabindex="-1">Requests</h1>
+            <div class="header-slot" data-filters></div>
+          </header>
           <div class="table-wrap">
-            <table class="usage-table">
-              <caption id="ledger-caption" class="sr-only">Token ledger by user</caption>
-              <thead>
-                <tr>
-                  <th scope="col" id="group-heading">Person</th>
-                  <th scope="col">Input</th>
-                  <th scope="col">Cache read</th>
-                  <th scope="col">Cache write</th>
-                  <th scope="col">Output</th>
-                  <th scope="col">Observed total</th>
-                  <th scope="col">Requests</th>
-                  <th scope="col">Status</th>
-                </tr>
-              </thead>
-              <tbody id="usage-rows"></tbody>
+            <table class="requests">
+              <thead><tr><th scope="col">When</th><th scope="col">Person</th><th scope="col">Model</th><th scope="col">Status</th><th scope="col">Time</th><th scope="col" class="num">Tokens</th></tr></thead>
+              <tbody id="request-rows"></tbody>
             </table>
           </div>
-          <div id="usage-empty" class="empty-state" hidden>
-            <h3>No requests in this period</h3>
-            <p>
-              No message requests match these filters. Try a wider date range or choose another user.
-            </p>
-            <a class="needs-connection" href="#connection">Set up Claude</a>
-          </div>
-          <div class="report-notes">
-            <p>
-              Input excludes cache reads and writes. Totals include all four
-              token categories.
-            </p>
-            <p>
-              Partial or unknown usage is flagged. These are observed tokens,
-              not a percentage of your subscription limit. Dates use UTC.
-            </p>
-          </div>
-          <section class="history-section" aria-labelledby="history-title">
-            <div class="report-heading"><h2 id="history-title" tabindex="-1">Request history</h2><p>Newest first · UTC · 50 per page</p></div>
-            <div class="table-wrap" tabindex="0" aria-label="Request history, scroll for all columns"><table><caption class="sr-only">Request history, newest first</caption><thead><tr><th scope="col">Started (UTC)</th><th scope="col">User / key</th><th scope="col">Model</th><th scope="col">Outcome / HTTP</th><th scope="col">Duration</th><th scope="col">Input</th><th scope="col">Cache read</th><th scope="col">Cache write</th><th scope="col">Output</th><th scope="col">Observed total</th><th scope="col">Measurement</th></tr></thead><tbody id="request-rows"></tbody></table></div>
-            <div class="history-pagination"><button id="history-prev" class="secondary" disabled>Previous</button><p id="history-caption"></p><button id="history-next" class="secondary" disabled>Next</button></div>
-          </section>
+          <p id="requests-empty" class="empty" hidden>No requests in this period.</p>
+          <div class="pager">
+            <p id="pager-caption"></p>
+            <div><button id="page-newer" class="button secondary" type="button">Newer</button><button id="page-older" class="button secondary" type="button">Older</button></div>
           </div>
         </section>
-        <section id="page-keys" class="page" hidden>
+
+        <section id="page-people" class="page" aria-labelledby="people-title" hidden>
           <header class="page-header">
-            <div>
-              <h1 tabindex="-1">Friends &amp; keys</h1>
-              <p>
-                One identity per friend. A separate key for each device or
-                workflow.
-              </p>
-            </div>
+            <h1 id="people-title" tabindex="-1">People &amp; keys</h1>
+            <button id="add-person" class="button" type="button">Add person</button>
           </header>
-          <div class="setup-forms">
-            <form id="person-form">
-              <h2>Add a friend</h2>
-              <label for="person-name">Name</label>
-              <div class="input-action">
-                <input
-                  id="person-name"
-                  required
-                  maxlength="100"
-                  placeholder="e.g. Alex"
-                /><button type="submit">Add friend</button>
-              </div>
-            </form>
-            <form id="key-form">
-              <h2>Issue an API key</h2>
-              <div class="form-row">
-                <label>Friend<select id="key-person" required></select></label
-                ><label
-                  >Key label<input
-                    id="key-label"
-                    required
-                    maxlength="100"
-                    placeholder="e.g. Laptop"
-                /></label>
-              </div>
-              <button id="issue-key" type="submit">Create key</button>
-              <p class="helper">
-                New keys receive every enabled, reviewed model. Fable 5.1 is
-                always excluded.
-              </p>
-            </form>
-          </div>
-          <div class="report-heading">
-            <h2>People with access</h2>
-            <p>Revoking a key keeps its usage history.</p>
-          </div>
           <div id="people-list"></div>
-          <div id="people-empty" class="empty-state" hidden>
-            <h3>Start with your first friend</h3>
-            <p>
-              Add their name above, then create a key. Their Claude credentials
-              are never needed.
-            </p>
-          </div>
         </section>
-        <section id="page-connection" class="page" hidden>
+
+        <section id="page-models" class="page" aria-labelledby="models-title" hidden>
           <header class="page-header">
-            <div>
-              <h1 tabindex="-1">Claude connection</h1>
-              <p>
-                Your credentials stay on this server. Friends receive router
-                keys only.
-              </p>
-            </div>
+            <h1 id="models-title" tabindex="-1">Models</h1>
+            <button id="refresh-models" class="button secondary" type="button"><svg viewBox="0 0 14 14" aria-hidden="true"><path d="M11.5 7A4.5 4.5 0 1 1 10 3.6M11.5 2v3h-3" /></svg>Check for new models</button>
           </header>
-          <div class="connection-panel">
-            <div>
-              <h2 id="connection-title">Checking your connection…</h2>
-              <p id="connection-detail"></p>
-            </div>
-            <button id="connect-claude">Connect Claude</button>
-          </div>
-          <form id="oauth-form" class="oauth-flow" hidden>
-            <h2>Complete your connection</h2>
-            <p>
-              <a id="authorize-link" target="_blank" rel="noreferrer"
-                >Open Claude sign-in</a
-              >
-              and authorize your account. When your browser reaches the
-              localhost callback, copy the entire URL from its address bar—even
-              if the page cannot load.
-            </p>
-            <label for="redirect-url">Full callback URL</label
-            ><input
-              id="redirect-url"
-              type="url"
-              autocomplete="off"
-              required
-              placeholder="http://localhost:54545/callback?code=…&amp;state=…"
-            /><button type="submit">Finish connection</button>
-            <p class="helper">
-              This link expires in 10 minutes. Start again if it expires.
-            </p>
-          </form>
-          <div class="report-heading model-heading">
-            <div>
-              <h2>Model catalog</h2>
-              <p>
-                Review models before making them available. New discoveries
-                start disabled.
-              </p>
-            </div>
-            <button id="refresh-models" class="secondary">
-              Refresh from Claude
-            </button>
-          </div>
-          <div id="model-list" class="model-list"></div>
-          <p class="helper">
-            Enabling a model includes it on future keys. Edit an existing key’s
-            access to add it there.
-          </p>
+          <ul id="model-list" class="rows"></ul>
         </section>
-        <footer>
-          Shared Router <span>Private access. Clear accounting.</span>
-        </footer>
+
+        <section id="page-connection" class="page" aria-labelledby="connection-title" hidden>
+          <header class="page-header">
+            <h1 id="connection-title" tabindex="-1">Claude connection</h1>
+          </header>
+          <div class="status-line">
+            <p><span id="connection-dot" class="status-dot" aria-hidden="true"></span><span id="connection-state">Checking…</span></p>
+            <button id="reconnect" class="button secondary" type="button" hidden>Reconnect</button>
+          </div>
+          <dl id="connection-details" class="details" hidden>
+            <div><dt>Access token</dt><dd id="detail-token">—</dd></div>
+            <div><dt>Models available</dt><dd id="detail-models">—</dd></div>
+            <div><dt>Last request</dt><dd id="detail-last">—</dd></div>
+          </dl>
+          <form id="oauth-form" class="steps" hidden>
+            <div class="step">
+              <span class="step-number" aria-hidden="true">1</span>
+              <p class="step-title">Sign in to Claude</p>
+              <a id="authorize-link" class="button" target="_blank" rel="noreferrer">Open sign-in<svg viewBox="0 0 14 14" aria-hidden="true"><path d="M5.5 3H3v8h8V8.5M8 2.5h3.5V6M11.5 2.5 6.5 7.5" /></svg></a>
+            </div>
+            <div class="step step-paste">
+              <span class="step-number" aria-hidden="true">2</span>
+              <div>
+                <label class="step-title" for="redirect-url">Paste the address it lands on</label>
+                <div class="address-hint" aria-hidden="true"><span class="lights"><i></i><i></i><i></i></span><code>localhost:54545/callback?code=…</code></div>
+                <div class="input-row">
+                  <input id="redirect-url" type="url" autocomplete="off" required placeholder="http://localhost:54545/callback?code=…" />
+                  <button id="finish-oauth" class="button" type="submit" disabled>Connect</button>
+                </div>
+              </div>
+            </div>
+          </form>
+        </section>
       </main>
     </div>
-    <dialog
-      id="output-dialog"
-      aria-labelledby="output-title"
-      aria-describedby="output-description"
-    >
-      <div class="dialog-heading">
-        <h2 id="output-title">Your new API key</h2>
-        <button id="close-output" class="secondary">Close</button>
+
+    <div id="menu" class="menu" role="menu" hidden></div>
+
+    <dialog id="person-dialog" aria-labelledby="person-dialog-title">
+      <form method="dialog" id="person-form" class="sheet">
+        <h2 id="person-dialog-title">Add person</h2>
+        <label class="field">Name<input id="person-name" required maxlength="100" autocomplete="off" /></label>
+        <div class="sheet-actions"><button class="button secondary" type="button" data-close>Cancel</button><button id="person-save" class="button" type="submit">Add</button></div>
+      </form>
+    </dialog>
+
+    <dialog id="key-dialog" aria-labelledby="key-dialog-title">
+      <form method="dialog" id="key-form" class="sheet">
+        <h2 id="key-dialog-title">New key</h2>
+        <label class="field" id="key-label-field">Device<input id="key-label" required maxlength="100" autocomplete="off" placeholder="e.g. Laptop" /></label>
+        <fieldset class="field">
+          <legend id="key-models-legend">Models</legend>
+          <div id="key-models" class="checks"></div>
+        </fieldset>
+        <div class="sheet-actions"><button class="button secondary" type="button" data-close>Cancel</button><button id="key-save" class="button" type="submit">Create key</button></div>
+      </form>
+    </dialog>
+
+    <dialog id="ready-dialog" aria-labelledby="ready-title">
+      <div class="sheet sheet-wide">
+        <h2 id="ready-title" class="with-check"><span class="check-badge" aria-hidden="true"></span><span id="ready-title-text">Key ready</span></h2>
+        <div class="field" id="ready-key-field">
+          <div class="field-head"><span>Key</span><span class="once">Shown once</span></div>
+          <div class="copy-row"><code id="ready-key"></code><button class="button secondary copy" type="button" data-copy="ready-key">Copy</button></div>
+        </div>
+        <div class="field">
+          <div class="field-head"><span>opencodex setup</span><button class="button secondary copy" type="button" data-copy="ready-config">Copy</button></div>
+          <pre id="ready-config" tabindex="0"></pre>
+        </div>
+        <p id="copy-status" class="copy-status" role="status"></p>
+        <div class="sheet-actions"><button id="ready-done" class="button" type="button">Done</button></div>
       </div>
-      <p id="output-description"></p>
-      <pre id="output-content" tabindex="0"></pre>
-      <button id="copy-output">Copy</button>
-      <p id="copy-status" role="status"></p>
+    </dialog>
+
+    <dialog id="confirm-dialog" aria-labelledby="confirm-title">
+      <form method="dialog" class="sheet">
+        <h2 id="confirm-title">Revoke key?</h2>
+        <div class="sheet-actions"><button class="button secondary" type="button" data-close>Cancel</button><button id="confirm-ok" class="button danger" type="submit">Revoke</button></div>
+      </form>
+    </dialog>
+
+    <dialog id="alias-dialog" aria-labelledby="alias-title">
+      <form method="dialog" id="alias-form" class="sheet">
+        <h2 id="alias-title">Add alias</h2>
+        <label class="field">Alias<input id="alias-name" required maxlength="150" autocomplete="off" pattern="[A-Za-z0-9_/\-]+" placeholder="e.g. sonnet-latest" /></label>
+        <div class="sheet-actions"><button class="button secondary" type="button" data-close>Cancel</button><button id="alias-save" class="button" type="submit">Add</button></div>
+      </form>
     </dialog>
   </body>
 </html>
