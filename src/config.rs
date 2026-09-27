@@ -112,12 +112,24 @@ pub fn bind_address(value: Option<String>) -> anyhow::Result<SocketAddr> {
 /// non-streaming call sets its own request timeout, and streams are bounded by
 /// [`crate::proxy::MAX_STREAM_DURATION`].
 pub(crate) fn http_client() -> anyhow::Result<reqwest::Client> {
-    Ok(reqwest::Client::builder()
+    Ok(client_builder()?
         .redirect(reqwest::redirect::Policy::none())
         .retry(reqwest::retry::never())
         .connect_timeout(Duration::from_secs(15))
         .read_timeout(Duration::from_secs(120))
         .build()?)
+}
+
+/// A client builder that uses rustls with the ring provider and trusts only the bundled
+/// Mozilla root certificates, so outbound TLS does not depend on the host's trust store.
+pub fn client_builder() -> anyhow::Result<reqwest::ClientBuilder> {
+    // Fails only when a provider is already installed, which is this one on a later call.
+    let _ = rustls::crypto::ring::default_provider().install_default();
+    let roots = webpki_root_certs::TLS_SERVER_ROOT_CERTS
+        .iter()
+        .map(|der| reqwest::Certificate::from_der(der))
+        .collect::<Result<Vec<_>, _>>()?;
+    Ok(reqwest::Client::builder().tls_certs_only(roots))
 }
 
 #[cfg(test)]

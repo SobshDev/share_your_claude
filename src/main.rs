@@ -122,7 +122,7 @@ async fn healthcheck() -> anyhow::Result<()> {
         };
         address.set_ip(loopback);
     }
-    let client = reqwest::Client::builder()
+    let client = config::client_builder()?
         .no_proxy()
         .redirect(reqwest::redirect::Policy::none())
         .timeout(HEALTHCHECK_TIMEOUT)
