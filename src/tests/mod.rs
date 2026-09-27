@@ -33,6 +33,7 @@ mod mock_upstream;
 mod admin;
 mod analytics;
 mod auth;
+mod compat;
 mod dashboard;
 mod oauth;
 mod policy;

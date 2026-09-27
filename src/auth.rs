@@ -37,6 +37,12 @@ pub(crate) fn hash(secret: &str) -> Vec<u8> {
     Sha256::digest(secret.as_bytes()).to_vec()
 }
 
+/// Checks a password against a PHC-encoded Argon2 hash. The parameters come from the hash.
+pub(crate) fn verify_password(encoded: &str, password: &[u8]) -> bool {
+    PasswordHash::new(encoded)
+        .is_ok_and(|hash| Argon2::default().verify_password(password, &hash).is_ok())
+}
+
 fn single_header<'a>(headers: &'a HeaderMap, name: &str) -> Result<Option<&'a str>> {
     let mut values = headers.get_all(name).iter();
     let value = values.next();
@@ -335,15 +341,9 @@ pub(crate) async fn login(
     };
     let encoded = state.config.password_hash.clone();
     let password = zeroize::Zeroizing::new(input.password);
-    let valid = tokio::task::spawn_blocking(move || {
-        PasswordHash::new(&encoded).is_ok_and(|hash| {
-            Argon2::default()
-                .verify_password(password.as_bytes(), &hash)
-                .is_ok()
-        })
-    })
-    .await
-    .map_err(|_| AppError::internal())?;
+    let valid = tokio::task::spawn_blocking(move || verify_password(&encoded, password.as_bytes()))
+        .await
+        .map_err(|_| AppError::internal())?;
     if !valid {
         return Err(AppError::unauthorized());
     }
