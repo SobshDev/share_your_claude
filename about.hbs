@@ -1,0 +1,30 @@
+# Third-party crate licenses
+
+This file lists the Rust crates compiled into the `shared-router` binary for Linux (x86_64 and aarch64), with the license text each one ships. It is generated from `Cargo.lock`; do not edit it by hand. Regenerate it with:
+
+```bash
+cargo about generate --locked about.hbs -o THIRD_PARTY_NOTICES_CRATES.md
+```
+
+Where a crate offers a choice of licenses, the first accepted license in `about.toml` is used. SQLite and code adapted from opencodex are covered in [THIRD_PARTY_NOTICES.md](THIRD_PARTY_NOTICES.md).
+
+## Overview
+
+{{#each overview}}
+- {{{name}}}: {{count}} crates
+{{/each}}
+
+{{#each licenses}}
+## {{{name}}}
+
+Used by:
+
+{{#each used_by}}
+- [{{{crate.name}}} {{{crate.version}}}]({{#if crate.repository}}{{{crate.repository}}}{{else}}https://crates.io/crates/{{{crate.name}}}{{/if}})
+{{/each}}
+
+````text
+{{{text}}}
+````
+
+{{/each}}

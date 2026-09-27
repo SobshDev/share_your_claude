@@ -1,0 +1,160 @@
+# Operations runbook
+
+Copy-paste procedures for running Shared Router under Docker Compose, including Dokploy. Run every command on the Docker host as a user who can use `docker`. Commands use Bash.
+
+Keep three things safe and separate: the database backups, the `ENCRYPTION_KEY` value that was active when each backup was taken, and the owner password. A database backup without its matching key cannot recover the saved Claude login.
+
+## Find the container and volume
+
+Compose prefixes names with the project name, so the `router_data` volume appears on the host as `<project>_router_data`. On Dokploy the project name is the service's app name, and the Compose directory is managed by Dokploy. These commands find the names from Docker labels, so they work from any directory:
+
+```bash
+router_container=$(docker ps -a --filter label=com.docker.compose.service=router --format '{{.Names}}')
+echo "$router_container"
+router_volume=$(docker inspect "$router_container" --format '{{range .Mounts}}{{if eq .Destination "/data"}}{{.Name}}{{end}}{{end}}')
+echo "$router_volume"
+```
+
+Each command must print exactly one name. If several Compose projects define a service called `router`, add `--filter label=com.docker.compose.project=<project>` to the first command. `docker compose ls` and `docker volume ls | grep router_data` list the candidates.
+
+The runtime image contains only the router binary, `ca-certificates`, and the license notices in `/usr/share/doc/shared-router/`. It has no `curl` and no SQLite shell, so readiness checks below use the binary's `healthcheck` command, and offline database work uses a short-lived `debian:bookworm-slim` container with the volume mounted. The router runs as UID 10001, and every file it opens must belong to that user.
+
+## Back up
+
+A backup uses SQLite `VACUUM INTO` inside the running container, so the router can keep serving. Never copy the live `router.sqlite` alone: with WAL mode, recent writes live in `router.sqlite-wal`.
+
+```bash
+umask 077
+router_backup="router-$(date -u +%Y%m%dT%H%M%SZ).sqlite"
+docker exec "$router_container" shared-router backup "/data/$router_backup"
+docker cp "$router_container:/data/$router_backup" "./$router_backup"
+docker exec "$router_container" rm "/data/$router_backup"
+chmod 600 "./$router_backup"
+```
+
+From a Compose directory that uses the same project name, `bash scripts/backup.sh` does the same, writes to `./backups` or to `BACKUP_DIR`, and with `BACKUP_KEEP=N` keeps only the newest N backups there. On Dokploy, point `BACKUP_DIR` outside the checkout. Move the file to protected storage. Backups contain hashed keys, usage history, and the encrypted Claude tokens, so treat them as private.
+
+## Restore
+
+1. Stop the router so nothing writes to the volume:
+
+   ```bash
+   docker stop "$router_container"
+   ```
+
+2. Replace the database with `scripts/restore.sh`, from a checkout of this repository on the Docker host (any directory works):
+
+   ```bash
+   BACKUP_DIR=/srv/router-backups bash scripts/restore.sh /srv/router-backups/router-20260101T000000Z.sqlite
+   ```
+
+   The script finds the router container and its `/data` volume from the Compose labels (set `ROUTER_PROJECT=<project>` when several projects define a `router` service) and refuses to run while the router is up; `--force` stops it for you. Before replacing anything, it copies the current database, and its WAL file if present, to `BACKUP_DIR` (default `./backups`) as `pre-restore-<timestamp>.sqlite`, so a restore of the wrong file can be undone the same way. It then deletes the old WAL and SHM files, which belong to the database being replaced and which SQLite would otherwise apply to the restored file, and installs the backup owned by UID 10001 with mode 600. It leaves the router stopped. The helper containers use `debian:bookworm-slim` (override with `HELPER_IMAGE`), which Docker pulls on first use.
+
+   Without a checkout, the equivalent manual step is the following, run from the directory that holds the backup, with `router_backup` set to its file name. It skips the pre-restore copy:
+
+   ```bash
+   docker run --rm -v "$router_volume":/data -v "$PWD":/in:ro -e router_backup="$router_backup" debian:bookworm-slim \
+     sh -c 'rm -f /data/router.sqlite-wal /data/router.sqlite-shm && cp "/in/$router_backup" /data/router.sqlite && chown 10001:10001 /data/router.sqlite && chmod 600 /data/router.sqlite'
+   ```
+
+3. Make sure the deployment's `ENCRYPTION_KEY` is the key that was active when the backup was taken. If you changed it in Dokploy, restore the old value and redeploy instead of starting the container directly.
+4. Start the router and check readiness:
+
+   ```bash
+   docker start "$router_container"
+   docker exec "$router_container" shared-router healthcheck && echo ready
+   ```
+
+   The last command prints `ready`. Sign in to the dashboard and check that **Friends & keys** shows the people and keys from the backup.
+
+Startup marks requests that were in progress at backup time as `interrupted`, with an empty `finished_at` because their real end is unknown, and removes expired sessions. If the backup's refresh token has already been rotated, the dashboard will ask you to connect Claude again. A key issued after the backup no longer exists and must be issued again.
+
+## Upgrade
+
+Migrations are embedded in the binary. They run automatically every time the router starts, before it begins serving, and they are forward-only: there are no down migrations. An older image will not start against a database that a newer image has migrated, because the database records migrations the older binary does not know.
+
+1. Take a backup as above and keep it with the image or tag you are currently running.
+2. Read [CHANGELOG.md](../CHANGELOG.md) for configuration changes and new migrations.
+3. Deploy the new version (redeploy in Dokploy, or `docker compose up -d --build`).
+4. Check `/readyz` and the dashboard.
+
+Upgrading past migration `0003_admin_session_password.sql` deletes every existing dashboard session once, because older sessions cannot be tied to a password. Sign in again after that upgrade; friend keys and the Claude connection are not affected.
+
+To roll back, redeploy the previous version and restore the backup from step 1 using the restore procedure. Usage recorded since the upgrade is lost.
+
+## Stop or restart
+
+`docker stop`, `docker compose down`, and Dokploy redeploys send SIGTERM. The router then answers `/readyz` with 503 so the proxy stops routing to it, and gives open requests up to 20 seconds to finish. After that, each open stream saves the usage it has seen, is recorded as `interrupted`, and ends with an error; within 3 more seconds every request still open is recorded as `interrupted` with the shutdown time, and the database is closed within 5 more seconds. The whole sequence takes at most 28 seconds, inside the 30-second `stop_grace_period` in `compose.yaml`. If you pass your own timeout, as in `docker stop -t`, keep it at 30 seconds or more. A process killed earlier leaves its open requests for the next startup, which records them as `interrupted` with an empty `finished_at`.
+
+Friends with a long stream open during a restart see it end early and must send the request again.
+
+## Rotate the encryption key
+
+`ENCRYPTION_KEY` encrypts only the stored Claude OAuth tokens. The router has no re-encryption command, so rotation means discarding the saved Claude login and connecting again under the new key.
+
+1. Take a backup, and store the current key with it.
+2. Generate a new key:
+
+   ```bash
+   docker exec "$router_container" shared-router generate-key
+   ```
+
+3. Replace `ENCRYPTION_KEY` in Dokploy's **Environment** settings (or `.env`) and redeploy.
+4. Sign in to the dashboard, open **Claude connection**, and click **Connect Claude**. Completing the login replaces the stored tokens, now encrypted with the new key.
+
+Between steps 3 and 4, friend requests fail with 500 "The router could not complete this operation", because the old ciphertext cannot be decrypted. The dashboard can still show the connection as connected during that window. If you are rotating because the key and a database copy may have leaked together, treat the stored Claude tokens as exposed too and sign out other sessions from your Claude account.
+
+## Rotate the owner password
+
+1. Generate a hash for the new password without putting it in shell history or process arguments:
+
+   ```bash
+   read -r -s -p 'New owner password: ' router_password; echo
+   printf '%s' "$router_password" | docker exec -i "$router_container" shared-router hash-password
+   unset router_password
+   ```
+
+   Do not use `scripts/bootstrap-secrets.sh` for this: it also prints a new encryption key.
+2. Replace `ADMIN_PASSWORD_HASH` in Dokploy's **Environment** settings, keeping the single quotes, and redeploy.
+3. Sign in with the new password.
+
+Each dashboard session is bound to the `ADMIN_PASSWORD_HASH` it was issued under. Once the router restarts with a different hash, every existing session is rejected, so every browser, including yours, must sign in again. No database step is needed. Any change to the value counts, including a fresh hash of the same password. To sign every session out without changing the password, generate a new hash of the current password and deploy it the same way.
+
+## Troubleshooting
+
+Router logs never contain prompts, tokens, or SQL values. Read them with `docker logs "$router_container"` (or `docker compose logs router`).
+
+**Claude needs reconnection (`needs_reauth`).** Friends get 503 `authentication_error` with "The owner must reconnect Claude in the dashboard". A single upstream 401 does not cause this: the router first refreshes the token once. It sets the state when:
+
+- the refresh itself is rejected with 400, 401, or 403, usually because the refresh token was revoked or already used;
+- a token count, or a catalog page fetched by **Refresh from Claude**, sent again with a just-refreshed token is still refused with 401;
+- Claude answers a proxied request or a catalog page with 403 of type `authentication_error` (other 403s affect only that request);
+- the stored credential cannot be decrypted, usually because `ENCRYPTION_KEY` changed.
+
+It never falls back to other billing. Sign in, open **Claude connection**, and click **Connect Claude**. Restoring an older backup can cause this too, because its refresh token may already have been used.
+
+**Friends get 503 "The router renewed its Claude session. Retry the request".** Claude rejected the access token, and the router refreshed it. The router never sends a `/v1/messages` request twice, so the client must retry; the next attempt uses the new token. If this repeats for every request, check the logs for refresh failures.
+
+**Every friend request fails with 500 while the dashboard shows connected.** The stored tokens cannot be decrypted, almost always because `ENCRYPTION_KEY` changed. Restore the original key and redeploy, or connect Claude again to re-encrypt with the current key.
+
+**Sign-in returns 429 "Too many sign-in attempts. Wait one minute".** Each client address may fail five times per minute, and all addresses together 30 times per minute. A successful sign-in clears that address's failures. Wait one minute and try again; restarting the router also clears the counters. If you are locked out without having mistyped your password five times, either someone else is sending sign-in attempts (the 30-per-minute total applies to everyone), or the router cannot tell clients apart: behind Dokploy's Traefik every request arrives from the proxy's address, so set `TRUSTED_PROXY_HOPS=1` in the Environment settings and redeploy.
+
+**Sign-in or dashboard changes return 403 "This action must originate from the owner dashboard".** The browser origin differs from `PUBLIC_ORIGIN`. They must match exactly, including scheme and port.
+
+**Friends get 429 "The router is busy" or "This key has too many requests in progress".** Each key may run 3 `/v1/messages` requests at once, all keys together 8, and token counts 4 in their own pool. Extra requests are refused immediately rather than queued, with `retry-after: 1`. Retry after running requests finish; open streams hold their slots until they end. A 429 that says "Claude rejected the request" comes from Claude itself, and its `retry-after` header is passed through.
+
+**`/readyz` fails or the container is unhealthy.** `/readyz` runs one SQLite query. If nothing answers at all, the process did not start: check the logs for the first error. Common causes:
+
+- `PUBLIC_ORIGIN must be set`, `ENCRYPTION_KEY must contain 32 bytes encoded as base64`, `invalid admin password hash`, `admin password must use Argon2id`, or `TRUSTED_PROXY_HOPS must be a non-negative integer`: fix the environment value. The hash needs single quotes in Dokploy and `.env` so its `$` characters stay literal.
+- A permission or "unable to open database file" error: the files in the volume are not owned by UID 10001. Run the restore step 2 `chown` again.
+- A migration error after a downgrade: the database was migrated by a newer version. Deploy that version again, or restore a backup taken before the upgrade.
+
+If the process answers `/healthz` but not `/readyz`, the database is unavailable. Check the volume and disk space.
+
+**The OAuth callback is rejected.**
+
+- "This connection expired or belongs to another session. Start again": more than ten minutes passed, you signed in again, or you clicked **Connect Claude** again. Only the most recent link works.
+- "Start a new Claude connection first": the router restarted after you clicked **Connect Claude**. Pending logins are kept in memory.
+- "Unexpected OAuth redirect URL": paste the whole address unchanged, starting with `http://localhost:54545/callback`. Replacing `localhost` with `127.0.0.1` does not work.
+
+In every case, click **Connect Claude** and complete the new link within ten minutes.

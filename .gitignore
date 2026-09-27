@@ -1,7 +1,16 @@
+# Keep the secret and data patterns in sync with .dockerignore, which must stay a superset.
 /target/
 /data/
 /backups/
 /secrets/
-/.env
+.env
+.env.*
+!.env.example
+*.pem
+*.key
 *.sqlite*
 .DS_Store
+node_modules/
+.idea/
+.vscode/
+*.swp

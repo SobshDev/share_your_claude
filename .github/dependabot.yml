@@ -1,0 +1,19 @@
+version: 2
+updates:
+  - package-ecosystem: cargo
+    directory: "/"
+    schedule:
+      interval: weekly
+    groups:
+      cargo-minor-and-patch:
+        update-types: [minor, patch]
+  - package-ecosystem: github-actions
+    directory: "/"
+    schedule:
+      interval: weekly
+  # Bumps the digest-pinned base images in the Dockerfile. When the rust image
+  # moves to a new minor version, update the toolchain refs in ci.yml with it.
+  - package-ecosystem: docker
+    directory: "/"
+    schedule:
+      interval: weekly

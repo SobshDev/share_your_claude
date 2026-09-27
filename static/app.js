@@ -1,69 +1,36 @@
-"use strict";
-const $ = (id) => document.getElementById(id);
-let csrf = "";
-let people = [],
-  keys = [],
-  models = [];
-const number = (value) =>
-  value == null ? "—" : new Intl.NumberFormat().format(value);
+import {
+  $,
+  api,
+  button,
+  focusKey,
+  node,
+  notice,
+  onReauth,
+  run,
+  setCsrf,
+  state,
+} from "./common.js";
+import {
+  initializeAnalytics,
+  loadUsage,
+  selectUsagePerson,
+  updateUsageFilters,
+} from "./analytics.js";
 const date = (value) =>
   value ? new Date(value).toLocaleString() : "Never used";
-function node(tag, text, className) {
-  const element = document.createElement(tag);
-  if (text !== undefined) element.textContent = text;
-  if (className) element.className = className;
-  return element;
-}
-function notice(message, error = false) {
-  const box = $("notice");
-  if (!box) return;
-  box.textContent = message;
-  box.className = error ? "notice error" : "notice";
-  box.hidden = !message;
-}
-async function api(path, method = "GET", body) {
-  const response = await fetch(`/admin/api/${path}`, {
-    method,
-    credentials: "same-origin",
-    headers: { "Content-Type": "application/json", "X-CSRF-Token": csrf },
-    ...(body === undefined ? {} : { body: JSON.stringify(body) }),
-  });
-  if (response.status === 401 && path !== "login") {
-    location.assign("/admin/login");
-    throw new Error("Your session expired. Sign in again.");
-  }
-  const data =
-    response.status === 204 ? null : await response.json().catch(() => null);
-  if (!response.ok)
-    throw new Error(
-      data?.error?.message || `Request failed (${response.status}). Try again.`,
-    );
-  return data;
-}
-async function run(action, button) {
-  if (button) button.disabled = true;
-  notice("");
-  try {
-    await action();
-  } catch (error) {
-    notice(error.message || "Could not connect. Try again.", true);
-  } finally {
-    if (button) button.disabled = false;
-  }
-}
-function button(label, action, className = "secondary") {
-  const element = node("button", label, className);
-  element.type = "button";
-  element.addEventListener("click", () => run(() => action(element), element));
-  return element;
-}
 function formAction(id, action) {
   $(id).addEventListener("submit", (event) => {
     event.preventDefault();
     run(action, event.submitter);
   });
 }
-function showOutput(title, description, content, copyLabel) {
+// A one-time secret is lost when the dialog closes, so Escape is refused
+// until it has been copied. The Close button always discards it.
+let outputSecret = false,
+  outputCopied = false;
+function showOutput(title, description, content, copyLabel, secret = false) {
+  outputSecret = secret;
+  outputCopied = false;
   $("output-title").textContent = title;
   $("output-description").textContent = description;
   $("output-content").textContent = content;
@@ -71,12 +38,19 @@ function showOutput(title, description, content, copyLabel) {
   $("copy-status").textContent = "";
   $("output-dialog").showModal();
 }
-function page() {
-  const name = ["overview", "keys", "connection"].includes(
-    location.hash.slice(1),
-  )
-    ? location.hash.slice(1)
-    : "overview";
+const pages = {
+  overview: "Usage overview",
+  keys: "Friends & keys",
+  connection: "Claude connection",
+};
+let currentPage = null;
+function page(focusHeading = false) {
+  const hash = location.hash.slice(1),
+    known = Object.hasOwn(pages, hash);
+  // Other fragments (such as #main) keep the page that is already shown.
+  if (!known && currentPage) return;
+  const name = known ? hash : "overview";
+  currentPage = name;
   document.querySelectorAll(".page").forEach((element) => {
     element.hidden = element.id !== `page-${name}`;
   });
@@ -85,11 +59,12 @@ function page() {
       element.setAttribute("aria-current", "page");
     else element.removeAttribute("aria-current");
   });
-  document.title = `${{ overview: "Usage overview", keys: "Friends & keys", connection: "Claude connection" }[name]} · Shared Router`;
+  document.title = `${pages[name]} · Shared Router`;
+  if (focusHeading) $(`page-${name}`).querySelector("h1").focus();
 }
 async function connection() {
   const data = await api("me");
-  csrf = data.csrf_token;
+  setCsrf(data.csrf_token);
   const connected = data.claude?.state === "connected";
   $("connection-label").textContent = connected
     ? "Claude connected"
@@ -104,10 +79,12 @@ async function connection() {
   $("connect-claude").textContent = connected
     ? "Reconnect Claude"
     : "Connect Claude";
+  // run() restores this state after its own busy phase.
+  $("refresh-models").dataset.unavailable = String(!connected);
   $("refresh-models").disabled = !connected;
 }
 async function loadAccess() {
-  [people, keys, models] = await Promise.all([
+  [state.people, state.keys, state.models] = await Promise.all([
     api("people"),
     api("keys"),
     api("models"),
@@ -117,6 +94,7 @@ async function loadAccess() {
   updateUsageFilters();
 }
 function renderPeople() {
+  const { people, keys, models } = state;
   const select = $("key-person"),
     previous = select.value;
   select.replaceChildren();
@@ -140,12 +118,19 @@ function renderPeople() {
   for (const person of people) {
     const section = node("section", undefined, "friend");
     const heading = node("div", undefined, "friend-heading");
-    heading.append(node("h3", person.name));
-    heading.append(button("View usage", () => selectUsagePerson(person.id), "text-button"));
+    const name = focusKey(node("h3", person.name), `person:${person.id}`);
+    name.tabIndex = -1;
+    heading.append(name);
+    heading.append(
+      focusKey(
+        button("View usage", () => selectUsagePerson(person.id), "text-button"),
+        `person:${person.id}:usage`,
+      ),
+    );
     heading.append(
       button(
         "Rename",
-        async () => {
+        async (opener) => {
           if (section.querySelector(".rename-form")) return;
           const form = node("form", undefined, "rename-form input-action"),
             input = node("input");
@@ -153,12 +138,19 @@ function renderPeople() {
           input.required = true;
           input.maxLength = 100;
           input.setAttribute("aria-label", "New name");
-          const save = node("button", "Save name");
+          const save = focusKey(
+            node("button", "Save name"),
+            `person:${person.id}:save`,
+            `person:${person.id}:rename`,
+          );
           save.type = "submit";
           form.append(
             input,
             save,
-            button("Cancel", async () => form.remove()),
+            button("Cancel", async () => {
+              form.remove();
+              opener.focus();
+            }),
           );
           form.addEventListener("submit", (event) => {
             event.preventDefault();
@@ -174,6 +166,7 @@ function renderPeople() {
         "text-button",
       ),
     );
+    focusKey(heading.lastElementChild, `person:${person.id}:rename`);
     section.append(heading);
     const ownKeys = keys.filter((key) => key.person_id === person.id);
     if (!ownKeys.length)
@@ -204,21 +197,24 @@ function renderPeople() {
       const actions = node("div", undefined, "key-actions");
       if (!key.revoked_at) {
         actions.append(
-          button("Edit access", async () => {
+          button("Edit access", async (opener) => {
             if (row.nextElementSibling?.classList.contains("grant-form")) {
               row.nextElementSibling.remove();
               return;
             }
             const form = node("form", undefined, "grant-form"),
+              fieldset = node("fieldset", undefined, "grant-fieldset"),
               options = node("div", undefined, "grant-options");
-            form.append(
-              node("h3", `Model access for ${key.label}`),
+            fieldset.append(
+              node("legend", `Model access for ${key.label}`, "grant-legend"),
               node(
                 "p",
                 "Fable 5.1 cannot be granted. Save with none selected to pause model access.",
                 "helper",
               ),
+              options,
             );
+            form.append(fieldset);
             for (const model of models.filter(
               (m) => m.enabled && m.reviewed_at && !m.blocked,
             )) {
@@ -230,6 +226,23 @@ function renderPeople() {
               label.append(input, node("span", model.display_name));
               options.append(label);
             }
+            // Grants for disabled models are kept by the server and return
+            // when the model is enabled again; show them without submitting.
+            for (const model of models.filter(
+              (m) => !m.enabled && !m.blocked && key.models.includes(m.id),
+            )) {
+              const label = node("label", undefined, "check-label"),
+                input = node("input");
+              input.type = "checkbox";
+              input.value = model.id;
+              input.checked = true;
+              input.disabled = true;
+              label.append(
+                input,
+                node("span", `${model.display_name} (disabled in catalog)`),
+              );
+              options.append(label);
+            }
             if (!options.children.length)
               options.append(
                 node(
@@ -238,19 +251,25 @@ function renderPeople() {
                   "helper",
                 ),
               );
-            const save = node("button", "Save access");
+            const save = focusKey(
+              node("button", "Save access"),
+              `key:${key.id}:save`,
+              `key:${key.id}:access`,
+            );
             save.type = "submit";
             form.append(
-              options,
               save,
-              button("Cancel", async () => form.remove()),
+              button("Cancel", async () => {
+                form.remove();
+                opener.focus();
+              }),
             );
             form.addEventListener("submit", (event) => {
               event.preventDefault();
               run(async () => {
                 await api(`keys/${key.id}/models`, "PUT", {
                   models: Array.from(
-                    options.querySelectorAll("input:checked"),
+                    options.querySelectorAll("input:checked:enabled"),
                     (input) => input.value,
                   ),
                 });
@@ -261,6 +280,7 @@ function renderPeople() {
             row.after(form);
           }),
         );
+        focusKey(actions.lastElementChild, `key:${key.id}:access`);
         actions.append(
           button("opencodex setup", async () => {
             const config = await api(`keys/${key.id}/config`);
@@ -272,24 +292,51 @@ function renderPeople() {
             );
           }),
         );
-        actions.append(
-          button(
-            "Revoke",
-            async (control) => {
-              if (control.dataset.confirm !== "yes") {
-                control.dataset.confirm = "yes";
-                control.textContent = "Confirm revoke";
-                return;
-              }
-              await api(`keys/${key.id}`, "DELETE");
-              await loadAccess();
-              notice(
-                "Key revoked. Existing requests can finish; new requests are blocked.",
-              );
-            },
-            "secondary danger",
-          ),
+        focusKey(actions.lastElementChild, `key:${key.id}:config`);
+        // Revocation cannot be undone, so it needs a deliberate second click.
+        let revokeTimer;
+        const prompt = () =>
+          notice(
+            `Press “Confirm revoke” to revoke ${key.label}. This cannot be undone.`,
+          );
+        const disarm = (control) => {
+          clearTimeout(revokeTimer);
+          delete control.dataset.confirm;
+          delete control.dataset.armedAt;
+          control.textContent = "Revoke";
+        };
+        const revoke = button(
+          "Revoke",
+          async (control) => {
+            if (control.dataset.confirm !== "yes") {
+              control.dataset.confirm = "yes";
+              control.dataset.armedAt = String(Date.now());
+              control.textContent = "Confirm revoke";
+              revokeTimer = setTimeout(() => disarm(control), 5000);
+              prompt();
+              return;
+            }
+            // The second click of a double-click is not a confirmation.
+            if (Date.now() - Number(control.dataset.armedAt) < 600) {
+              prompt();
+              return;
+            }
+            disarm(control);
+            await api(`keys/${key.id}`, "DELETE");
+            await loadAccess();
+            notice(
+              "Key revoked. Existing requests can finish; new requests are blocked.",
+            );
+          },
+          "secondary danger",
         );
+        focusKey(revoke, `key:${key.id}:revoke`, `person:${person.id}`);
+        // run() disables the button while busy, which can blur it; ignore that.
+        revoke.addEventListener("blur", () => {
+          if (!revoke.disabled && revoke.dataset.confirm === "yes")
+            disarm(revoke);
+        });
+        actions.append(revoke);
       }
       row.append(identity, meta, actions);
       section.append(row);
@@ -298,6 +345,7 @@ function renderPeople() {
   }
 }
 function renderModels() {
+  const { models } = state;
   $("model-list").replaceChildren();
   for (const model of models) {
     const row = node("div", undefined, "model-row"),
@@ -322,14 +370,15 @@ function renderModels() {
             notice(
               model.enabled
                 ? "Model disabled for all keys."
-                : "Model enabled. Add it to existing keys through Edit access.",
+                : "Model enabled. Keys that had access before it was disabled can use it again; add it to other keys through Edit access.",
             );
           },
         ),
       );
+    if (!model.blocked) focusKey(row.lastElementChild, `model:${model.id}`);
     $("model-list").append(row);
   }
-  if (models.length < 2)
+  if (!models.some((m) => !m.blocked))
     $("model-list").append(
       node(
         "p",
@@ -349,7 +398,8 @@ async function initialize() {
         await api("login", "POST", { password: $("password").value });
         location.assign("/admin");
       } catch (error) {
-        $("login-error").textContent = error.message;
+        $("login-error").textContent =
+          error.status === 401 ? "That password is incorrect." : error.message;
       } finally {
         $("password").value = "";
         control.disabled = false;
@@ -357,8 +407,13 @@ async function initialize() {
     });
     return;
   }
+  onReauth(connection);
   page();
-  window.addEventListener("hashchange", page);
+  window.addEventListener("hashchange", () => page(true));
+  document.querySelector(".skip-link").addEventListener("click", (event) => {
+    event.preventDefault();
+    $("main").focus();
+  });
   const today = new Date(),
     start = new Date(today);
   start.setUTCDate(start.getUTCDate() - 29);
@@ -392,6 +447,7 @@ async function initialize() {
       "Copy this key now and share it privately with your friend. It cannot be displayed again. Revoking the key will stop future requests.",
       result.secret,
       "Copy API key",
+      true,
     );
     await loadAccess();
   });
@@ -417,6 +473,7 @@ async function initialize() {
   $("refresh-models").addEventListener("click", (event) =>
     run(async () => {
       const result = await api("models/refresh", "POST");
+      await connection();
       await loadAccess();
       notice(
         `${result.discovered} models discovered. Review new models below.`,
@@ -424,17 +481,32 @@ async function initialize() {
     }, event.currentTarget),
   );
   $("close-output").addEventListener("click", () => $("output-dialog").close());
+  $("output-dialog").addEventListener("cancel", (event) => {
+    if (!outputSecret || outputCopied) return;
+    event.preventDefault();
+    $("copy-status").textContent =
+      "Copy the key first, or press Close to discard it.";
+  });
   $("output-dialog").addEventListener("close", () => {
     $("output-content").textContent = "";
     $("copy-status").textContent = "";
+    outputSecret = false;
   });
   $("copy-output").addEventListener("click", async () => {
     try {
       await navigator.clipboard.writeText($("output-content").textContent);
+      outputCopied = true;
       $("copy-status").textContent = "Copied to clipboard.";
     } catch {
+      const content = $("output-content"),
+        range = document.createRange(),
+        selection = getSelection();
+      range.selectNodeContents(content);
+      selection.removeAllRanges();
+      selection.addRange(range);
+      content.focus();
       $("copy-status").textContent =
-        "Clipboard access is unavailable. Select and copy the text above.";
+        "Clipboard access is unavailable. The text above is selected; copy it with your keyboard.";
     }
   });
   await connection();

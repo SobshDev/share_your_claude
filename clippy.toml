@@ -1,0 +1,2 @@
+# Proper nouns that doc_markdown should not ask to wrap in backticks. ".." keeps the defaults.
+doc-valid-idents = ["SQLite", ".."]

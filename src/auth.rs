@@ -1,31 +1,45 @@
 use crate::{
     AppState, db,
-    error::{AppError, Result},
+    error::{AppError, ErrorKind, Result},
 };
 use argon2::{Argon2, PasswordHash, PasswordVerifier};
 use axum::{
-    Json,
-    extract::{Request, State},
+    Extension, Json,
+    extract::{ConnectInfo, Request, State},
     http::{HeaderMap, StatusCode, header},
     middleware::Next,
     response::{IntoResponse, Response},
 };
 use base64::{Engine, engine::general_purpose::URL_SAFE_NO_PAD};
-use rand::{RngCore, rngs::OsRng};
 use serde::Deserialize;
 use serde_json::json;
 use sha2::{Digest, Sha256};
 use sqlx::Row;
-use std::sync::Arc;
+use std::{
+    collections::HashMap,
+    net::{IpAddr, SocketAddr},
+    sync::Arc,
+};
 use subtle::ConstantTimeEq;
 
-pub fn random_secret() -> String {
+/// `api_key.last_used_at` is refreshed at most once per this many seconds.
+const LAST_USED_RESOLUTION_SECS: i64 = 60;
+/// Lifetime of an admin session, in the database and in the cookie.
+const SESSION_TTL_SECS: i64 = 43200;
+
+pub(crate) fn random_secret() -> String {
     let mut bytes = [0; 32];
-    OsRng.fill_bytes(&mut bytes);
+    getrandom::fill(&mut bytes).expect("operating system random number generator failed");
     URL_SAFE_NO_PAD.encode(bytes)
 }
-pub fn hash(secret: &str) -> Vec<u8> {
+pub(crate) fn hash(secret: &str) -> Vec<u8> {
     Sha256::digest(secret.as_bytes()).to_vec()
+}
+
+/// Checks a password against a PHC-encoded Argon2 hash. The parameters come from the hash.
+pub(crate) fn verify_password(encoded: &str, password: &[u8]) -> bool {
+    PasswordHash::new(encoded)
+        .is_ok_and(|hash| Argon2::default().verify_password(password, &hash).is_ok())
 }
 
 fn single_header<'a>(headers: &'a HeaderMap, name: &str) -> Result<Option<&'a str>> {
@@ -39,7 +53,7 @@ fn single_header<'a>(headers: &'a HeaderMap, name: &str) -> Result<Option<&'a st
         .transpose()
 }
 
-pub async fn api_key(headers: &HeaderMap, state: &AppState) -> Result<String> {
+pub(crate) async fn api_key(headers: &HeaderMap, state: &AppState) -> Result<String> {
     let key = single_header(headers, "x-api-key")?;
     let bearer = match single_header(headers, "authorization")? {
         Some(value) => Some(
@@ -64,15 +78,27 @@ pub async fn api_key(headers: &HeaderMap, state: &AppState) -> Result<String> {
             .fetch_optional(&state.db)
             .await?;
     let id = id.ok_or_else(AppError::unauthorized)?;
-    sqlx::query("UPDATE api_key SET last_used_at=? WHERE id=?")
-        .bind(db::now())
-        .bind(&id)
-        .execute(&state.db)
-        .await?;
+    // `last_used_at` is informational: write it at most once a minute per key, and never fail
+    // an authenticated request because the write lost the race for SQLite's writer lock.
+    let now = chrono::Utc::now();
+    let cutoff = (now - chrono::Duration::seconds(LAST_USED_RESOLUTION_SECS))
+        .to_rfc3339_opts(chrono::SecondsFormat::Millis, true);
+    if let Err(error) = sqlx::query(
+        "UPDATE api_key SET last_used_at=? WHERE id=? AND (last_used_at IS NULL OR last_used_at<?)",
+    )
+    .bind(now.to_rfc3339_opts(chrono::SecondsFormat::Millis, true))
+    .bind(&id)
+    .bind(cutoff)
+    .execute(&state.db)
+    .await
+    {
+        crate::error::log_database_error(&error);
+        tracing::warn!("could not record key last use");
+    }
     Ok(id)
 }
 
-pub fn origin(headers: &HeaderMap, state: &AppState) -> Result<()> {
+pub(crate) fn origin(headers: &HeaderMap, state: &AppState) -> Result<()> {
     if single_header(headers, "origin")? != Some(state.config.public_origin.as_str()) {
         return Err(AppError::forbidden(
             "This action must originate from the owner dashboard",
@@ -81,7 +107,7 @@ pub fn origin(headers: &HeaderMap, state: &AppState) -> Result<()> {
     Ok(())
 }
 
-pub fn cookie_name(state: &AppState) -> &'static str {
+pub(crate) fn cookie_name(state: &AppState) -> &'static str {
     if state.config.secure_cookie {
         "__Host-router_session"
     } else {
@@ -89,7 +115,21 @@ pub fn cookie_name(state: &AppState) -> &'static str {
     }
 }
 
-pub fn session_token(headers: &HeaderMap, state: &AppState) -> Result<String> {
+/// The `Set-Cookie` value that stores `value` as the admin session for `max_age` seconds.
+/// An empty value with `max_age` 0 clears the cookie.
+fn session_cookie(state: &AppState, value: &str, max_age: i64) -> String {
+    let secure = if state.config.secure_cookie {
+        "; Secure"
+    } else {
+        ""
+    };
+    format!(
+        "{}={value}; Path=/; HttpOnly; SameSite=Strict; Max-Age={max_age}{secure}",
+        cookie_name(state)
+    )
+}
+
+pub(crate) fn session_token(headers: &HeaderMap, state: &AppState) -> Result<String> {
     let mut result = None;
     for value in headers.get_all(header::COOKIE) {
         for item in value
@@ -110,17 +150,26 @@ pub fn session_token(headers: &HeaderMap, state: &AppState) -> Result<String> {
     result.ok_or_else(AppError::unauthorized)
 }
 
-pub async fn session(headers: &HeaderMap, state: &AppState) -> Result<String> {
-    let token = session_token(headers, state)?;
-    sqlx::query_scalar("SELECT csrf_token FROM admin_session WHERE token_hash=? AND expires_at>?")
-        .bind(hash(&token))
-        .bind(db::epoch())
-        .fetch_optional(&state.db)
-        .await?
-        .ok_or_else(AppError::unauthorized)
+/// Fingerprint of the configured owner password hash. Sessions are bound to it, so changing
+/// `ADMIN_PASSWORD_HASH` signs out every existing session.
+fn password_fingerprint(state: &AppState) -> Vec<u8> {
+    hash(&state.config.password_hash)
 }
 
-pub async fn require_admin(
+pub(crate) async fn session(headers: &HeaderMap, state: &AppState) -> Result<String> {
+    let token = session_token(headers, state)?;
+    sqlx::query_scalar(
+        "SELECT csrf_token FROM admin_session WHERE token_hash=? AND expires_at>? AND password_fp=?",
+    )
+    .bind(hash(&token))
+    .bind(db::epoch())
+    .bind(password_fingerprint(state))
+    .fetch_optional(&state.db)
+    .await?
+    .ok_or_else(AppError::unauthorized)
+}
+
+pub(crate) async fn require_admin(
     State(state): State<Arc<AppState>>,
     request: Request,
     next: Next,
@@ -143,12 +192,132 @@ pub async fn require_admin(
 
 #[derive(Deserialize)]
 #[serde(deny_unknown_fields)]
-pub struct Login {
+pub(crate) struct Login {
     password: String,
 }
 
-pub async fn login(
+/// Failed sign-in throttling, kept per client address with a global backstop.
+///
+/// Each client may fail [`Self::CLIENT_FAILURES`] times per fixed [`Self::WINDOW_SECS`] window,
+/// and all clients together [`Self::GLOBAL_FAILURES`] times, so a stranger cannot lock the
+/// owner out and many addresses cannot guess quickly. An attempt reserves a failure before
+/// the password is checked, which keeps concurrent guesses from overrunning the limit; a
+/// successful sign-in releases the reservation and clears the caller's failures. At most
+/// [`Self::MAX_CLIENTS`] addresses are tracked: expired windows are pruned first, then the
+/// oldest window is evicted.
+///
+/// The client address is the socket peer, or, when `TRUSTED_PROXY_HOPS` is N > 0, the
+/// N-th `X-Forwarded-For` entry from the right (the address the outermost trusted proxy saw).
+/// IPv6 clients are grouped by /64. Requests without a usable address share one bucket.
+pub(crate) struct LoginLimiter {
+    pub(crate) trusted_proxy_hops: usize,
+    clients: HashMap<Option<IpAddr>, Window>,
+    global: Window,
+}
+
+#[derive(Clone, Copy, Default)]
+struct Window {
+    start: i64,
+    failures: u32,
+}
+impl Window {
+    fn current(&mut self, now: i64) -> &mut Self {
+        if now - self.start >= LoginLimiter::WINDOW_SECS {
+            *self = Self {
+                start: now,
+                failures: 0,
+            };
+        }
+        self
+    }
+}
+
+impl LoginLimiter {
+    pub(crate) const WINDOW_SECS: i64 = 60;
+    pub(crate) const CLIENT_FAILURES: u32 = 5;
+    pub(crate) const GLOBAL_FAILURES: u32 = 30;
+    pub(crate) const MAX_CLIENTS: usize = 4096;
+
+    pub(crate) fn new(trusted_proxy_hops: usize) -> Self {
+        Self {
+            trusted_proxy_hops,
+            clients: HashMap::new(),
+            global: Window::default(),
+        }
+    }
+
+    /// The rate-limit key for a request.
+    pub(crate) fn client(&self, headers: &HeaderMap, peer: Option<SocketAddr>) -> Option<IpAddr> {
+        let address = if self.trusted_proxy_hops > 0 {
+            let entries: Vec<&str> = headers
+                .get_all("x-forwarded-for")
+                .iter()
+                .filter_map(|v| v.to_str().ok())
+                .flat_map(|v| v.split(','))
+                .map(str::trim)
+                .collect();
+            entries
+                .len()
+                .checked_sub(self.trusted_proxy_hops)
+                .and_then(|i| entries[i].parse().ok())
+                .or_else(|| peer.map(|p| p.ip()))
+        } else {
+            peer.map(|p| p.ip())
+        };
+        address.map(|ip| match ip.to_canonical() {
+            IpAddr::V6(v6) => IpAddr::V6((u128::from(v6) & (u128::MAX << 64)).into()),
+            v4 @ IpAddr::V4(_) => v4,
+        })
+    }
+
+    /// Reserves one failed attempt for `client`, or returns false when it is throttled.
+    pub(crate) fn begin(&mut self, client: Option<IpAddr>, now: i64) -> bool {
+        if self.global.current(now).failures >= Self::GLOBAL_FAILURES
+            || self
+                .clients
+                .get_mut(&client)
+                .is_some_and(|w| w.current(now).failures >= Self::CLIENT_FAILURES)
+        {
+            return false;
+        }
+        if !self.clients.contains_key(&client) && self.clients.len() >= Self::MAX_CLIENTS {
+            self.clients
+                .retain(|_, w| now - w.start < Self::WINDOW_SECS);
+            if self.clients.len() >= Self::MAX_CLIENTS
+                && let Some(oldest) = self
+                    .clients
+                    .iter()
+                    .min_by_key(|(_, w)| w.start)
+                    .map(|(k, _)| *k)
+            {
+                self.clients.remove(&oldest);
+            }
+        }
+        self.clients
+            .entry(client)
+            .or_default()
+            .current(now)
+            .failures += 1;
+        self.global.failures += 1;
+        true
+    }
+
+    /// Releases the attempt reserved by `begin` and clears the client's failures.
+    pub(crate) fn succeeded(&mut self, client: Option<IpAddr>, now: i64) {
+        self.clients.remove(&client);
+        let global = self.global.current(now);
+        global.failures = global.failures.saturating_sub(1);
+    }
+
+    #[cfg(test)]
+    pub(crate) fn tracked_clients(&self) -> usize {
+        self.clients.len()
+    }
+}
+
+pub(crate) async fn login(
     State(state): State<Arc<AppState>>,
+    peer: Option<Extension<ConnectInfo<SocketAddr>>>,
     headers: HeaderMap,
     Json(input): Json<Login>,
 ) -> Result<Response> {
@@ -156,57 +325,53 @@ pub async fn login(
     if input.password.len() > 1024 {
         return Err(AppError::bad("Password is too long"));
     }
-    {
-        let mut limit = state.login_attempts.lock().await;
-        if db::epoch() - limit.0 >= 60 {
-            *limit = (db::epoch(), 0);
-        }
-        if limit.1 >= 5 {
-            return Err(AppError(
+    let client = {
+        let mut oauth = state.oauth.lock().await;
+        let client = oauth.login.client(&headers, peer.map(|p| p.0.0));
+        if !oauth.login.begin(client, db::epoch()) {
+            return Err(AppError::new(
+                ErrorKind::Request,
                 StatusCode::TOO_MANY_REQUESTS,
                 "rate_limit_error",
                 "Too many sign-in attempts. Wait one minute",
             ));
         }
-        limit.1 += 1;
-    }
+        client
+    };
     let encoded = state.config.password_hash.clone();
     let password = zeroize::Zeroizing::new(input.password);
-    let valid = tokio::task::spawn_blocking(move || {
-        PasswordHash::new(&encoded).is_ok_and(|hash| {
-            Argon2::default()
-                .verify_password(password.as_bytes(), &hash)
-                .is_ok()
-        })
-    })
-    .await
-    .map_err(|_| AppError::internal())?;
+    let valid = tokio::task::spawn_blocking(move || verify_password(&encoded, password.as_bytes()))
+        .await
+        .map_err(|_| AppError::internal())?;
     if !valid {
         return Err(AppError::unauthorized());
     }
+    state
+        .oauth
+        .lock()
+        .await
+        .login
+        .succeeded(client, db::epoch());
     let token = random_secret();
     let csrf = random_secret();
+    let fingerprint = password_fingerprint(&state);
     let mut tx = state.db.begin().await?;
-    sqlx::query("DELETE FROM admin_session WHERE expires_at<=?")
+    sqlx::query("DELETE FROM admin_session WHERE expires_at<=? OR password_fp<>?")
         .bind(db::epoch())
+        .bind(&fingerprint)
         .execute(&mut *tx)
         .await?;
-    sqlx::query("INSERT INTO admin_session VALUES(?,?,?)")
-        .bind(hash(&token))
-        .bind(&csrf)
-        .bind(db::epoch() + 43200)
-        .execute(&mut *tx)
-        .await?;
+    sqlx::query(
+        "INSERT INTO admin_session(token_hash,csrf_token,expires_at,password_fp) VALUES(?,?,?,?)",
+    )
+    .bind(hash(&token))
+    .bind(&csrf)
+    .bind(db::epoch() + SESSION_TTL_SECS)
+    .bind(&fingerprint)
+    .execute(&mut *tx)
+    .await?;
     tx.commit().await?;
-    let secure = if state.config.secure_cookie {
-        "; Secure"
-    } else {
-        ""
-    };
-    let cookie = format!(
-        "{}={token}; Path=/; HttpOnly; SameSite=Strict; Max-Age=43200{secure}",
-        cookie_name(&state)
-    );
+    let cookie = session_cookie(&state, &token, SESSION_TTL_SECS);
     Ok((
         [(header::SET_COOKIE, cookie)],
         Json(json!({"csrf_token":csrf})),
@@ -214,25 +379,20 @@ pub async fn login(
         .into_response())
 }
 
-pub async fn logout(State(state): State<Arc<AppState>>, headers: HeaderMap) -> Result<Response> {
+pub(crate) async fn logout(
+    State(state): State<Arc<AppState>>,
+    headers: HeaderMap,
+) -> Result<Response> {
     let token = session_token(&headers, &state)?;
     sqlx::query("DELETE FROM admin_session WHERE token_hash=?")
         .bind(hash(&token))
         .execute(&state.db)
         .await?;
-    let secure = if state.config.secure_cookie {
-        "; Secure"
-    } else {
-        ""
-    };
-    let cookie = format!(
-        "{}=; Path=/; HttpOnly; SameSite=Strict; Max-Age=0{secure}",
-        cookie_name(&state)
-    );
+    let cookie = session_cookie(&state, "", 0);
     Ok(([(header::SET_COOKIE, cookie)], StatusCode::NO_CONTENT).into_response())
 }
 
-pub async fn me(
+pub(crate) async fn me(
     State(state): State<Arc<AppState>>,
     headers: HeaderMap,
 ) -> Result<Json<serde_json::Value>> {

@@ -13,14 +13,14 @@ use sqlx::{Row, SqliteConnection};
 use std::sync::Arc;
 
 #[derive(Deserialize, Default)]
-pub struct UsageQuery {
-    pub group_by: Option<String>,
-    pub from: Option<String>,
-    pub to: Option<String>,
-    pub person_id: Option<String>,
-    pub key_id: Option<String>,
-    pub model: Option<String>,
-    pub offset: Option<u32>,
+pub(crate) struct UsageQuery {
+    pub(crate) group_by: Option<String>,
+    pub(crate) from: Option<String>,
+    pub(crate) to: Option<String>,
+    pub(crate) person_id: Option<String>,
+    pub(crate) key_id: Option<String>,
+    pub(crate) model: Option<String>,
+    pub(crate) offset: Option<u32>,
 }
 
 struct Filter {
@@ -30,7 +30,21 @@ struct Filter {
 }
 
 impl Filter {
-    fn new(query: UsageQuery) -> Result<Self> {
+    fn new(mut query: UsageQuery) -> Result<Self> {
+        // An empty parameter (`?person_id=`) means the same as an absent one. Binding `''`
+        // would match no rows and silently return an empty report.
+        for value in [
+            &mut query.group_by,
+            &mut query.from,
+            &mut query.to,
+            &mut query.person_id,
+            &mut query.key_id,
+            &mut query.model,
+        ] {
+            if value.as_deref().is_some_and(|v| v.trim().is_empty()) {
+                *value = None;
+            }
+        }
         let now = Utc::now();
         let timestamp = |value: Option<&str>, default: DateTime<Utc>| -> Result<String> {
             let date = match value {
@@ -53,27 +67,40 @@ impl Filter {
         Ok(Self { from, to, query })
     }
 
-    fn bind<'a>(
-        &'a self,
-        sql: &'a str,
-    ) -> sqlx::query::Query<'a, sqlx::Sqlite, sqlx::sqlite::SqliteArguments<'a>> {
-        sqlx::query(sql)
+    /// The FROM and WHERE clauses for this filter. The model condition is added only when a
+    /// model is given, written exactly like index `usage_endpoint_model_time` so SQLite uses it.
+    fn source(&self) -> String {
+        let mut source = SOURCE.to_owned();
+        if self.query.model.is_some() {
+            source.push_str(" AND COALESCE(u.resolved_model,u.requested_model)=?");
+        }
+        source
+    }
+
+    /// Binds the parameters of [`Self::source`], in order. `sql` may interpolate only fixed
+    /// expressions; every user filter is bound here.
+    fn bind(
+        &self,
+        sql: String,
+    ) -> sqlx::query::Query<'_, sqlx::Sqlite, sqlx::sqlite::SqliteArguments> {
+        let query = sqlx::query(sqlx::AssertSqlSafe(sql))
             .bind(&self.from)
             .bind(&self.to)
             .bind(&self.query.person_id)
             .bind(&self.query.person_id)
             .bind(&self.query.key_id)
-            .bind(&self.query.key_id)
-            .bind(&self.query.model)
-            .bind(&self.query.model)
+            .bind(&self.query.key_id);
+        match &self.query.model {
+            Some(model) => query.bind(model),
+            None => query,
+        }
     }
 }
 
 const SOURCE: &str =
     "FROM request_usage u JOIN api_key k ON k.id=u.key_id JOIN person p ON p.id=k.person_id
     WHERE u.endpoint='/v1/messages' AND u.started_at>=? AND u.started_at<?
-    AND (? IS NULL OR p.id=?) AND (? IS NULL OR k.id=?)
-    AND (? IS NULL OR COALESCE(u.resolved_model,u.requested_model)=?)";
+    AND (? IS NULL OR p.id=?) AND (? IS NULL OR k.id=?)";
 const TOTAL: &str = "CASE WHEN u.raw_usage IS NOT NULL THEN COALESCE(u.input_tokens,0)+COALESCE(u.cache_read_tokens,0)+COALESCE(u.cache_write_tokens,0)+COALESCE(u.output_tokens,0) END";
 const COUNTS: &[&str] = &[
     "requests",
@@ -97,27 +124,63 @@ const TOKENS: &[&str] = &[
     "observed_total_tokens",
 ];
 
+/// How a report groups requests. `Total` is internal; clients choose one of the others.
+#[derive(Clone, Copy)]
+enum GroupBy {
+    Total,
+    Person,
+    Key,
+    Model,
+    Day,
+}
+
+impl GroupBy {
+    fn parse(value: &str) -> Result<Self> {
+        match value {
+            "person" => Ok(Self::Person),
+            "key" => Ok(Self::Key),
+            "model" => Ok(Self::Model),
+            "day" => Ok(Self::Day),
+            _ => Err(AppError::bad("group_by must be person, key, model, or day")),
+        }
+    }
+
+    fn name(self) -> &'static str {
+        match self {
+            Self::Total => "total",
+            Self::Person => "person",
+            Self::Key => "key",
+            Self::Model => "model",
+            Self::Day => "day",
+        }
+    }
+
+    /// Fixed SQL for the group key and its display label.
+    fn sql(self) -> (&'static str, &'static str) {
+        match self {
+            Self::Total => ("'total'", "'All users'"),
+            Self::Person => ("p.id", "p.name"),
+            Self::Key => ("k.id", "p.name || ' / ' || k.label"),
+            Self::Model => (
+                "COALESCE(u.resolved_model,u.requested_model)",
+                "COALESCE(u.resolved_model,u.requested_model)",
+            ),
+            Self::Day => ("substr(u.started_at,1,10)", "substr(u.started_at,1,10)"),
+        }
+    }
+}
+
 async fn aggregate(
     conn: &mut SqliteConnection,
     filter: &Filter,
-    group: &str,
+    group: GroupBy,
 ) -> Result<Vec<Value>> {
-    let (expr, label) = match group {
-        "total" => ("'total'", "'All users'"),
-        "person" => ("p.id", "p.name"),
-        "key" => ("k.id", "p.name || ' / ' || k.label"),
-        "model" => (
-            "COALESCE(u.resolved_model,u.requested_model)",
-            "COALESCE(u.resolved_model,u.requested_model)",
-        ),
-        "day" => ("substr(u.started_at,1,10)", "substr(u.started_at,1,10)"),
-        _ => return Err(AppError::bad("group_by must be person, key, model, or day")),
+    let (expr, label) = group.sql();
+    let grouping = match group {
+        GroupBy::Total => String::new(),
+        _ => format!("GROUP BY {expr} ORDER BY {label}, {expr}"),
     };
-    let grouping = if group == "total" {
-        String::new()
-    } else {
-        format!("GROUP BY {expr} ORDER BY {label}, {expr}")
-    };
+    let source = filter.source();
     // Only fixed expressions are interpolated. Every user filter is bound.
     let sql = format!("SELECT {expr} AS id,{label} AS label,COUNT(*) AS requests,
         COUNT(CASE WHEN u.outcome='completed' THEN 1 END) AS completed_requests,
@@ -135,8 +198,8 @@ async fn aggregate(
         SUM({TOTAL}) AS observed_total_tokens,
         AVG(CASE WHEN u.outcome='completed' THEN MAX(0,(julianday(u.finished_at)-julianday(u.started_at))*86400000) END) AS average_duration_ms,
         COUNT(CASE WHEN u.outcome='completed' AND u.finished_at IS NOT NULL THEN 1 END) AS duration_samples,
-        MAX(u.started_at) AS last_used_at {SOURCE} {grouping}");
-    let rows = filter.bind(&sql).fetch_all(conn).await?;
+        MAX(u.started_at) AS last_used_at {source} {grouping}");
+    let rows = filter.bind(sql).fetch_all(conn).await?;
     Ok(rows.iter().map(|row| {
         let mut value = json!({"id":row.get::<String,_>("id"), "label":row.get::<String,_>("label"),
             "average_duration_ms":row.get::<Option<f64>,_>("average_duration_ms"),
@@ -147,23 +210,20 @@ async fn aggregate(
     }).collect())
 }
 
-pub async fn usage_report(
+pub(crate) async fn usage_report(
     State(state): State<Arc<AppState>>,
     Query(query): Query<UsageQuery>,
 ) -> Result<Json<Value>> {
     let filter = Filter::new(query)?;
-    let group = filter.query.group_by.as_deref().unwrap_or("person");
-    if !["person", "key", "model", "day"].contains(&group) {
-        return Err(AppError::bad("group_by must be person, key, model, or day"));
-    }
+    let group = GroupBy::parse(filter.query.group_by.as_deref().unwrap_or("person"))?;
     let mut conn = state.db.acquire().await?;
     let data = aggregate(&mut conn, &filter, group).await?;
     Ok(Json(
-        json!({"group_by":group,"from":filter.from,"to":filter.to,"data":data}),
+        json!({"group_by":group.name(),"from":filter.from,"to":filter.to,"data":data}),
     ))
 }
 
-pub async fn report(
+pub(crate) async fn report(
     State(state): State<Arc<AppState>>,
     Query(query): Query<UsageQuery>,
 ) -> Result<Json<Value>> {
@@ -171,16 +231,23 @@ pub async fn report(
     // One read snapshot keeps totals, charts and request history consistent during traffic.
     let mut tx = state.db.begin().await?;
     let mut result = json!({"from":filter.from,"to":filter.to});
-    for group in ["total", "person", "model", "day", "key"] {
-        result[group] = json!(aggregate(&mut tx, &filter, group).await?);
+    for group in [
+        GroupBy::Total,
+        GroupBy::Person,
+        GroupBy::Model,
+        GroupBy::Day,
+        GroupBy::Key,
+    ] {
+        result[group.name()] = json!(aggregate(&mut tx, &filter, group).await?);
     }
+    let source = filter.source();
     let sql = format!("SELECT u.id,p.id AS person_id,p.name AS person_name,k.label AS key_label,
         u.requested_model,u.resolved_model,u.response_model,u.started_at,u.finished_at,
         u.outcome,u.http_status,u.usage_state,u.input_tokens,u.cache_read_tokens,u.cache_write_tokens,u.output_tokens,
-        {TOTAL} AS observed_total_tokens {SOURCE} ORDER BY u.started_at DESC,u.id DESC LIMIT 51 OFFSET ?");
+        {TOTAL} AS observed_total_tokens {source} ORDER BY u.started_at DESC,u.id DESC LIMIT 51 OFFSET ?");
     let offset = filter.query.offset.unwrap_or(0);
     let rows = filter
-        .bind(&sql)
+        .bind(sql)
         .bind(i64::from(offset))
         .fetch_all(&mut *tx)
         .await?;

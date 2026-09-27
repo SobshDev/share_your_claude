@@ -5,13 +5,59 @@ use crate::{
 };
 use serde_json::{Value, json};
 use sha2::{Digest, Sha256};
-use std::collections::{HashMap, HashSet};
+use std::{
+    collections::{HashMap, HashSet},
+    fmt::Write as _,
+};
 
-pub fn blocked(id: &str, group: &str) -> bool {
-    group == "fable-5.1" || id == "claude-fable-5-1" || id.starts_with("claude-fable-5-1-")
+/// Catalog group of every Fable 5.1 variant. Also used by the seed migration.
+pub(crate) const FABLE_GROUP: &str = "fable-5.1";
+/// Token sequence that identifies Fable 5.1 in any spelling of an id, alias, group, or name.
+const FABLE_TOKENS: [&str; 3] = ["fable", "5", "1"];
+/// Denial returned whenever a request or admin action would expose Fable 5.1.
+pub(crate) const FABLE_RESERVED: &str = "Fable 5.1 is reserved for the owner";
+
+/// Whether a model id, alias, group, or display name refers to Fable 5.1.
+///
+/// Names are lowercased and split into runs of ASCII letters or digits, so separators such
+/// as `.`, `_`, `@`, `/`, and whitespace are equivalent, and so are letter-digit boundaries
+/// (`fable5.1`). Only a whole `fable 5 1` sequence matches: `claude-fable-5-10` does not.
+pub(crate) fn names_fable(name: &str) -> bool {
+    let lower = name.to_ascii_lowercase();
+    let mut tokens = Vec::new();
+    for part in lower.split(|c: char| !c.is_ascii_alphanumeric()) {
+        // `part` is ASCII, so byte offsets are character boundaries.
+        let mut start = 0;
+        for (i, pair) in part.as_bytes().windows(2).enumerate() {
+            if pair[0].is_ascii_digit() != pair[1].is_ascii_digit() {
+                tokens.push(&part[start..=i]);
+                start = i + 1;
+            }
+        }
+        if start < part.len() {
+            tokens.push(&part[start..]);
+        }
+    }
+    tokens
+        .windows(FABLE_TOKENS.len())
+        .any(|w| w == FABLE_TOKENS)
 }
 
-pub async fn resolve(state: &AppState, key_id: &str, requested: &str) -> Result<String> {
+/// The single rule that keeps Fable 5.1 away from friend keys.
+pub(crate) fn blocked(id: &str, group: &str) -> bool {
+    names_fable(id) || names_fable(group)
+}
+
+/// Catalog group for a model discovered upstream.
+pub(crate) fn catalog_group(id: &str, display_name: &str) -> &'static str {
+    if blocked(id, "") || names_fable(display_name) {
+        FABLE_GROUP
+    } else {
+        "claude"
+    }
+}
+
+pub(crate) async fn resolve(state: &AppState, key_id: &str, requested: &str) -> Result<String> {
     use sqlx::Row;
     let row = sqlx::query("SELECT m.id,m.model_group FROM model m JOIN key_model_grant g ON g.model_id=m.id JOIN api_key k ON k.id=g.key_id WHERE g.key_id=? AND k.revoked_at IS NULL AND m.enabled=1 AND m.reviewed_at IS NOT NULL AND m.id=COALESCE((SELECT id FROM model WHERE id=?),(SELECT model_id FROM model_alias WHERE alias=?))")
         .bind(key_id).bind(requested).bind(requested).fetch_optional(&state.db).await?
@@ -19,12 +65,12 @@ pub async fn resolve(state: &AppState, key_id: &str, requested: &str) -> Result<
     let id: String = row.get("id");
     let group: String = row.get("model_group");
     if blocked(&id, &group) {
-        return Err(AppError::forbidden("Fable 5.1 is reserved for the owner"));
+        return Err(AppError::forbidden(FABLE_RESERVED));
     }
     Ok(id)
 }
 
-pub fn validate(body: &Value, counting: bool) -> Result<()> {
+pub(crate) fn validate(body: &Value, counting: bool) -> Result<()> {
     let object = body
         .as_object()
         .ok_or_else(|| AppError::bad("Expected a JSON object"))?;
@@ -55,7 +101,7 @@ pub fn validate(body: &Value, counting: bool) -> Result<()> {
         .get("model")
         .and_then(Value::as_str)
         .ok_or_else(|| AppError::bad("model is required"))?;
-    if model.is_empty() || model.len() > 200 {
+    if model.is_empty() || model.len() > crate::proxy::MAX_MODEL_ID_BYTES {
         return Err(AppError::bad("Invalid model identifier"));
     }
     if !object.get("messages").is_some_and(Value::is_array) {
@@ -65,7 +111,7 @@ pub fn validate(body: &Value, counting: bool) -> Result<()> {
         && !object
             .get("max_tokens")
             .and_then(Value::as_u64)
-            .is_some_and(|n| n > 0 && n <= i64::MAX as u64)
+            .is_some_and(|n| n > 0 && i64::try_from(n).is_ok())
     {
         return Err(AppError::bad("max_tokens must be a positive integer"));
     }
@@ -160,7 +206,7 @@ pub fn validate(body: &Value, counting: bool) -> Result<()> {
 }
 
 #[derive(Default, Debug)]
-pub struct ToolMap {
+pub(crate) struct ToolMap {
     originals: HashMap<String, String>,
     builtins: HashSet<String>,
 }
@@ -170,13 +216,12 @@ impl ToolMap {
         // Stable bijection within a request, including names already starting with custom_.
         // 63 characters fits Anthropic's 64-character tool name limit.
         let digest = Sha256::digest(name.as_bytes());
-        let wire = format!(
-            "custom_{}",
-            digest[..28]
-                .iter()
-                .map(|b| format!("{b:02x}"))
-                .collect::<String>()
-        );
+        let mut wire = String::with_capacity(63);
+        wire.push_str("custom_");
+        for byte in &digest[..28] {
+            // Writing to a String cannot fail.
+            let _ = write!(wire, "{byte:02x}");
+        }
         if self
             .originals
             .get(&wire)
@@ -196,7 +241,7 @@ impl ToolMap {
         }
         Ok(())
     }
-    pub fn prepare(body: &mut Value) -> Result<Self> {
+    pub(crate) fn prepare(body: &mut Value) -> Result<Self> {
         let mut mapping = Self::default();
         let mut seen = std::collections::HashSet::new();
         if let Some(tools) = body.get_mut("tools").and_then(Value::as_array_mut) {
@@ -253,7 +298,7 @@ impl ToolMap {
         body["system"] = blocks.into();
         Ok(mapping)
     }
-    pub fn restore(&self, value: &mut Value) {
+    pub(crate) fn restore(&self, value: &mut Value) {
         // Only protocol tool-use blocks are rewritten, never arbitrary tool arguments or text.
         if value.get("type").and_then(Value::as_str) == Some("tool_use")
             && let Some(original) = value
