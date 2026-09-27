@@ -88,15 +88,6 @@ async fn catalog_refresh_authentication_403_requires_reconnect() {
     assert!(!body.to_string().contains("provider-secret"));
     assert_eq!(credential(&h).await.0, "needs_reauth");
 }
-/// A harness whose state was changed by `edit` before its router was built.
-fn rebuilt(mut h: Harness, edit: impl FnOnce(&mut AppState)) -> Harness {
-    // The router holds the only other references to the state; rebuild it around the change.
-    h.router = Router::new();
-    edit(Arc::get_mut(&mut h.state).unwrap());
-    h.router = app(h.state.clone());
-    h
-}
-
 /// Waits for the latest request to reach a terminal outcome and returns it with its status.
 async fn settled(h: &Harness) -> (String, Option<i64>) {
     tokio::time::timeout(Duration::from_secs(5), async {
@@ -119,7 +110,7 @@ async fn settled(h: &Harness) -> (String, Option<i64>) {
 
 #[tokio::test]
 async fn a_stream_past_the_duration_limit_ends_with_a_timeout_error() {
-    let h = rebuilt(Harness::new().await, |state| {
+    let h = Harness::new().await.rebuilt(|state| {
         state.max_stream_duration = Duration::from_millis(100);
     });
     let response = h

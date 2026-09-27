@@ -34,7 +34,7 @@ pub(super) struct Capture {
 
 #[derive(Default)]
 pub(super) struct Mock {
-    /// Calls to the API routes: messages, count_tokens, and models.
+    /// Calls to the API routes: messages, `count_tokens`, and models.
     pub(super) requests: AtomicUsize,
     /// Calls to the token endpoint (refreshes and code exchanges).
     pub(super) refreshes: AtomicUsize,
@@ -189,7 +189,7 @@ async fn mock_message(
 }
 
 /// One server-sent event named after its payload's `type`.
-fn event(payload: Value) -> String {
+pub(super) fn event(payload: Value) -> String {
     format!(
         "event: {}\ndata: {payload}\n\n",
         payload["type"].as_str().unwrap()

@@ -1,5 +1,5 @@
 //! OAuth wire constants and system compatibility are based on opencodex 2.49.0.
-//! See THIRD_PARTY_NOTICES.md. The router exclusively owns its refresh token.
+//! See `THIRD_PARTY_NOTICES.md`. The router exclusively owns its refresh token.
 use crate::{
     AppState, auth, db,
     error::{AppError, Result},
@@ -20,11 +20,11 @@ use subtle::ConstantTimeEq;
 use tokio::sync::Mutex;
 use zeroize::{Zeroize, ZeroizeOnDrop, Zeroizing};
 
-pub const CLIENT_ID: &str = "9d1c250a-e61b-44d9-88ed-5944d1962f5e";
+pub(crate) const CLIENT_ID: &str = "9d1c250a-e61b-44d9-88ed-5944d1962f5e";
 // The OAuth client registers localhost; the equivalent loopback IP is not accepted.
-pub const REDIRECT_URI: &str = "http://localhost:54545/callback";
-pub const BETA: &str = "claude-code-20250219,oauth-2025-04-20";
-pub const SYSTEM: &str = "You are a Claude agent, built on Anthropic's Claude Agent SDK.";
+pub(crate) const REDIRECT_URI: &str = "http://localhost:54545/callback";
+pub(crate) const BETA: &str = "claude-code-20250219,oauth-2025-04-20";
+pub(crate) const SYSTEM: &str = "You are a Claude agent, built on Anthropic's Claude Agent SDK.";
 
 /// Refresh when the access token expires within this many seconds.
 const REFRESH_MARGIN_SECS: i64 = 300;
@@ -36,7 +36,7 @@ const PERSIST_ATTEMPTS: u32 = 3;
 
 /// In-process owner authentication state. Every lock on `AppState::oauth` is short and never
 /// held across network or database I/O; refreshes are serialized by `refresh` instead.
-pub struct OAuthState {
+pub(crate) struct OAuthState {
     pending: Option<Pending>,
     refresh: Arc<Mutex<Refresh>>,
     /// Admin sign-in throttling (kept here so it shares `AppState`'s existing lock).
@@ -44,7 +44,7 @@ pub struct OAuthState {
 }
 impl OAuthState {
     /// `trusted_proxy_hops` configures the admin login limiter; see [`auth::LoginLimiter`].
-    pub fn new(trusted_proxy_hops: usize) -> Self {
+    pub(crate) fn new(trusted_proxy_hops: usize) -> Self {
         Self {
             pending: None,
             refresh: Arc::default(),
@@ -91,12 +91,12 @@ struct Pending {
 }
 
 #[derive(Serialize, Deserialize, Zeroize, ZeroizeOnDrop)]
-pub struct Tokens {
-    pub access_token: String,
-    pub refresh_token: String,
+pub(crate) struct Tokens {
+    pub(crate) access_token: String,
+    pub(crate) refresh_token: String,
 }
 
-pub fn encrypt(key: &[u8; 32], tokens: &Tokens) -> Result<Vec<u8>> {
+pub(crate) fn encrypt(key: &[u8; 32], tokens: &Tokens) -> Result<Vec<u8>> {
     let cipher = XChaCha20Poly1305::new(key.into());
     let mut nonce = [0; 24];
     OsRng.fill_bytes(&mut nonce);
@@ -107,7 +107,7 @@ pub fn encrypt(key: &[u8; 32], tokens: &Tokens) -> Result<Vec<u8>> {
         .map_err(|_| AppError::internal())?;
     Ok([nonce.to_vec(), ciphertext].concat())
 }
-pub fn decrypt(key: &[u8; 32], encrypted: &[u8]) -> Result<Tokens> {
+pub(crate) fn decrypt(key: &[u8; 32], encrypted: &[u8]) -> Result<Tokens> {
     if encrypted.len() < 40 {
         return Err(AppError::internal());
     }
@@ -120,7 +120,10 @@ pub fn decrypt(key: &[u8; 32], encrypted: &[u8]) -> Result<Tokens> {
     serde_json::from_slice(&plaintext).map_err(|_| AppError::internal())
 }
 
-pub async fn begin(State(state): State<Arc<AppState>>, headers: HeaderMap) -> Result<Json<Value>> {
+pub(crate) async fn begin(
+    State(state): State<Arc<AppState>>,
+    headers: HeaderMap,
+) -> Result<Json<Value>> {
     let pending = Pending {
         state: auth::random_secret(),
         verifier: auth::random_secret(),
@@ -145,7 +148,7 @@ pub async fn begin(State(state): State<Arc<AppState>>, headers: HeaderMap) -> Re
 
 #[derive(Deserialize, Zeroize, ZeroizeOnDrop)]
 #[serde(deny_unknown_fields)]
-pub struct Completion {
+pub(crate) struct Completion {
     redirect_url: String,
 }
 
@@ -183,7 +186,7 @@ fn redirect_params(redirect_url: &str) -> Result<(Zeroizing<String>, Zeroizing<S
     result
 }
 
-pub async fn complete(
+pub(crate) async fn complete(
     State(state): State<Arc<AppState>>,
     headers: HeaderMap,
     Json(input): Json<Completion>,
@@ -278,6 +281,12 @@ async fn exchange(
     request: &TokenRequest<'_>,
     refresh_fallback: Option<&str>,
 ) -> std::result::Result<(Tokens, i64), ExchangeError> {
+    #[derive(Deserialize, Zeroize, ZeroizeOnDrop)]
+    struct Reply {
+        access_token: String,
+        refresh_token: Option<String>,
+        expires_in: i64,
+    }
     let body = Zeroizing::new(serde_json::to_vec(request).map_err(|_| ExchangeError::Failed)?);
     let response = state
         .client
@@ -295,12 +304,6 @@ async fn exchange(
         } else {
             ExchangeError::Failed
         });
-    }
-    #[derive(Deserialize, Zeroize, ZeroizeOnDrop)]
-    struct Reply {
-        access_token: String,
-        refresh_token: Option<String>,
-        expires_in: i64,
     }
     let body = Zeroizing::new(
         crate::proxy::limited_body(response, 65536)
@@ -324,9 +327,9 @@ async fn exchange(
     ))
 }
 
-pub struct Access {
-    pub tokens: Tokens,
-    pub generation: i64,
+pub(crate) struct Access {
+    pub(crate) tokens: Tokens,
+    pub(crate) generation: i64,
 }
 
 /// The stored credential, decrypted.
@@ -401,7 +404,7 @@ fn unexpired(stored: Stored) -> Result<Access> {
     }
 }
 
-pub async fn access(state: &AppState) -> Result<Access> {
+pub(crate) async fn access(state: &AppState) -> Result<Access> {
     // One service replica. A credential that is not due for refresh is served without locking.
     let stored = load(state).await?;
     if stored.expires > db::epoch() + REFRESH_MARGIN_SECS {
@@ -492,7 +495,7 @@ pub async fn access(state: &AppState) -> Result<Access> {
 /// When another request already replaced that generation, returns the newer tokens without
 /// refreshing again. The credential is marked for reconnection only when the refresh itself
 /// is rejected.
-pub async fn force_refresh(state: &AppState, generation: i64) -> Result<Access> {
+pub(crate) async fn force_refresh(state: &AppState, generation: i64) -> Result<Access> {
     let refresh = state.oauth.lock().await.refresh.clone();
     let mut refresh = refresh.lock().await;
     let stored = load(state).await?;
@@ -536,7 +539,7 @@ pub async fn force_refresh(state: &AppState, generation: i64) -> Result<Access> 
     }
 }
 
-pub async fn mark_reauth(state: &AppState, generation: i64) -> Result<()> {
+pub(crate) async fn mark_reauth(state: &AppState, generation: i64) -> Result<()> {
     sqlx::query("UPDATE claude_credential SET state='needs_reauth' WHERE id=1 AND generation=?")
         .bind(generation)
         .execute(&state.db)
@@ -544,7 +547,7 @@ pub async fn mark_reauth(state: &AppState, generation: i64) -> Result<()> {
     Ok(())
 }
 
-pub fn upstream_headers(access: &Access) -> Result<reqwest::header::HeaderMap> {
+pub(crate) fn upstream_headers(access: &Access) -> Result<reqwest::header::HeaderMap> {
     use reqwest::header::{HeaderMap, HeaderValue};
     let mut h = HeaderMap::new();
     for (k, v) in [

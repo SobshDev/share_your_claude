@@ -6,18 +6,18 @@ use zeroize::Zeroizing;
 /// Database used when `DATABASE_URL` is not set.
 pub const DEFAULT_DATABASE_URL: &str = "sqlite://data/router.sqlite";
 /// Listen address used when `BIND_ADDRESS` is not set.
-pub const DEFAULT_BIND_ADDRESS: &str = "127.0.0.1:8080";
+pub(crate) const DEFAULT_BIND_ADDRESS: &str = "127.0.0.1:8080";
 
 pub struct Config {
     pub bind: SocketAddr,
     pub database_url: String,
-    pub public_origin: String,
-    pub password_hash: String,
-    pub encryption_key: Zeroizing<[u8; 32]>,
-    pub secure_cookie: bool,
+    pub(crate) public_origin: String,
+    pub(crate) password_hash: String,
+    pub(crate) encryption_key: Zeroizing<[u8; 32]>,
+    pub(crate) secure_cookie: bool,
     /// Reverse proxies in front of the router whose `X-Forwarded-For` entries are trusted
     /// when throttling admin sign-ins. 0 uses the socket peer address.
-    pub trusted_proxy_hops: usize,
+    pub(crate) trusted_proxy_hops: usize,
 }
 
 impl Config {
@@ -111,7 +111,7 @@ pub fn bind_address(value: Option<String>) -> anyhow::Result<SocketAddr> {
 /// Shared upstream client. It bounds connecting and each read, with no total timeout: every
 /// non-streaming call sets its own request timeout, and streams are bounded by
 /// [`crate::proxy::MAX_STREAM_DURATION`].
-pub fn http_client() -> anyhow::Result<reqwest::Client> {
+pub(crate) fn http_client() -> anyhow::Result<reqwest::Client> {
     Ok(reqwest::Client::builder()
         .redirect(reqwest::redirect::Policy::none())
         .retry(reqwest::retry::never())

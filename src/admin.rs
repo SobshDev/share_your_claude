@@ -1,6 +1,6 @@
 use crate::{
     AppState, auth, db,
-    error::{AppError, Result},
+    error::{AppError, ErrorKind, Result},
     oauth, policy, proxy,
 };
 use askama::Template;
@@ -18,7 +18,7 @@ use sqlx::Row;
 use std::{collections::HashMap, sync::Arc};
 
 /// Upper bound for each upstream catalog page request, including its body.
-pub const CATALOG_REQUEST_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(30);
+pub(crate) const CATALOG_REQUEST_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(30);
 
 const JS: &str = "text/javascript; charset=utf-8";
 const CSS: &str = "text/css; charset=utf-8";
@@ -38,18 +38,21 @@ const VERSIONED_ASSET_CACHE: &str = "public, max-age=31536000, immutable";
 
 /// Content hash of every embedded asset. Templates add it to asset URLs as `?v=`, so any
 /// change to an asset gives the pages new URLs and browsers never run stale scripts.
-pub static ASSET_VERSION: std::sync::LazyLock<String> = std::sync::LazyLock::new(|| {
+pub(crate) static ASSET_VERSION: std::sync::LazyLock<String> = std::sync::LazyLock::new(|| {
     use sha2::{Digest, Sha256};
+    use std::fmt::Write as _;
     let mut hasher = Sha256::new();
     for (path, _, body) in ASSETS {
         hasher.update(path.as_bytes());
         hasher.update((body.len() as u64).to_le_bytes());
         hasher.update(body.as_bytes());
     }
-    hasher.finalize()[..8]
-        .iter()
-        .map(|byte| format!("{byte:02x}"))
-        .collect()
+    let mut version = String::with_capacity(16);
+    for byte in &hasher.finalize()[..8] {
+        // Writing to a String cannot fail.
+        let _ = write!(version, "{byte:02x}");
+    }
+    version
 });
 
 /// Serves an embedded asset. Only a URL carrying the current version may be cached for good;
@@ -71,7 +74,7 @@ fn asset(query: Option<&str>, content_type: &'static str, body: &'static str) ->
         .into_response()
 }
 
-pub fn routes(state: Arc<AppState>) -> Router<Arc<AppState>> {
+pub(crate) fn routes(state: Arc<AppState>) -> Router<Arc<AppState>> {
     let protected = Router::new()
         .route("/admin/api/me", get(auth::me))
         .route("/admin/api/logout", post(auth::logout))
@@ -154,10 +157,11 @@ fn page_error() -> Response {
     )
         .into_response()
 }
-pub async fn ready(State(state): State<Arc<AppState>>) -> Result<&'static str> {
+pub(crate) async fn ready(State(state): State<Arc<AppState>>) -> Result<&'static str> {
     // Load balancers stop routing here once shutdown has begun.
     if state.phase() != crate::Phase::Serving {
-        return Err(AppError(
+        return Err(AppError::new(
+            ErrorKind::Request,
             StatusCode::SERVICE_UNAVAILABLE,
             "overloaded_error",
             "The router is shutting down",

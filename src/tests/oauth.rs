@@ -106,14 +106,14 @@ async fn oauth_state_is_session_bound_and_consumed_once() {
         200
     );
     {
+        use base64::Engine;
+        use sha2::Digest;
         let captures = h.mock.token_captures.lock().await;
         assert_eq!(captures.len(), 1);
         let exchange = &captures[0];
         assert_eq!(exchange["redirect_uri"], "http://localhost:54545/callback");
         assert_eq!(exchange["code"], "abc");
         assert_eq!(exchange["state"], params["state"].as_ref());
-        use base64::Engine;
-        use sha2::Digest;
         let challenge = base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(
             sha2::Sha256::digest(exchange["code_verifier"].as_str().unwrap().as_bytes()),
         );
@@ -579,10 +579,9 @@ async fn unreadable_credential_requires_reconnect_and_reconnecting_restores_it()
     for secret in ["owner-access-must-not-leak", "owner-refresh"] {
         assert!(!output.contains(secret));
     }
-    use base64::Engine;
     for encoding in [
-        base64::engine::general_purpose::STANDARD.encode(&stored),
-        base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(&stored),
+        base64::Engine::encode(&base64::engine::general_purpose::STANDARD, &stored),
+        base64::Engine::encode(&base64::engine::general_purpose::URL_SAFE_NO_PAD, &stored),
     ] {
         assert!(!output.contains(&encoding[..16]));
     }

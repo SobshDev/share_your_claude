@@ -1,6 +1,6 @@
 use crate::{
     AppState, PER_KEY_CONCURRENCY, auth,
-    error::{self, AppError, Result},
+    error::{self, AppError, ErrorKind, Result},
     oauth,
     policy::{self, ToolMap},
     usage::{self, RequestGuard, Usage},
@@ -22,29 +22,29 @@ use tokio::sync::{OwnedSemaphorePermit, Semaphore, mpsc};
 use tokio_stream::wrappers::ReceiverStream;
 
 /// Largest request body a friend may send to the two POST routes.
-pub const MAX_REQUEST_BODY_BYTES: usize = 32 * 1024 * 1024;
+pub(crate) const MAX_REQUEST_BODY_BYTES: usize = 32 * 1024 * 1024;
 /// Largest non-streaming upstream reply the router buffers.
 pub(crate) const MAX_RESPONSE_BODY_BYTES: usize = 32 * 1024 * 1024;
 /// Largest upstream error body read to learn its error type.
 const MAX_ERROR_BODY_BYTES: usize = 64 * 1024;
 /// Largest server-sent event buffered from upstream before the stream counts as malformed.
-pub const MAX_SSE_EVENT_BYTES: usize = 4 * 1024 * 1024;
+pub(crate) const MAX_SSE_EVENT_BYTES: usize = 4 * 1024 * 1024;
 /// Longest model identifier the router accepts and records.
-pub const MAX_MODEL_ID_BYTES: usize = 200;
+pub(crate) const MAX_MODEL_ID_BYTES: usize = 200;
 /// Longest upstream `request-id` the router records.
 const MAX_UPSTREAM_REQUEST_ID_BYTES: usize = 200;
 /// Stream chunks buffered between the upstream reader and the client.
 const STREAM_CHANNEL_CAPACITY: usize = 4;
 /// How long a client may stop reading a stream before the router abandons it.
-pub const CLIENT_SEND_TIMEOUT: Duration = Duration::from_secs(120);
+pub(crate) const CLIENT_SEND_TIMEOUT: Duration = Duration::from_secs(120);
 /// Upper bound for a non-streaming `/v1/messages` call, including its reply body. It matches
 /// the `x-stainless-timeout` the router announces upstream.
-pub const MESSAGE_TIMEOUT: Duration = Duration::from_secs(600);
+pub(crate) const MESSAGE_TIMEOUT: Duration = Duration::from_secs(600);
 /// Upper bound for a `count_tokens` call, including its reply body.
-pub const COUNT_TOKENS_TIMEOUT: Duration = Duration::from_secs(60);
+pub(crate) const COUNT_TOKENS_TIMEOUT: Duration = Duration::from_secs(60);
 /// Longest a relayed stream may run. A stream still open after this ends with a
 /// `timeout_error` event and is recorded as interrupted.
-pub const MAX_STREAM_DURATION: Duration = Duration::from_secs(60 * 60);
+pub(crate) const MAX_STREAM_DURATION: Duration = Duration::from_secs(60 * 60);
 /// How long the router tries to deliver the sanitized error event that ends a failed stream.
 const STREAM_ERROR_SEND_TIMEOUT: Duration = Duration::from_secs(5);
 /// Seconds a client should wait before retrying when admission is saturated.
@@ -55,7 +55,7 @@ const MODEL_MISMATCH: &str = "Claude answered with a different model than reques
 const STREAM_ERROR: &str = "Claude ended the stream with an error";
 /// Client-requested betas reviewed for pass-through. The router's own compatibility betas,
 /// [`oauth::BETA`], are always sent and may also be requested.
-pub const CLIENT_BETAS: &[&str] = &[
+pub(crate) const CLIENT_BETAS: &[&str] = &[
     "prompt-caching-2024-07-31",
     "interleaved-thinking-2025-05-14",
     "fine-grained-tool-streaming-2025-05-14",
@@ -65,10 +65,10 @@ type Chunk = std::result::Result<Bytes, io::Error>;
 
 /// Id of the router key that authenticated the request, set by [`authenticate`].
 #[derive(Clone)]
-pub struct KeyId(String);
+pub(crate) struct KeyId(String);
 
 /// Authenticates the router key from the headers alone, before any request body is read.
-pub async fn authenticate(
+pub(crate) async fn authenticate(
     State(state): State<Arc<AppState>>,
     mut request: Request,
     next: Next,
@@ -95,7 +95,7 @@ fn json_body(headers: &HeaderMap, body: &[u8]) -> Result<Value> {
     serde_json::from_slice(body).map_err(|_| AppError::bad("Invalid JSON body"))
 }
 
-pub async fn messages(
+pub(crate) async fn messages(
     State(state): State<Arc<AppState>>,
     Extension(KeyId(key)): Extension<KeyId>,
     headers: HeaderMap,
@@ -104,7 +104,7 @@ pub async fn messages(
     let body = json_body(&headers, &body)?;
     forward(state, key, headers, body, false).await
 }
-pub async fn count_tokens(
+pub(crate) async fn count_tokens(
     State(state): State<Arc<AppState>>,
     Extension(KeyId(key)): Extension<KeyId>,
     headers: HeaderMap,
@@ -114,7 +114,7 @@ pub async fn count_tokens(
     forward(state, key, headers, body, true).await
 }
 
-pub async fn models(
+pub(crate) async fn models(
     State(state): State<Arc<AppState>>,
     Extension(KeyId(key)): Extension<KeyId>,
 ) -> Result<Json<Value>> {
@@ -145,7 +145,7 @@ pub async fn models(
     })))
 }
 
-pub async fn limited_body(response: reqwest::Response, limit: usize) -> Result<Vec<u8>> {
+pub(crate) async fn limited_body(response: reqwest::Response, limit: usize) -> Result<Vec<u8>> {
     read_body(response, limit)
         .await
         .map_err(|_| AppError::upstream())
@@ -252,7 +252,7 @@ async fn forward(
     let mut guard = RequestGuard::new(state.db.clone(), id.clone());
     let admitted = match admit(&state, &key, &id, &headers, body, &requested, counting).await {
         Ok(v) => v,
-        Err(e) => return fail(&mut guard, "denied", e.0.as_u16(), true, e).await,
+        Err(e) => return fail(&mut guard, "denied", e.status().as_u16(), true, e).await,
     };
     let permits = match acquire(&state, &key, counting) {
         Ok(v) => v,
@@ -270,21 +270,23 @@ async fn forward(
         Ok(v) => v,
         Err(e) => {
             log_failure(&id, endpoint, "credential", None);
-            return fail(&mut guard, "upstream_error", e.0.as_u16(), true, e).await;
+            return fail(&mut guard, "upstream_error", e.status().as_u16(), true, e).await;
         }
     };
     let streaming = !counting && admitted.body.get("stream") == Some(&Value::Bool(true));
     let sent = send_upstream(&state, &id, endpoint, &access, &admitted, streaming).await;
     let mut response = match sent {
         Ok(r) => r,
-        Err(e) => return fail(&mut guard, "upstream_error", e.0.as_u16(), false, e).await,
+        Err(e) => return fail(&mut guard, "upstream_error", e.status().as_u16(), false, e).await,
     };
     record_upstream(&state, &id, &response).await?;
     if response.status() == StatusCode::UNAUTHORIZED {
         (response, access) =
             match retry_unauthorized(&state, &id, endpoint, &access, &admitted, counting).await {
                 Ok(v) => v,
-                Err(e) => return fail(&mut guard, "upstream_error", e.0.as_u16(), true, e).await,
+                Err(e) => {
+                    return fail(&mut guard, "upstream_error", e.status().as_u16(), true, e).await;
+                }
             };
         record_upstream(&state, &id, &response).await?;
     }
@@ -330,7 +332,8 @@ async fn admit(
 /// then a global one; token counts use their own pool.
 fn acquire(state: &AppState, key: &str, counting: bool) -> Result<Permits> {
     let busy = |_| {
-        AppError(
+        AppError::new(
+            ErrorKind::Request,
             StatusCode::TOO_MANY_REQUESTS,
             "rate_limit_error",
             "The router is busy. Try again shortly",
@@ -346,7 +349,7 @@ fn acquire(state: &AppState, key: &str, counting: bool) -> Result<Permits> {
         let mut keys = state
             .key_admission
             .lock()
-            .unwrap_or_else(|poisoned| poisoned.into_inner());
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
         // Acquired under the lock so pruning cannot drop a semaphore that is about to be used.
         keys.retain(|_, semaphore| semaphore.available_permits() < PER_KEY_CONCURRENCY);
         keys.entry(key.to_owned())
@@ -354,7 +357,8 @@ fn acquire(state: &AppState, key: &str, counting: bool) -> Result<Permits> {
             .clone()
             .try_acquire_owned()
             .map_err(|_| {
-                AppError(
+                AppError::new(
+                    ErrorKind::Request,
                     StatusCode::TOO_MANY_REQUESTS,
                     "rate_limit_error",
                     "This key has too many requests in progress. Try again shortly",
@@ -467,7 +471,8 @@ async fn retry_unauthorized(
         .inspect_err(|_| log_failure(id, endpoint, "refresh", Some(401)))?;
     if !counting {
         log_failure(id, endpoint, "unauthorized", Some(401));
-        return Err(AppError(
+        return Err(AppError::new(
+            ErrorKind::Upstream,
             StatusCode::SERVICE_UNAVAILABLE,
             "api_error",
             "The router renewed its Claude session. Retry the request",
@@ -522,7 +527,8 @@ async fn handle_error_status(
     } else {
         status
     };
-    let mut result = AppError(
+    let mut result = AppError::new(
+        ErrorKind::Upstream,
         code,
         error::error_type(code),
         "Claude rejected the request. Check the model, connection, or retry later",
@@ -623,10 +629,10 @@ async fn finish_json(
         return fail(guard, "upstream_error", 502, false, AppError::upstream()).await;
     };
     if counting {
-        if !value
+        if value
             .get("input_tokens")
             .and_then(Value::as_i64)
-            .is_some_and(|n| n >= 0)
+            .is_none_or(|n| n < 0)
         {
             malformed();
             return fail(guard, "upstream_error", 502, true, AppError::upstream()).await;
@@ -642,7 +648,7 @@ async fn finish_json(
             return fail(guard, "upstream_error", 502, false, AppError::upstream()).await;
         }
         if let Err(error) = verify_response_model(state, id, &model, value.get("model")).await {
-            let category = if error.2 == MODEL_MISMATCH {
+            let category = if error.kind() == ErrorKind::ModelMismatch {
                 "model_mismatch"
             } else {
                 "internal"
@@ -680,7 +686,8 @@ async fn verify_response_model(
             .execute(&state.db)
             .await?;
         if actual != expected {
-            return Err(AppError(
+            return Err(AppError::new(
+                ErrorKind::ModelMismatch,
                 StatusCode::BAD_GATEWAY,
                 "api_error",
                 MODEL_MISMATCH,
@@ -708,16 +715,13 @@ enum StreamError {
 impl From<AppError> for StreamError {
     fn from(error: AppError) -> Self {
         // Database failures surface as internal errors; everything else came from upstream.
-        if error.0 == StatusCode::INTERNAL_SERVER_ERROR {
-            Self::Internal
-        } else {
-            let category = match error.2 {
-                MODEL_MISMATCH => "model_mismatch",
-                STREAM_ERROR => "stream_error",
-                _ => "malformed",
-            };
-            Self::Upstream(error.1, category)
-        }
+        let category = match error.kind() {
+            ErrorKind::Internal => return Self::Internal,
+            ErrorKind::ModelMismatch => "model_mismatch",
+            ErrorKind::StreamError => "stream_error",
+            ErrorKind::Request | ErrorKind::Upstream | ErrorKind::Reauth => "malformed",
+        };
+        Self::Upstream(error.error_type(), category)
     }
 }
 
@@ -738,7 +742,7 @@ async fn stream_response(
     let mut phase = state.phase.subscribe();
     loop {
         let chunk = tokio::select! {
-            _ = tx.closed() => { guard.finish("interrupted",Some(200),false).await?; return Ok(()); }
+            () = tx.closed() => { guard.finish("interrupted",Some(200),false).await?; return Ok(()); }
             () = &mut deadline => return Err(StreamError::TooLong),
             true = async { phase.wait_for(|p| *p == crate::Phase::Stopping).await.is_ok() } => {
                 // Keep the counts seen so far before the stream is recorded as interrupted.
@@ -868,7 +872,12 @@ impl StreamProgress {
                     .and_then(Value::as_str)
                     .and_then(error::known_error_type)
                     .unwrap_or("api_error");
-                return Err(AppError(StatusCode::BAD_GATEWAY, kind, STREAM_ERROR));
+                return Err(AppError::new(
+                    ErrorKind::StreamError,
+                    StatusCode::BAD_GATEWAY,
+                    kind,
+                    STREAM_ERROR,
+                ));
             }
             "message_stop" => {
                 if !self.started {
@@ -894,7 +903,7 @@ impl StreamProgress {
 /// Incremental server-sent events decoder. Lines may end in `\n`, `\r\n`, or a bare `\r`, and a
 /// blank line ends an event. Each buffered byte is examined for a line ending once.
 #[derive(Default)]
-pub struct SseDecoder {
+pub(crate) struct SseDecoder {
     buffer: Vec<u8>,
     /// First buffered byte not yet examined for a line ending.
     scan_from: usize,
@@ -905,20 +914,20 @@ pub struct SseDecoder {
     #[cfg(test)]
     pub(crate) scanned: usize,
 }
-pub struct Event {
+pub(crate) struct Event {
     pub(crate) kind: String,
     pub(crate) data: Option<String>,
     pub(crate) raw: String,
 }
 impl SseDecoder {
-    pub fn push(&mut self, chunk: &[u8]) -> Result<()> {
+    pub(crate) fn push(&mut self, chunk: &[u8]) -> Result<()> {
         if self.buffer.len() + chunk.len() > MAX_SSE_EVENT_BYTES {
             return Err(AppError::upstream());
         }
         self.buffer.extend_from_slice(chunk);
         Ok(())
     }
-    pub fn next_event(&mut self) -> Result<Option<Event>> {
+    pub(crate) fn next_event(&mut self) -> Result<Option<Event>> {
         loop {
             if self.after_cr {
                 match self.buffer.get(self.scan_from) {

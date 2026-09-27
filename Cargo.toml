@@ -39,6 +39,27 @@ tempfile = "3"
 tokio = { version = "1", features = ["process"] }
 tower = { version = "0.5", features = ["util"] }
 
+# Editors and plain `cargo clippy` runs see the same policy as CI, which adds -D warnings.
+[lints.rust]
+unsafe_code = "forbid"
+
+# A curated subset of clippy::pedantic. The whole group is mostly noise for a binary crate.
+[lints.clippy]
+cast_possible_truncation = "warn"
+cast_possible_wrap = "warn"
+cast_sign_loss = "warn"
+checked_conversions = "warn"
+doc_markdown = "warn"
+format_collect = "warn"
+format_push_string = "warn"
+ignored_unit_patterns = "warn"
+items_after_statements = "warn"
+manual_let_else = "warn"
+match_wildcard_for_single_variants = "warn"
+nonminimal_bool = "warn"
+redundant_closure_for_method_calls = "warn"
+single_match_else = "warn"
+
 [profile.release]
 lto = "thin"
 strip = true

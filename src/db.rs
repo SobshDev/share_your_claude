@@ -11,13 +11,13 @@ use std::{
     time::Duration,
 };
 
-pub fn now() -> String {
+pub(crate) fn now() -> String {
     chrono::Utc::now().to_rfc3339_opts(chrono::SecondsFormat::Millis, true)
 }
-pub fn id() -> String {
+pub(crate) fn id() -> String {
     uuid::Uuid::new_v4().to_string()
 }
-pub fn epoch() -> i64 {
+pub(crate) fn epoch() -> i64 {
     chrono::Utc::now().timestamp()
 }
 
@@ -137,7 +137,7 @@ pub async fn interrupt_in_flight(pool: &SqlitePool) -> Result<u64, sqlx::Error> 
 
 /// Startup repair after an unclean stop. Leftover `in_progress` rows become interrupted with a
 /// NULL `finished_at`, because the time the process actually stopped is unknown.
-pub async fn recover(pool: &SqlitePool) -> Result<(), sqlx::Error> {
+pub(crate) async fn recover(pool: &SqlitePool) -> Result<(), sqlx::Error> {
     interrupt(pool, None).await?;
     sqlx::query("DELETE FROM admin_session WHERE expires_at <= ?")
         .bind(epoch())

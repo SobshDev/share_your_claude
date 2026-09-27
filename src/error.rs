@@ -7,7 +7,7 @@ use axum::{
 };
 use serde_json::json;
 
-pub type Result<T> = std::result::Result<T, AppError>;
+pub(crate) type Result<T> = std::result::Result<T, AppError>;
 
 /// Every error type Anthropic documents. Only these strings are relayed from upstream.
 const ERROR_TYPES: &[&str] = &[
@@ -24,7 +24,7 @@ const ERROR_TYPES: &[&str] = &[
 ];
 
 /// Anthropic's error type for an HTTP status.
-pub fn error_type(status: StatusCode) -> &'static str {
+pub(crate) fn error_type(status: StatusCode) -> &'static str {
     match status.as_u16() {
         401 => "authentication_error",
         402 => "billing_error",
@@ -40,13 +40,13 @@ pub fn error_type(status: StatusCode) -> &'static str {
 }
 
 /// Returns the router's copy of a documented error type, or `None` for anything else.
-pub fn known_error_type(kind: &str) -> Option<&'static str> {
+pub(crate) fn known_error_type(kind: &str) -> Option<&'static str> {
     ERROR_TYPES.iter().copied().find(|known| *known == kind)
 }
 
 /// Gives error responses that axum produces itself (unmatched methods, body limits, extractor
 /// rejections) Anthropic's error envelope. Their plain-text detail is replaced, never relayed.
-pub async fn envelope_rejections(request: Request, next: Next) -> Response {
+pub(crate) async fn envelope_rejections(request: Request, next: Next) -> Response {
     let response = next.run(request).await;
     let status = response.status();
     let plain = response
@@ -67,7 +67,7 @@ pub async fn envelope_rejections(request: Request, next: Next) -> Response {
     };
     parts.headers.remove(header::CONTENT_TYPE);
     parts.headers.remove(header::CONTENT_LENGTH);
-    let (envelope, body) = AppError(status, error_type(status), message)
+    let (envelope, body) = AppError::new(ErrorKind::Request, status, error_type(status), message)
         .into_response()
         .into_parts();
     parts.headers.extend(envelope.headers);
@@ -89,54 +89,124 @@ async fn rejection_message(body: axum::body::Body) -> &'static str {
     }
 }
 
+/// What failed. Callers branch on this instead of on the status code or message.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum ErrorKind {
+    /// The request was refused: invalid, unauthenticated, forbidden, over a limit, or sent
+    /// while the router shuts down.
+    Request,
+    /// The router itself failed, for example on a database error.
+    Internal,
+    /// Claude was unreachable, refused the request, or sent a reply the router cannot use.
+    Upstream,
+    /// Claude answered with a different model than the one requested.
+    ModelMismatch,
+    /// Claude ended a stream with an error event.
+    StreamError,
+    /// The stored Claude credential is unusable until the owner reconnects.
+    Reauth,
+}
+
+/// An error response in Anthropic's envelope: `{"type":"error","error":{"type","message"}}`.
 #[derive(Debug)]
-pub struct AppError(pub StatusCode, pub &'static str, pub &'static str);
+pub(crate) struct AppError {
+    kind: ErrorKind,
+    status: StatusCode,
+    /// Anthropic error type sent as `error.type`.
+    error_type: &'static str,
+    message: &'static str,
+}
 
 impl AppError {
-    pub fn bad(message: &'static str) -> Self {
-        Self(StatusCode::BAD_REQUEST, "invalid_request_error", message)
+    pub(crate) fn new(
+        kind: ErrorKind,
+        status: StatusCode,
+        error_type: &'static str,
+        message: &'static str,
+    ) -> Self {
+        Self {
+            kind,
+            status,
+            error_type,
+            message,
+        }
     }
-    pub fn unauthorized() -> Self {
-        Self(
+    pub(crate) fn bad(message: &'static str) -> Self {
+        Self::new(
+            ErrorKind::Request,
+            StatusCode::BAD_REQUEST,
+            "invalid_request_error",
+            message,
+        )
+    }
+    pub(crate) fn unauthorized() -> Self {
+        Self::new(
+            ErrorKind::Request,
             StatusCode::UNAUTHORIZED,
             "authentication_error",
             "Authentication required",
         )
     }
-    pub fn forbidden(message: &'static str) -> Self {
-        Self(StatusCode::FORBIDDEN, "permission_error", message)
+    pub(crate) fn forbidden(message: &'static str) -> Self {
+        Self::new(
+            ErrorKind::Request,
+            StatusCode::FORBIDDEN,
+            "permission_error",
+            message,
+        )
     }
-    pub fn internal() -> Self {
-        Self(
+    pub(crate) fn internal() -> Self {
+        Self::new(
+            ErrorKind::Internal,
             StatusCode::INTERNAL_SERVER_ERROR,
             "api_error",
             "The router could not complete this operation",
         )
     }
-    pub fn upstream() -> Self {
-        Self(
+    pub(crate) fn upstream() -> Self {
+        Self::new(
+            ErrorKind::Upstream,
             StatusCode::BAD_GATEWAY,
             "api_error",
             "Claude could not complete this request; try again later",
         )
     }
-    pub fn reauth() -> Self {
-        Self(
+    pub(crate) fn reauth() -> Self {
+        Self::new(
+            ErrorKind::Reauth,
             StatusCode::SERVICE_UNAVAILABLE,
             "authentication_error",
             "The owner must reconnect Claude in the dashboard",
         )
     }
-    pub fn not_found(message: &'static str) -> Self {
-        Self(StatusCode::NOT_FOUND, "not_found_error", message)
+    pub(crate) fn not_found(message: &'static str) -> Self {
+        Self::new(
+            ErrorKind::Request,
+            StatusCode::NOT_FOUND,
+            "not_found_error",
+            message,
+        )
+    }
+    pub(crate) fn kind(&self) -> ErrorKind {
+        self.kind
+    }
+    pub(crate) fn status(&self) -> StatusCode {
+        self.status
+    }
+    pub(crate) fn error_type(&self) -> &'static str {
+        self.error_type
+    }
+    #[cfg(test)]
+    pub(crate) fn message(&self) -> &'static str {
+        self.message
     }
 }
 
 impl IntoResponse for AppError {
     fn into_response(self) -> Response {
         (
-            self.0,
-            Json(json!({"type":"error","error":{"type":self.1,"message":self.2}})),
+            self.status,
+            Json(json!({"type":"error","error":{"type":self.error_type,"message":self.message}})),
         )
             .into_response()
     }
@@ -153,7 +223,7 @@ impl From<sqlx::Error> for AppError {
 /// (the `?` that converted it). Database messages can contain values, so only the error kind,
 /// SQLite's result code, and the I/O error kind are logged.
 #[track_caller]
-pub fn log_database_error(error: &sqlx::Error) {
+pub(crate) fn log_database_error(error: &sqlx::Error) {
     use sqlx::error::ErrorKind;
     let at = std::panic::Location::caller();
     let (kind, code) = match error {
@@ -165,7 +235,7 @@ pub fn log_database_error(error: &sqlx::Error) {
                 ErrorKind::CheckViolation => "check_violation",
                 _ => "database",
             };
-            (kind, error.code().map(|code| code.into_owned()))
+            (kind, error.code().map(std::borrow::Cow::into_owned))
         }
         sqlx::Error::PoolTimedOut => ("pool_timed_out", None),
         sqlx::Error::PoolClosed => ("pool_closed", None),

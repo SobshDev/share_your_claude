@@ -17,9 +17,14 @@ async fn with_upstream(h: &Harness, service: Router) -> (Router, tokio::task::Jo
         secure_cookie: false,
         trusted_proxy_hops: 0,
     };
-    let mut state = AppState::new(config, h.state.db.clone()).unwrap();
-    Arc::get_mut(&mut state).unwrap().upstream = format!("http://{address}");
-    (app(state), server)
+    let state = AppState::with_endpoints(
+        config,
+        h.state.db.clone(),
+        format!("http://{address}"),
+        TOKEN_ENDPOINT.into(),
+    )
+    .unwrap();
+    (app(Arc::new(state)), server)
 }
 
 /// Calls an admin route on `router` with the harness session.
@@ -424,10 +429,7 @@ async fn fable_stream(State(calls): State<Arc<AtomicUsize>>, Json(body): Json<Va
         json!({"type":"message_delta","delta":{"stop_reason":"end_turn","model":"claude-fable-5-1"},"usage":{"output_tokens":2}}),
         json!({"type":"message_stop"}),
     ];
-    let stream: String = events
-        .iter()
-        .map(|e| format!("event: {}\ndata: {e}\n\n", e["type"].as_str().unwrap()))
-        .collect();
+    let stream: String = events.into_iter().map(event).collect();
     ([("content-type", "text/event-stream")], stream).into_response()
 }
 
