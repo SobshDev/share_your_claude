@@ -77,12 +77,13 @@ impl Filter {
         source
     }
 
-    /// Binds the parameters of [`Self::source`], in order.
-    fn bind<'a>(
-        &'a self,
-        sql: &'a str,
-    ) -> sqlx::query::Query<'a, sqlx::Sqlite, sqlx::sqlite::SqliteArguments<'a>> {
-        let query = sqlx::query(sql)
+    /// Binds the parameters of [`Self::source`], in order. `sql` may interpolate only fixed
+    /// expressions; every user filter is bound here.
+    fn bind(
+        &self,
+        sql: String,
+    ) -> sqlx::query::Query<'_, sqlx::Sqlite, sqlx::sqlite::SqliteArguments> {
+        let query = sqlx::query(sqlx::AssertSqlSafe(sql))
             .bind(&self.from)
             .bind(&self.to)
             .bind(&self.query.person_id)
@@ -198,7 +199,7 @@ async fn aggregate(
         AVG(CASE WHEN u.outcome='completed' THEN MAX(0,(julianday(u.finished_at)-julianday(u.started_at))*86400000) END) AS average_duration_ms,
         COUNT(CASE WHEN u.outcome='completed' AND u.finished_at IS NOT NULL THEN 1 END) AS duration_samples,
         MAX(u.started_at) AS last_used_at {source} {grouping}");
-    let rows = filter.bind(&sql).fetch_all(conn).await?;
+    let rows = filter.bind(sql).fetch_all(conn).await?;
     Ok(rows.iter().map(|row| {
         let mut value = json!({"id":row.get::<String,_>("id"), "label":row.get::<String,_>("label"),
             "average_duration_ms":row.get::<Option<f64>,_>("average_duration_ms"),
@@ -246,7 +247,7 @@ pub(crate) async fn report(
         {TOTAL} AS observed_total_tokens {source} ORDER BY u.started_at DESC,u.id DESC LIMIT 51 OFFSET ?");
     let offset = filter.query.offset.unwrap_or(0);
     let rows = filter
-        .bind(&sql)
+        .bind(sql)
         .bind(i64::from(offset))
         .fetch_all(&mut *tx)
         .await?;

@@ -4,7 +4,7 @@ Shared Router is a small, single-maintainer project that holds a Claude account 
 
 ## Development setup
 
-You need Rust 1.88 or newer and a C compiler (SQLite is compiled in). [README.md](README.md) explains how to run the router locally, and [docs/architecture.md](docs/architecture.md) maps the modules and the request flow.
+You need Rust 1.94 or newer and a C compiler (SQLite is compiled in). [README.md](README.md) explains how to run the router locally, and [docs/architecture.md](docs/architecture.md) maps the modules and the request flow.
 
 Run these before opening a pull request; CI runs the first three:
 
