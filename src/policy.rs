@@ -10,64 +10,12 @@ use std::{
     fmt::Write as _,
 };
 
-/// Catalog group of every Fable 5.1 variant. Also used by the seed migration.
-pub(crate) const FABLE_GROUP: &str = "fable-5.1";
-/// Token sequence that identifies Fable 5.1 in any spelling of an id, alias, group, or name.
-const FABLE_TOKENS: [&str; 3] = ["fable", "5", "1"];
-/// Denial returned whenever a request or admin action would expose Fable 5.1.
-pub(crate) const FABLE_RESERVED: &str = "Fable 5.1 is reserved for the owner";
-
-/// Whether a model id, alias, group, or display name refers to Fable 5.1.
-///
-/// Names are lowercased and split into runs of ASCII letters or digits, so separators such
-/// as `.`, `_`, `@`, `/`, and whitespace are equivalent, and so are letter-digit boundaries
-/// (`fable5.1`). Only a whole `fable 5 1` sequence matches: `claude-fable-5-10` does not.
-pub(crate) fn names_fable(name: &str) -> bool {
-    let lower = name.to_ascii_lowercase();
-    let mut tokens = Vec::new();
-    for part in lower.split(|c: char| !c.is_ascii_alphanumeric()) {
-        // `part` is ASCII, so byte offsets are character boundaries.
-        let mut start = 0;
-        for (i, pair) in part.as_bytes().windows(2).enumerate() {
-            if pair[0].is_ascii_digit() != pair[1].is_ascii_digit() {
-                tokens.push(&part[start..=i]);
-                start = i + 1;
-            }
-        }
-        if start < part.len() {
-            tokens.push(&part[start..]);
-        }
-    }
-    tokens
-        .windows(FABLE_TOKENS.len())
-        .any(|w| w == FABLE_TOKENS)
-}
-
-/// The single rule that keeps Fable 5.1 away from friend keys.
-pub(crate) fn blocked(id: &str, group: &str) -> bool {
-    names_fable(id) || names_fable(group)
-}
-
-/// Catalog group for a model discovered upstream.
-pub(crate) fn catalog_group(id: &str, display_name: &str) -> &'static str {
-    if blocked(id, "") || names_fable(display_name) {
-        FABLE_GROUP
-    } else {
-        "claude"
-    }
-}
-
 pub(crate) async fn resolve(state: &AppState, key_id: &str, requested: &str) -> Result<String> {
     use sqlx::Row;
-    let row = sqlx::query("SELECT m.id,m.model_group FROM model m JOIN key_model_grant g ON g.model_id=m.id JOIN api_key k ON k.id=g.key_id WHERE g.key_id=? AND k.revoked_at IS NULL AND m.enabled=1 AND m.reviewed_at IS NOT NULL AND m.id=COALESCE((SELECT id FROM model WHERE id=?),(SELECT model_id FROM model_alias WHERE alias=?))")
+    let row = sqlx::query("SELECT m.id FROM model m JOIN key_model_grant g ON g.model_id=m.id JOIN api_key k ON k.id=g.key_id WHERE g.key_id=? AND k.revoked_at IS NULL AND m.enabled=1 AND m.reviewed_at IS NOT NULL AND m.id=COALESCE((SELECT id FROM model WHERE id=?),(SELECT model_id FROM model_alias WHERE alias=?))")
         .bind(key_id).bind(requested).bind(requested).fetch_optional(&state.db).await?
         .ok_or_else(|| AppError::forbidden("This key does not have access to that model"))?;
-    let id: String = row.get("id");
-    let group: String = row.get("model_group");
-    if blocked(&id, &group) {
-        return Err(AppError::forbidden(FABLE_RESERVED));
-    }
-    Ok(id)
+    Ok(row.get("id"))
 }
 
 pub(crate) fn validate(body: &Value, counting: bool) -> Result<()> {

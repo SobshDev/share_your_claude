@@ -1,6 +1,6 @@
 # Shared Router
 
-A private Claude gateway for a small group. Friends use individual router keys in opencodex; the owner’s Claude OAuth credentials remain on the server. Fable 5.1 is blocked for every router key and cannot be granted; the owner reaches it only through direct Claude access, outside this router.
+A private Claude gateway for a small group. Friends use individual router keys in opencodex; the owner’s Claude OAuth credentials remain on the server. Each key reaches only the reviewed, enabled models the owner grants it.
 
 The Rust service includes an owner dashboard, model grants, streaming and non-streaming Messages API support, token counting, model discovery, encrypted OAuth credentials, coordinated refresh, and SQLite usage reports. It does **not** impose token budgets or convert token counts into subscription-limit percentages.
 
@@ -105,11 +105,11 @@ git push --force origin 'v0.1.0^{commit}:refs/heads/deploy'
 
 ## First connection and friend setup
 
-1. Sign in with the owner password, open **Claude connection**, and click **Connect Claude**.
-2. Open the generated Claude authorization link in your browser. After authorization, copy the entire `http://localhost:54545/callback?code=…&state=…` address into the dashboard. The browser may show a connection error at that address; copying it still completes the flow. Keep `localhost` exactly as generated: the OAuth client does not accept `127.0.0.1` as a substitute. State is session-bound and expires after ten minutes.
-3. Refresh the catalog. Review and enable the models you want to share. Discovery alone never enables a new model. Fable 5.1 stays blocked.
-4. Open **Friends & keys**, add a person, and create their key. Copy the key immediately: only its hash is stored, and it cannot be recovered later.
-5. Use **opencodex setup** beside the key to copy its provider configuration. Merge it into the friend’s opencodex configuration. Set `SHARED_CLAUDE_API_KEY` in the environment of the opencodex process, then restart that process. A background service must receive that environment variable too; alternatively put the issued router key in the local provider’s `apiKey` field and protect the configuration file.
+1. Sign in with the owner password and open **Claude connection**.
+2. Click **Open sign-in** to open the Claude authorization link. After authorization, paste the entire `http://localhost:54545/callback?code=…&state=…` address into the dashboard and click **Connect**. The browser may show a connection error at that address; copying it still completes the flow. Keep `localhost` exactly as generated: the OAuth client does not accept `127.0.0.1` as a substitute. State is session-bound and expires after ten minutes.
+3. Open **Models** and click **Check for new models**. Switch on the models you want to share; new models are marked **New** and stay off until you switch them on. Fable 5.1 is an ordinary model: it starts off and is shared only when you switch it on and grant it.
+4. Open **People & keys**, add a person, and create their key. The key sheet shows the secret once, together with a ready opencodex configuration that already contains it. Copy it immediately: only its hash is stored, and it cannot be recovered later.
+5. Merge the configuration into the friend’s opencodex configuration and protect that file. **Setup for opencodex** in the key’s menu shows the configuration again later, with `${SHARED_CLAUDE_API_KEY}` in place of the secret; in that case set `SHARED_CLAUDE_API_KEY` in the environment of the opencodex process (and of any background service running it), then restart that process.
 
 ```json
 {
@@ -125,9 +125,9 @@ git push --force origin 'v0.1.0^{commit}:refs/heads/deploy'
 }
 ```
 
-The displayed configuration uses only models granted to that key. Even if a client invents another model name, the router checks access again before contacting Claude. Revocation blocks new requests; already-admitted requests can finish. New keys start with every currently enabled model except Fable 5.1. Enabling a model later does not change existing keys; use **Edit access**.
+The displayed configuration uses only models granted to that key. Even if a client invents another model name, the router checks access again before contacting Claude. Revocation blocks new requests; already-admitted requests can finish. The new key sheet starts with every enabled model checked; uncheck any you do not want to grant. Enabling a model later does not change existing keys; use **Model access** in the key’s menu.
 
-If friends previously received your actual account credentials, revoke those sessions/credentials before relying on router restrictions. Personal requests sent directly to Claude are outside this router’s per-person accounting. Blocking Fable does not reserve shared account capacity.
+If friends previously received your actual account credentials, revoke those sessions/credentials before relying on router restrictions. Personal requests sent directly to Claude are outside this router’s per-person accounting.
 
 ## API contract
 
@@ -175,7 +175,7 @@ Sign-in allows five failed attempts per client address per minute, and 30 failed
 |---|---|---|
 | GET / POST | `/admin/api/people` | List / create `{"name":"Alex"}` |
 | PATCH | `/admin/api/people/{id}` | Rename `{"name":"Alex"}` |
-| GET / POST | `/admin/api/keys` | List / issue `{"person_id":"…","label":"Laptop"}`; secret returned once |
+| GET / POST | `/admin/api/keys` | List / issue `{"person_id":"…","label":"Laptop","models":["claude-sonnet-4-6"]}`; `models` is optional and defaults to every enabled model; secret returned once |
 | DELETE | `/admin/api/keys/{id}` | Revoke, retaining history |
 | PUT | `/admin/api/keys/{id}/models` | Replace grants `{"models":["claude-sonnet-4-6"]}` |
 | GET | `/admin/api/keys/{id}/config` | Generated opencodex configuration |

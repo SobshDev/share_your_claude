@@ -2,7 +2,7 @@
 use super::*;
 
 #[tokio::test]
-async fn fable_cannot_be_enabled_after_a_catalog_refresh() {
+async fn fable_can_be_enabled_after_a_catalog_refresh() {
     let h = Harness::new().await;
     assert_eq!(
         h.admin("/admin/api/models/refresh", "POST", None)
@@ -11,17 +11,14 @@ async fn fable_cannot_be_enabled_after_a_catalog_refresh() {
         200
     );
     assert_eq!(
-        error_message(
-            h.admin(
-                "/admin/api/models/claude-fable-5-1",
-                "PUT",
-                Some(json!({"enabled":true}))
-            )
-            .await,
-            403
+        h.admin(
+            "/admin/api/models/claude-fable-5-1",
+            "PUT",
+            Some(json!({"enabled":true}))
         )
-        .await,
-        crate::policy::FABLE_RESERVED
+        .await
+        .status(),
+        204
     );
 }
 
@@ -311,7 +308,7 @@ async fn owner_workflow_through_the_admin_api() {
             400
         )
         .await,
-        "Only reviewed, enabled models other than Fable 5.1 can be granted"
+        "Only reviewed, enabled models can be granted"
     );
     assert_eq!(
         error_message(
@@ -381,13 +378,12 @@ async fn admin_api_rejects_invalid_aliases_grants_and_unknown_ids() {
     );
     let long = "a".repeat(151);
     for (alias, message) in [
-        ("", "Invalid or reserved alias"),
-        ("has space", "Invalid or reserved alias"),
-        ("dotted.alias", "Invalid or reserved alias"),
-        (long.as_str(), "Invalid or reserved alias"),
+        ("", "Invalid alias"),
+        ("has space", "Invalid alias"),
+        ("dotted.alias", "Invalid alias"),
+        (long.as_str(), "Invalid alias"),
         // Aliases cannot replace canonical ids, including the model's own id.
         (MODEL, "That alias is already in use"),
-        ("claude-fable-5-1", "Invalid or reserved alias"),
         ("shared-sonnet", "That alias is already in use"),
     ] {
         assert_eq!(
@@ -424,7 +420,7 @@ async fn admin_api_rejects_invalid_aliases_grants_and_unknown_ids() {
                 400
             )
             .await,
-            "Only reviewed, enabled models other than Fable 5.1 can be granted"
+            "Only reviewed, enabled models can be granted"
         );
     }
     assert_eq!(

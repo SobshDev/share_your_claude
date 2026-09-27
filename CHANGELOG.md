@@ -6,14 +6,15 @@ Entries marked **Breaking** require an action when upgrading; follow the steps l
 
 ## [Unreleased]
 
-This release needs operator action: it adds three migrations, a new setting for deployments behind a proxy, and changes to the CLI and the Docker image. Take a backup before upgrading.
+This release needs operator action: it adds four migrations, a new setting for deployments behind a proxy, and changes to the CLI and the Docker image. Take a backup before upgrading.
 
 ### Upgrade steps
 
 1. Back up the database (`bash scripts/backup.sh`, see the [operations runbook](docs/operations.md)).
 2. Behind Dokploy's Traefik, set `TRUSTED_PROXY_HOPS=1` in the Environment settings, so sign-in throttling can tell clients apart. The value must be a non-negative integer; anything else stops the router at startup.
 3. Keep `stop_grace_period` at 30 seconds or more if you run your own Compose file; shutdown now takes up to 28 seconds.
-4. Redeploy. Migrations `0003` to `0005` run automatically at startup. `0003` signs every dashboard session out once, so sign in again afterwards.
+4. Redeploy. Migrations `0003` to `0006` run automatically at startup. `0003` signs every dashboard session out once, so sign in again afterwards.
+5. Fable 5.1 can now be granted like any other model. It stays off after the upgrade; switch it on in **Models** and grant it per key only if you want friends to use it.
 
 ### Security
 
@@ -26,11 +27,10 @@ This release needs operator action: it adds three migrations, a new setting for 
 - With an HTTPS `PUBLIC_ORIGIN`, every response carries `Strict-Transport-Security: max-age=31536000` (#54).
 - The database, its directory, and backups are created owner-only (files 600, directories 700) (#53). PKCE verifiers, authorization codes, token request bodies, and newly issued key secrets are wiped from memory after use (#46).
 
-### Fable 5.1 hardening
+### Fable 5.1
 
-- `policy::blocked` normalizes case and separators, so spellings such as `claude-fable-5.1` and `CLAUDE-FABLE-5-1` are blocked, and every layer, including key creation and catalog refresh, uses it (#4).
-- Migration `0005_forbid_fable_grants.sql` deletes any existing Fable 5.1 grants and adds triggers that refuse Fable grants in the database itself and revoke grants when a model moves into the Fable group (#55).
-- Tests cover every block layer on every endpoint, including a stream whose reply reports Fable (#5).
+- **Breaking:** Fable 5.1 is no longer blocked. The owner can switch it on, grant it per key, alias it, and list it in `/v1/models` like any other reviewed model. Migration `0005_forbid_fable_grants.sql` still removes Fable grants from earlier versions, and `0006_allow_fable.sql` then drops its triggers and moves Fable back into the `claude` group, so every key starts without Fable (#4, #5, #55).
+- `POST /admin/api/keys` accepts an optional `models` list; without it a new key gets every enabled model.
 
 ### Added
 
@@ -48,6 +48,7 @@ This release needs operator action: it adds three migrations, a new setting for 
 
 ### Changed
 
+- The dashboard is redesigned: a side rail with Overview, Requests, People & keys, Models, and Claude connection; one shared filter bar for person, model, and period; a daily chart with share and token mix breakdowns; key rows with model chips and a menu for model access, opencodex setup, and revocation; model switches; and a two-step Claude connection. A new key's sheet shows the secret once inside a ready opencodex configuration. The interface is white with an evergreen accent and uses Manrope and IBM Plex Mono when installed, falling back to system fonts.
 - **Breaking:** `shared-router hash-password` reads only piped input and refuses a terminal, where the password would be echoed. Commands with extra arguments now print usage and exit with status 2 instead of ignoring them (#57).
 - **Breaking:** the Docker image no longer contains `curl`; its health check runs `shared-router healthcheck`. Replace any `docker exec … curl` with `docker exec … shared-router healthcheck` (#68).
 - **Breaking:** migration `0003_admin_session_password.sql` deletes all existing dashboard sessions once (#6).

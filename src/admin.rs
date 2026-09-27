@@ -1,7 +1,7 @@
 use crate::{
     AppState, auth, db,
     error::{AppError, ErrorKind, Result},
-    oauth, policy, proxy,
+    oauth, proxy,
 };
 use askama::Template;
 use axum::{
@@ -256,6 +256,29 @@ async fn keys(State(state): State<Arc<AppState>>) -> Result<Json<Value>> {
 struct KeyInput {
     person_id: String,
     label: String,
+    /// Models to grant. When absent, the key receives every reviewed, enabled model.
+    #[serde(default)]
+    models: Option<Vec<String>>,
+}
+/// Rejects a grant list that is too long or names a model that is not reviewed and enabled.
+async fn require_grantable(tx: &mut sqlx::SqliteConnection, models: &[String]) -> Result<()> {
+    if models.len() > 200 {
+        return Err(AppError::bad("Too many models"));
+    }
+    for model in models {
+        let known: i64 = sqlx::query_scalar(
+            "SELECT count(*) FROM model WHERE id=? AND enabled=1 AND reviewed_at IS NOT NULL",
+        )
+        .bind(model)
+        .fetch_one(&mut *tx)
+        .await?;
+        if known == 0 {
+            return Err(AppError::bad(
+                "Only reviewed, enabled models can be granted",
+            ));
+        }
+    }
+    Ok(())
 }
 async fn create_key(
     State(state): State<Arc<AppState>>,
@@ -286,16 +309,19 @@ async fn create_key(
     .bind(db::now())
     .execute(&mut *tx)
     .await?;
-    let enabled =
-        sqlx::query("SELECT id,model_group FROM model WHERE enabled=1 AND reviewed_at IS NOT NULL")
-            .fetch_all(&mut *tx)
-            .await?;
-    for row in &enabled {
-        let model: &str = row.get("id");
-        if policy::blocked(model, row.get("model_group")) {
-            continue;
+    let models = match input.models {
+        Some(models) => {
+            require_grantable(&mut tx, &models).await?;
+            models
         }
-        sqlx::query("INSERT INTO key_model_grant(key_id,model_id) VALUES(?,?)")
+        None => {
+            sqlx::query_scalar("SELECT id FROM model WHERE enabled=1 AND reviewed_at IS NOT NULL")
+                .fetch_all(&mut *tx)
+                .await?
+        }
+    };
+    for model in &models {
+        sqlx::query("INSERT OR IGNORE INTO key_model_grant(key_id,model_id) VALUES(?,?)")
             .bind(&id)
             .bind(model)
             .execute(&mut *tx)
@@ -332,24 +358,9 @@ async fn set_grants(
     Path(id): Path<String>,
     Json(input): Json<Grants>,
 ) -> Result<StatusCode> {
-    if input.models.len() > 200 {
-        return Err(AppError::bad("Too many models"));
-    }
     let mut tx = state.db.begin().await?;
     require_active_key(&mut *tx, &id).await?;
-    for model in &input.models {
-        let group: Option<String> = sqlx::query_scalar(
-            "SELECT model_group FROM model WHERE id=? AND enabled=1 AND reviewed_at IS NOT NULL",
-        )
-        .bind(model)
-        .fetch_optional(&mut *tx)
-        .await?;
-        if group.is_none() || policy::blocked(model, group.as_deref().unwrap_or("")) {
-            return Err(AppError::bad(
-                "Only reviewed, enabled models other than Fable 5.1 can be granted",
-            ));
-        }
-    }
+    require_grantable(&mut tx, &input.models).await?;
     // The form lists only enabled models, so only their grants are replaced. Grants for
     // disabled models stay and take effect again when the model is re-enabled.
     sqlx::query("DELETE FROM key_model_grant WHERE key_id=? AND model_id IN (SELECT id FROM model WHERE enabled=1 AND reviewed_at IS NOT NULL)")
@@ -371,12 +382,7 @@ async fn client_config(
     Path(id): Path<String>,
 ) -> Result<Json<Value>> {
     require_active_key(&state.db, &id).await?;
-    let rows=sqlx::query("SELECT m.id,m.model_group FROM model m JOIN key_model_grant g ON m.id=g.model_id WHERE g.key_id=? AND m.enabled=1 AND m.reviewed_at IS NOT NULL ORDER BY m.id").bind(&id).fetch_all(&state.db).await?;
-    let models: Vec<String> = rows
-        .iter()
-        .filter(|r| !policy::blocked(r.get("id"), r.get("model_group")))
-        .map(|r| r.get("id"))
-        .collect();
+    let models: Vec<String> = sqlx::query_scalar("SELECT m.id FROM model m JOIN key_model_grant g ON m.id=g.model_id WHERE g.key_id=? AND m.enabled=1 AND m.reviewed_at IS NOT NULL ORDER BY m.id").bind(&id).fetch_all(&state.db).await?;
     Ok(Json(
         json!({"providers":{"shared-claude":{"adapter":"anthropic","baseUrl":state.config.public_origin,"authMode":"key","apiKey":"${SHARED_CLAUDE_API_KEY}","models":models}}}),
     ))
@@ -386,7 +392,7 @@ async fn models(State(state): State<Arc<AppState>>) -> Result<Json<Value>> {
     let rows = sqlx::query("SELECT * FROM model ORDER BY display_name")
         .fetch_all(&state.db)
         .await?;
-    Ok(Json(json!(rows.iter().map(|r|json!({"id":r.get::<String,_>("id"),"display_name":r.get::<String,_>("display_name"),"enabled":r.get::<bool,_>("enabled"),"reviewed_at":r.get::<Option<String>,_>("reviewed_at"),"blocked":policy::blocked(r.get("id"),r.get("model_group"))})).collect::<Vec<_>>())))
+    Ok(Json(json!(rows.iter().map(|r|json!({"id":r.get::<String,_>("id"),"display_name":r.get::<String,_>("display_name"),"enabled":r.get::<bool,_>("enabled"),"reviewed_at":r.get::<Option<String>,_>("reviewed_at")})).collect::<Vec<_>>())))
 }
 async fn refresh_models(State(state): State<Arc<AppState>>) -> Result<Json<Value>> {
     let mut access = oauth::access(&state).await?;
@@ -430,8 +436,6 @@ async fn refresh_models(State(state): State<Arc<AppState>>) -> Result<Json<Value
                 .get("id")
                 .and_then(Value::as_str)
                 .ok_or_else(AppError::upstream)?;
-            // Variant spellings (`.`, `_`, `@`, uppercase) are kept so that policy can file
-            // them under the blocked group instead of silently dropping them.
             if id.len() > 150
                 || !id
                     .get(..7)
@@ -471,18 +475,10 @@ async fn refresh_models(State(state): State<Arc<AppState>>) -> Result<Json<Value
     }
     let mut tx = state.db.begin().await?;
     for (id, name) in &candidates {
-        let group = policy::catalog_group(id, name);
-        // An existing row keeps its reviewed group unless policy now blocks the model; then it
-        // moves to the blocked group and is disabled.
-        let sql = if group == policy::FABLE_GROUP {
-            "INSERT INTO model(id,display_name,model_group) VALUES(?,?,?) ON CONFLICT(id) DO UPDATE SET display_name=excluded.display_name,model_group=excluded.model_group,enabled=0"
-        } else {
-            "INSERT INTO model(id,display_name,model_group) VALUES(?,?,?) ON CONFLICT(id) DO UPDATE SET display_name=excluded.display_name"
-        };
-        sqlx::query(sql)
+        // A discovered model starts disabled and unreviewed; a known one keeps its review.
+        sqlx::query("INSERT INTO model(id,display_name,model_group) VALUES(?,?,'claude') ON CONFLICT(id) DO UPDATE SET display_name=excluded.display_name")
             .bind(id)
             .bind(name)
-            .bind(group)
             .execute(&mut *tx)
             .await?;
     }
@@ -526,14 +522,14 @@ async fn review_model(
     Path(id): Path<String>,
     Json(input): Json<Review>,
 ) -> Result<StatusCode> {
-    let group: Option<String> = sqlx::query_scalar("SELECT model_group FROM model WHERE id=?")
+    let known: i64 = sqlx::query_scalar("SELECT count(*) FROM model WHERE id=?")
         .bind(&id)
-        .fetch_optional(&state.db)
+        .fetch_one(&state.db)
         .await?;
-    let group =
-        group.ok_or_else(|| AppError::bad("Refresh the catalog to discover this model first"))?;
-    if input.enabled && policy::blocked(&id, &group) {
-        return Err(AppError::forbidden(policy::FABLE_RESERVED));
+    if known == 0 {
+        return Err(AppError::bad(
+            "Refresh the catalog to discover this model first",
+        ));
     }
     sqlx::query("UPDATE model SET enabled=?,reviewed_at=? WHERE id=?")
         .bind(input.enabled)
@@ -559,18 +555,17 @@ async fn add_alias(
         || !alias
             .bytes()
             .all(|b| b.is_ascii_alphanumeric() || b"-_/".contains(&b))
-        || policy::blocked(&alias, "")
     {
-        return Err(AppError::bad("Invalid or reserved alias"));
+        return Err(AppError::bad("Invalid alias"));
     }
     let mut tx = state.db.begin().await?;
-    let group: Option<String> = sqlx::query_scalar(
-        "SELECT model_group FROM model WHERE id=? AND reviewed_at IS NOT NULL AND enabled=1",
+    let enabled: i64 = sqlx::query_scalar(
+        "SELECT count(*) FROM model WHERE id=? AND reviewed_at IS NOT NULL AND enabled=1",
     )
     .bind(&id)
-    .fetch_optional(&mut *tx)
+    .fetch_one(&mut *tx)
     .await?;
-    if group.is_none() || policy::blocked(&id, group.as_deref().unwrap_or("")) {
+    if enabled == 0 {
         return Err(AppError::bad("Choose a reviewed and enabled model"));
     }
     let occupied:i64=sqlx::query_scalar("SELECT (SELECT count(*) FROM model WHERE id=?)+(SELECT count(*) FROM model_alias WHERE alias=?)").bind(&alias).bind(&alias).fetch_one(&mut *tx).await?;

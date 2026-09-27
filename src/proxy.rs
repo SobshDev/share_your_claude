@@ -127,7 +127,6 @@ pub(crate) async fn models(
     .await?;
     let data: Vec<Value> = rows
         .iter()
-        .filter(|row| !policy::blocked(row.get("id"), row.get("model_group")))
         .map(|row| {
             json!({
                 "id": row.get::<String, _>("id"),

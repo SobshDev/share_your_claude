@@ -979,18 +979,6 @@ fn request_validation_rejects_each_unreviewed_shape() {
 #[tokio::test]
 async fn invalid_and_denied_requests_never_reach_upstream_on_either_endpoint() {
     let h = Harness::new().await;
-    // Even an enabled, granted Fable model stays unreachable.
-    sqlx::query("UPDATE model SET enabled=1,reviewed_at=? WHERE id='claude-fable-5-1'")
-        .bind(db::now())
-        .execute(&h.state.db)
-        .await
-        .unwrap();
-    // Simulate a database from before migration 0005, which refuses Fable grants.
-    sqlx::query("DROP TRIGGER IF EXISTS key_model_grant_no_fable_insert")
-        .execute(&h.state.db)
-        .await
-        .unwrap();
-    grant(&h.state, &h.key_id, "claude-fable-5-1").await;
     let mut streaming_count = count_body();
     streaming_count["stream"] = true.into();
     let mut no_messages = message("hello", false);
@@ -1011,11 +999,7 @@ async fn invalid_and_denied_requests_never_reach_upstream_on_either_endpoint() {
             "messages must be an array",
         ),
     ];
-    for (model, denial) in [
-        ("claude-fable-5-1", crate::policy::FABLE_RESERVED),
-        ("claude-opus-5", NO_ACCESS),
-        ("unknown", NO_ACCESS),
-    ] {
+    for model in ["claude-fable-5-1", "claude-opus-5", "unknown"] {
         for path in ["/v1/messages", "/v1/messages/count_tokens"] {
             let mut body = if path == "/v1/messages" {
                 message("hello", false)
@@ -1023,7 +1007,7 @@ async fn invalid_and_denied_requests_never_reach_upstream_on_either_endpoint() {
                 count_body()
             };
             body["model"] = model.into();
-            cases.push((path, body, 403, "permission_error", denial));
+            cases.push((path, body, 403, "permission_error", NO_ACCESS));
         }
     }
     let total = cases.len();

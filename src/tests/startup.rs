@@ -230,6 +230,20 @@ async fn startup_upgrades_an_initial_database_and_recovers_it() {
             .await
             .unwrap();
     assert_eq!(grants, ["claude-sonnet-4-6"]);
+    // 0006: Fable 5.1 is filed with the other models, and no trigger refuses its grants.
+    let group: String =
+        sqlx::query_scalar("SELECT model_group FROM model WHERE id='claude-fable-5-1'")
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+    assert_eq!(group, "claude");
+    let triggers: i64 = sqlx::query_scalar(
+        "SELECT COUNT(*) FROM sqlite_master WHERE type='trigger' AND name LIKE '%fable%'",
+    )
+    .fetch_one(&pool)
+    .await
+    .unwrap();
+    assert_eq!(triggers, 0);
 
     let name: String = sqlx::query_scalar("SELECT name FROM person WHERE id='p'")
         .fetch_one(&pool)
@@ -334,58 +348,25 @@ async fn database_rejects_key_labels_outside_the_length_limit() {
 }
 
 #[tokio::test]
-async fn database_refuses_to_grant_fable() {
+async fn database_allows_granting_fable() {
     let dir = tempfile::tempdir().unwrap();
     let (pool, key) = database_with_key(dir.path()).await;
-    for (id, group) in [
-        ("claude-fable-5-1-20260901", "claude"),
-        ("CLAUDE-FABLE-5-1", "claude"),
-        ("renamed-fable", "fable-5.1"),
-        ("claude-sonnet-4-6", "claude"),
-    ] {
-        sqlx::query("INSERT INTO model(id,display_name,model_group,enabled,reviewed_at) VALUES(?,?,?,1,'now')")
-            .bind(id)
-            .bind(id)
-            .bind(group)
-            .execute(&pool)
-            .await
-            .unwrap();
-    }
-    let grant = |model: &'static str| {
+    sqlx::query("INSERT INTO model(id,display_name,model_group,enabled,reviewed_at) VALUES('claude-fable-5-1-20260901','Dated','claude',1,'now')")
+        .execute(&pool)
+        .await
+        .unwrap();
+    for model in ["claude-fable-5-1", "claude-fable-5-1-20260901"] {
         sqlx::query("INSERT INTO key_model_grant(key_id,model_id) VALUES(?,?)")
             .bind(&key)
             .bind(model)
             .execute(&pool)
-    };
-    for model in [
-        "claude-fable-5-1",
-        "claude-fable-5-1-20260901",
-        "CLAUDE-FABLE-5-1",
-        "renamed-fable",
-    ] {
-        let error = grant(model).await.unwrap_err();
-        assert!(
-            error.to_string().contains("Fable 5.1 cannot be granted"),
-            "{model}: {error}"
-        );
+            .await
+            .unwrap();
     }
-    grant("claude-sonnet-4-6").await.unwrap();
-    let moved =
-        sqlx::query("UPDATE key_model_grant SET model_id='claude-fable-5-1' WHERE key_id=?")
-            .bind(&key)
-            .execute(&pool)
-            .await;
-    assert!(moved.is_err());
-
-    // Regrouping a granted model as Fable revokes its grants.
-    sqlx::query("UPDATE model SET model_group='fable-5.1' WHERE id='claude-sonnet-4-6'")
-        .execute(&pool)
-        .await
-        .unwrap();
     let grants: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM key_model_grant")
         .fetch_one(&pool)
         .await
         .unwrap();
-    assert_eq!(grants, 0);
+    assert_eq!(grants, 2);
     pool.close().await;
 }
