@@ -105,9 +105,10 @@ async fn assert_throttled(response: Response) {
 
 #[tokio::test]
 async fn login_throttles_failures_per_client() {
+    const A: &str = "198.51.100.1";
+    const B: &str = "198.51.100.2";
     let h = Harness::new().await;
     let router = behind_proxy(&h);
-    const A: &str = "198.51.100.1";
     for _ in 0..auth::LoginLimiter::CLIENT_FAILURES {
         assert_wrong_password(login_from(&router, A, "wrong").await).await;
     }
@@ -116,7 +117,6 @@ async fn login_throttles_failures_per_client() {
     let spoofed = format!("203.0.113.7, {A}");
     assert_throttled(login_from(&router, &spoofed, "wrong").await).await;
     // Another client is unaffected.
-    const B: &str = "198.51.100.2";
     assert_wrong_password(login_from(&router, B, "wrong").await).await;
     let response = login_from(&router, B, ADMIN_PASSWORD).await;
     assert_eq!(response.status(), 200);
@@ -127,15 +127,15 @@ async fn login_throttles_failures_per_client() {
 
 #[tokio::test]
 async fn successful_login_clears_the_clients_failures() {
+    const A: &str = "2001:db8::1";
+    // Another address in the same IPv6 /64 is the same client.
+    const SAME: &str = "2001:db8::2";
     let h = Harness::new().await;
     let router = behind_proxy(&h);
-    const A: &str = "2001:db8::1";
     for _ in 1..auth::LoginLimiter::CLIENT_FAILURES {
         assert_wrong_password(login_from(&router, A, "wrong").await).await;
     }
     assert_eq!(login_from(&router, A, ADMIN_PASSWORD).await.status(), 200);
-    // Another address in the same IPv6 /64 is the same client.
-    const SAME: &str = "2001:db8::2";
     for _ in 0..auth::LoginLimiter::CLIENT_FAILURES {
         assert_wrong_password(login_from(&router, SAME, "wrong").await).await;
     }
@@ -162,7 +162,10 @@ fn login_limiter_windows_global_ceiling_and_size_bound() {
 
     // The global ceiling stops distributed guessing, and a success releases its reservation.
     let mut limiter = LoginLimiter::new(0);
-    let client = |i: u32| Some(std::net::IpAddr::from([10, 0, (i >> 8) as u8, i as u8]));
+    let client = |i: u32| {
+        let [_, _, high, low] = i.to_be_bytes();
+        Some(std::net::IpAddr::from([10, 0, high, low]))
+    };
     for i in 0..LoginLimiter::GLOBAL_FAILURES {
         assert!(limiter.begin(client(i), 5000));
     }
@@ -174,7 +177,7 @@ fn login_limiter_windows_global_ceiling_and_size_bound() {
 
     // The map never tracks more than MAX_CLIENTS addresses.
     let mut limiter = LoginLimiter::new(0);
-    for i in 0..LoginLimiter::MAX_CLIENTS as u32 + 100 {
+    for i in 0..u32::try_from(LoginLimiter::MAX_CLIENTS).unwrap() + 100 {
         assert!(limiter.begin(client(i), i64::from(i) * LoginLimiter::WINDOW_SECS));
         assert!(limiter.tracked_clients() <= LoginLimiter::MAX_CLIENTS);
     }
@@ -484,12 +487,12 @@ async fn set_last_used(h: &Harness, seconds_ago: i64) -> String {
 
 #[tokio::test]
 async fn last_used_is_written_at_most_once_a_minute() {
-    let h = Harness::new().await;
     async fn models(h: &Harness) -> StatusCode {
         h.get("/v1/models", &[("x-api-key", h.key.as_str())])
             .await
             .status()
     }
+    let h = Harness::new().await;
     assert_eq!(last_used(&h).await, None);
     assert_eq!(models(&h).await, 200);
     let first = last_used(&h).await.expect("first use is recorded");

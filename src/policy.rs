@@ -5,7 +5,10 @@ use crate::{
 };
 use serde_json::{Value, json};
 use sha2::{Digest, Sha256};
-use std::collections::{HashMap, HashSet};
+use std::{
+    collections::{HashMap, HashSet},
+    fmt::Write as _,
+};
 
 /// Catalog group of every Fable 5.1 variant. Also used by the seed migration.
 pub(crate) const FABLE_GROUP: &str = "fable-5.1";
@@ -108,7 +111,7 @@ pub(crate) fn validate(body: &Value, counting: bool) -> Result<()> {
         && !object
             .get("max_tokens")
             .and_then(Value::as_u64)
-            .is_some_and(|n| n > 0 && n <= i64::MAX as u64)
+            .is_some_and(|n| n > 0 && i64::try_from(n).is_ok())
     {
         return Err(AppError::bad("max_tokens must be a positive integer"));
     }
@@ -213,13 +216,12 @@ impl ToolMap {
         // Stable bijection within a request, including names already starting with custom_.
         // 63 characters fits Anthropic's 64-character tool name limit.
         let digest = Sha256::digest(name.as_bytes());
-        let wire = format!(
-            "custom_{}",
-            digest[..28]
-                .iter()
-                .map(|b| format!("{b:02x}"))
-                .collect::<String>()
-        );
+        let mut wire = String::with_capacity(63);
+        wire.push_str("custom_");
+        for byte in &digest[..28] {
+            // Writing to a String cannot fail.
+            let _ = write!(wire, "{byte:02x}");
+        }
         if self
             .originals
             .get(&wire)

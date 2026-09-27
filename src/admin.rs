@@ -40,16 +40,19 @@ const VERSIONED_ASSET_CACHE: &str = "public, max-age=31536000, immutable";
 /// change to an asset gives the pages new URLs and browsers never run stale scripts.
 pub(crate) static ASSET_VERSION: std::sync::LazyLock<String> = std::sync::LazyLock::new(|| {
     use sha2::{Digest, Sha256};
+    use std::fmt::Write as _;
     let mut hasher = Sha256::new();
     for (path, _, body) in ASSETS {
         hasher.update(path.as_bytes());
         hasher.update((body.len() as u64).to_le_bytes());
         hasher.update(body.as_bytes());
     }
-    hasher.finalize()[..8]
-        .iter()
-        .map(|byte| format!("{byte:02x}"))
-        .collect()
+    let mut version = String::with_capacity(16);
+    for byte in &hasher.finalize()[..8] {
+        // Writing to a String cannot fail.
+        let _ = write!(version, "{byte:02x}");
+    }
+    version
 });
 
 /// Serves an embedded asset. Only a URL carrying the current version may be cached for good;

@@ -235,7 +235,7 @@ pub(crate) fn log_database_error(error: &sqlx::Error) {
                 ErrorKind::CheckViolation => "check_violation",
                 _ => "database",
             };
-            (kind, error.code().map(|code| code.into_owned()))
+            (kind, error.code().map(std::borrow::Cow::into_owned))
         }
         sqlx::Error::PoolTimedOut => ("pool_timed_out", None),
         sqlx::Error::PoolClosed => ("pool_closed", None),

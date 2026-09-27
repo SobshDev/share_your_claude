@@ -1,5 +1,5 @@
 //! OAuth wire constants and system compatibility are based on opencodex 2.49.0.
-//! See THIRD_PARTY_NOTICES.md. The router exclusively owns its refresh token.
+//! See `THIRD_PARTY_NOTICES.md`. The router exclusively owns its refresh token.
 use crate::{
     AppState, auth, db,
     error::{AppError, Result},
@@ -281,6 +281,12 @@ async fn exchange(
     request: &TokenRequest<'_>,
     refresh_fallback: Option<&str>,
 ) -> std::result::Result<(Tokens, i64), ExchangeError> {
+    #[derive(Deserialize, Zeroize, ZeroizeOnDrop)]
+    struct Reply {
+        access_token: String,
+        refresh_token: Option<String>,
+        expires_in: i64,
+    }
     let body = Zeroizing::new(serde_json::to_vec(request).map_err(|_| ExchangeError::Failed)?);
     let response = state
         .client
@@ -298,12 +304,6 @@ async fn exchange(
         } else {
             ExchangeError::Failed
         });
-    }
-    #[derive(Deserialize, Zeroize, ZeroizeOnDrop)]
-    struct Reply {
-        access_token: String,
-        refresh_token: Option<String>,
-        expires_in: i64,
     }
     let body = Zeroizing::new(
         crate::proxy::limited_body(response, 65536)

@@ -153,7 +153,7 @@ async fn cancelling_before_upstream_headers_records_an_interrupted_request() {
     let mut request = Box::pin(h.request("/v1/messages", &h.key, message("slow", false)));
     tokio::select! {
         _ = &mut request => panic!("the slow scenario answered"),
-        _ = async {
+        () = async {
             while h.mock.requests.load(Ordering::SeqCst) == 0 {
                 tokio::time::sleep(Duration::from_millis(10)).await;
             }
@@ -181,6 +181,7 @@ async fn cancelling_before_upstream_headers_records_an_interrupted_request() {
 
 #[tokio::test]
 async fn complete_usage_fills_missing_cache_counters_and_counts_are_not_applicable() {
+    type Row = (String, String, String, Option<i64>, Option<i64>);
     let h = Harness::new().await;
     for (path, body) in [
         ("/v1/messages", message("no-cache", false)),
@@ -191,7 +192,6 @@ async fn complete_usage_fills_missing_cache_counters_and_counts_are_not_applicab
     ] {
         assert_eq!(h.request(path, &h.key, body).await.status(), 200);
     }
-    type Row = (String, String, String, Option<i64>, Option<i64>);
     let rows: Vec<Row> = sqlx::query_as(
         "SELECT endpoint,outcome,usage_state,cache_read_tokens,cache_write_tokens \
          FROM request_usage ORDER BY endpoint",

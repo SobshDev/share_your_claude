@@ -514,13 +514,13 @@ async fn saturated_admission_is_denied_before_upstream() {
         .state
         .admission
         .clone()
-        .try_acquire_many_owned(GLOBAL_CONCURRENCY as u32)
+        .try_acquire_many_owned(u32::try_from(GLOBAL_CONCURRENCY).unwrap())
         .unwrap();
     let counts = h
         .state
         .count_admission
         .clone()
-        .try_acquire_many_owned(COUNT_TOKENS_CONCURRENCY as u32)
+        .try_acquire_many_owned(u32::try_from(COUNT_TOKENS_CONCURRENCY).unwrap())
         .unwrap();
     assert_busy(
         h.request("/v1/messages", &h.key, message("hello", true))
@@ -1037,6 +1037,6 @@ async fn invalid_and_denied_requests_never_reach_upstream_on_either_endpoint() {
     .fetch_one(&h.state.db)
     .await
     .unwrap();
-    assert_eq!(denied, total as i64);
+    assert_eq!(denied, i64::try_from(total).unwrap());
     assert_eq!(h.mock.requests.load(Ordering::SeqCst), 0);
 }

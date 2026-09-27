@@ -261,7 +261,7 @@ impl LoginLimiter {
         };
         address.map(|ip| match ip.to_canonical() {
             IpAddr::V6(v6) => IpAddr::V6((u128::from(v6) & (u128::MAX << 64)).into()),
-            v4 => v4,
+            v4 @ IpAddr::V4(_) => v4,
         })
     }
 

@@ -349,7 +349,7 @@ fn acquire(state: &AppState, key: &str, counting: bool) -> Result<Permits> {
         let mut keys = state
             .key_admission
             .lock()
-            .unwrap_or_else(|poisoned| poisoned.into_inner());
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
         // Acquired under the lock so pruning cannot drop a semaphore that is about to be used.
         keys.retain(|_, semaphore| semaphore.available_permits() < PER_KEY_CONCURRENCY);
         keys.entry(key.to_owned())
@@ -629,10 +629,10 @@ async fn finish_json(
         return fail(guard, "upstream_error", 502, false, AppError::upstream()).await;
     };
     if counting {
-        if !value
+        if value
             .get("input_tokens")
             .and_then(Value::as_i64)
-            .is_some_and(|n| n >= 0)
+            .is_none_or(|n| n < 0)
         {
             malformed();
             return fail(guard, "upstream_error", 502, true, AppError::upstream()).await;
@@ -742,7 +742,7 @@ async fn stream_response(
     let mut phase = state.phase.subscribe();
     loop {
         let chunk = tokio::select! {
-            _ = tx.closed() => { guard.finish("interrupted",Some(200),false).await?; return Ok(()); }
+            () = tx.closed() => { guard.finish("interrupted",Some(200),false).await?; return Ok(()); }
             () = &mut deadline => return Err(StreamError::TooLong),
             true = async { phase.wait_for(|p| *p == crate::Phase::Stopping).await.is_ok() } => {
                 // Keep the counts seen so far before the stream is recorded as interrupted.

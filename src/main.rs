@@ -204,5 +204,5 @@ async fn shutdown() {
     };
     #[cfg(not(unix))]
     let terminate = std::future::pending::<()>();
-    tokio::select! { _=ctrl_c=>(),_=terminate=>() }
+    tokio::select! { () = ctrl_c => (), () = terminate => () }
 }

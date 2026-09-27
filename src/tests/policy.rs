@@ -429,10 +429,7 @@ async fn fable_stream(State(calls): State<Arc<AtomicUsize>>, Json(body): Json<Va
         json!({"type":"message_delta","delta":{"stop_reason":"end_turn","model":"claude-fable-5-1"},"usage":{"output_tokens":2}}),
         json!({"type":"message_stop"}),
     ];
-    let stream: String = events
-        .iter()
-        .map(|e| format!("event: {}\ndata: {e}\n\n", e["type"].as_str().unwrap()))
-        .collect();
+    let stream: String = events.into_iter().map(event).collect();
     ([("content-type", "text/event-stream")], stream).into_response()
 }
 
