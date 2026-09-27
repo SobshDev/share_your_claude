@@ -12,7 +12,7 @@ Please include the affected commit or tag, the deployment setup (Dokploy, local 
 
 These reports are in scope:
 
-- Reaching Fable 5.1 through the router with any router key, endpoint, alias, or request shape.
+- Reaching a model through the router that the key was not granted, or that is not reviewed and enabled, with any endpoint, alias, or request shape.
 - Bypassing router key authentication, per-key model grants, or key revocation.
 - Bypassing owner dashboard authentication, the session cookie, the exact-origin check, or the CSRF token.
 - Leaking the owner's Claude OAuth tokens, the `ENCRYPTION_KEY`, the admin password or its hash, router key secrets, or session tokens.

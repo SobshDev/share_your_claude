@@ -7,7 +7,7 @@
 - [ ] `cargo fmt --check`, `cargo clippy --locked --all-targets -- -D warnings`, and `cargo test --locked` pass
 - [ ] `node --check static/*.js` passes (if dashboard JavaScript changed)
 - [ ] No secrets, tokens, keys, passwords, prompts, completions, or raw provider bodies are logged or stored
-- [ ] Fable 5.1 remains unreachable through every router key and endpoint
+- [ ] Keys still reach only their granted, reviewed, enabled models on every endpoint
 - [ ] No `/v1/messages` request can be replayed or retried upstream
 - [ ] README API tables and accepted request surface updated (if routes, fields, betas, or tool types changed)
 - [ ] New migration added (if the schema changed); existing migrations untouched
