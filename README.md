@@ -139,7 +139,11 @@ Friend endpoints accept `x-api-key: sr_…` or `Authorization: Bearer sr_…`. C
 
 No batch, arbitrary forward-proxy, Files, Managed Agents, or provider-management routes are exposed to friends. Unreviewed request fields, beta headers, server tool types, and fallback/advisor routing are rejected. Custom client tools, images, thinking, and cache controls are supported. Incoming credentials are replaced with the owner’s upstream token. Inference requests are never automatically replayed, including after 429s, network errors, or an upstream 401.
 
-Admission control keeps one friend from taking the whole router. Each key may have 3 `/v1/messages` requests in progress, and at most 8 run at once across all keys. Token counts use a separate pool of 4, so they never wait behind long streams. The router does not queue: a request beyond a limit is answered immediately with `429 rate_limit_error` and `retry-after: 1`, saying either "This key has too many requests in progress" or "The router is busy". A streaming response holds its slots until the stream ends. See [docs/architecture.md](docs/architecture.md) for the module map and the full request flow.
+Admission control keeps one friend from taking the whole router. Each key may have 3 `/v1/messages` requests in progress, and at most 8 run at once across all keys. Token counts use a separate pool of 4, so they never wait behind long streams. The router does not queue: a request beyond a limit is answered immediately with `429 rate_limit_error` and `retry-after: 1`, saying either "This key has too many requests in progress" or "The router is busy". A streaming response holds its slots until the stream ends.
+
+Upstream calls have fixed time limits, which are constants in the code rather than settings. A stream may run for up to 60 minutes; after that the router sends a `timeout_error` event, ends the stream, and records the request as `interrupted`. A non-streaming `/v1/messages` call times out after 600 seconds, a token count after 60 seconds, and each catalog page fetched by **Refresh from Claude** after 30 seconds; a timed-out call returns `502 api_error` and is not retried. Every upstream connection must also open within 15 seconds and must not stall for more than 120 seconds between reads.
+
+See [docs/architecture.md](docs/architecture.md) for the module map and the full request flow.
 
 ### Accepted request surface
 
