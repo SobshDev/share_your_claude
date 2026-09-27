@@ -144,7 +144,7 @@ async fn serve() -> anyhow::Result<()> {
     let state = AppState::new(config, pool.clone())?;
     let listener = tokio::net::TcpListener::bind(address).await?;
     tracing::info!(%address,"router listening");
-    let mut phase = state.phase.subscribe();
+    let mut phase = state.subscribe_phase();
     // Connect info lets the login limiter tell direct clients apart by peer address.
     let app = shared_router::app(state.clone())
         .into_make_service_with_connect_info::<std::net::SocketAddr>();
@@ -152,7 +152,7 @@ async fn serve() -> anyhow::Result<()> {
     let server = axum::serve(listener, app).with_graceful_shutdown(async move {
         shutdown().await;
         // `/readyz` now reports 503.
-        signalled.phase.send_replace(Phase::Draining);
+        signalled.set_phase(Phase::Draining);
         tracing::info!("shutdown requested; draining open requests");
     });
     let mut server = std::pin::pin!(server.into_future());
@@ -165,7 +165,7 @@ async fn serve() -> anyhow::Result<()> {
         () = deadline => {
             tracing::warn!("drain period elapsed; interrupting open requests");
             // Open streams checkpoint their usage, record themselves as interrupted, and end.
-            state.phase.send_replace(Phase::Stopping);
+            state.set_phase(Phase::Stopping);
             match tokio::time::timeout(INTERRUPT_GRACE, &mut server).await {
                 Ok(result) => result.map_err(anyhow::Error::from),
                 Err(_) => Ok(()),

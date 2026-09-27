@@ -60,12 +60,15 @@ impl Harness {
             secure_cookie: false,
             trusted_proxy_hops: 0,
         };
-        let mut state = AppState::new(config, pool).unwrap();
-        {
-            let inner = Arc::get_mut(&mut state).unwrap();
-            inner.upstream = format!("http://{address}");
-            inner.token_endpoint = format!("http://{address}/v1/oauth/token");
-        }
+        let state = Arc::new(
+            AppState::with_endpoints(
+                config,
+                pool,
+                format!("http://{address}"),
+                format!("http://{address}/v1/oauth/token"),
+            )
+            .unwrap(),
+        );
         let encrypted = oauth::encrypt(
             &state.config.encryption_key,
             &oauth::Tokens {
@@ -359,15 +362,23 @@ impl Harness {
             secure_cookie: current.secure_cookie,
             trusted_proxy_hops: current.trusted_proxy_hops,
         };
-        let mut state = AppState::new(config, self.state.db.clone()).unwrap();
-        {
-            let inner = Arc::get_mut(&mut state).unwrap();
-            inner.upstream = self.state.upstream.clone();
-            inner.token_endpoint = self.state.token_endpoint.clone();
-            edit(inner);
-        }
+        let mut state = AppState::with_endpoints(
+            config,
+            self.state.db.clone(),
+            self.state.upstream.clone(),
+            self.state.token_endpoint.clone(),
+        )
+        .unwrap();
+        edit(&mut state);
+        let state = Arc::new(state);
         let router = app(state.clone());
         (state, router)
+    }
+
+    /// This harness with its state and router replaced by a `variant` built with `edit`.
+    pub(super) fn rebuilt(mut self, edit: impl FnOnce(&mut AppState)) -> Self {
+        (self.state, self.router) = self.variant(edit);
+        self
     }
 }
 

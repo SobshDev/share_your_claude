@@ -13,14 +13,14 @@ use sqlx::{Row, SqliteConnection};
 use std::sync::Arc;
 
 #[derive(Deserialize, Default)]
-pub struct UsageQuery {
-    pub group_by: Option<String>,
-    pub from: Option<String>,
-    pub to: Option<String>,
-    pub person_id: Option<String>,
-    pub key_id: Option<String>,
-    pub model: Option<String>,
-    pub offset: Option<u32>,
+pub(crate) struct UsageQuery {
+    pub(crate) group_by: Option<String>,
+    pub(crate) from: Option<String>,
+    pub(crate) to: Option<String>,
+    pub(crate) person_id: Option<String>,
+    pub(crate) key_id: Option<String>,
+    pub(crate) model: Option<String>,
+    pub(crate) offset: Option<u32>,
 }
 
 struct Filter {
@@ -209,7 +209,7 @@ async fn aggregate(
     }).collect())
 }
 
-pub async fn usage_report(
+pub(crate) async fn usage_report(
     State(state): State<Arc<AppState>>,
     Query(query): Query<UsageQuery>,
 ) -> Result<Json<Value>> {
@@ -222,7 +222,7 @@ pub async fn usage_report(
     ))
 }
 
-pub async fn report(
+pub(crate) async fn report(
     State(state): State<Arc<AppState>>,
     Query(query): Query<UsageQuery>,
 ) -> Result<Json<Value>> {

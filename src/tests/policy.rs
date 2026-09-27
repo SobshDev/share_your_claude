@@ -17,9 +17,14 @@ async fn with_upstream(h: &Harness, service: Router) -> (Router, tokio::task::Jo
         secure_cookie: false,
         trusted_proxy_hops: 0,
     };
-    let mut state = AppState::new(config, h.state.db.clone()).unwrap();
-    Arc::get_mut(&mut state).unwrap().upstream = format!("http://{address}");
-    (app(state), server)
+    let state = AppState::with_endpoints(
+        config,
+        h.state.db.clone(),
+        format!("http://{address}"),
+        TOKEN_ENDPOINT.into(),
+    )
+    .unwrap();
+    (app(Arc::new(state)), server)
 }
 
 /// Calls an admin route on `router` with the harness session.

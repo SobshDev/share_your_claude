@@ -1,6 +1,6 @@
 use crate::{
     AppState, db,
-    error::{AppError, Result},
+    error::{AppError, ErrorKind, Result},
 };
 use argon2::{Argon2, PasswordHash, PasswordVerifier};
 use axum::{
@@ -28,12 +28,12 @@ const LAST_USED_RESOLUTION_SECS: i64 = 60;
 /// Lifetime of an admin session, in the database and in the cookie.
 const SESSION_TTL_SECS: i64 = 43200;
 
-pub fn random_secret() -> String {
+pub(crate) fn random_secret() -> String {
     let mut bytes = [0; 32];
     OsRng.fill_bytes(&mut bytes);
     URL_SAFE_NO_PAD.encode(bytes)
 }
-pub fn hash(secret: &str) -> Vec<u8> {
+pub(crate) fn hash(secret: &str) -> Vec<u8> {
     Sha256::digest(secret.as_bytes()).to_vec()
 }
 
@@ -48,7 +48,7 @@ fn single_header<'a>(headers: &'a HeaderMap, name: &str) -> Result<Option<&'a st
         .transpose()
 }
 
-pub async fn api_key(headers: &HeaderMap, state: &AppState) -> Result<String> {
+pub(crate) async fn api_key(headers: &HeaderMap, state: &AppState) -> Result<String> {
     let key = single_header(headers, "x-api-key")?;
     let bearer = match single_header(headers, "authorization")? {
         Some(value) => Some(
@@ -93,7 +93,7 @@ pub async fn api_key(headers: &HeaderMap, state: &AppState) -> Result<String> {
     Ok(id)
 }
 
-pub fn origin(headers: &HeaderMap, state: &AppState) -> Result<()> {
+pub(crate) fn origin(headers: &HeaderMap, state: &AppState) -> Result<()> {
     if single_header(headers, "origin")? != Some(state.config.public_origin.as_str()) {
         return Err(AppError::forbidden(
             "This action must originate from the owner dashboard",
@@ -102,7 +102,7 @@ pub fn origin(headers: &HeaderMap, state: &AppState) -> Result<()> {
     Ok(())
 }
 
-pub fn cookie_name(state: &AppState) -> &'static str {
+pub(crate) fn cookie_name(state: &AppState) -> &'static str {
     if state.config.secure_cookie {
         "__Host-router_session"
     } else {
@@ -124,7 +124,7 @@ fn session_cookie(state: &AppState, value: &str, max_age: i64) -> String {
     )
 }
 
-pub fn session_token(headers: &HeaderMap, state: &AppState) -> Result<String> {
+pub(crate) fn session_token(headers: &HeaderMap, state: &AppState) -> Result<String> {
     let mut result = None;
     for value in headers.get_all(header::COOKIE) {
         for item in value
@@ -151,7 +151,7 @@ fn password_fingerprint(state: &AppState) -> Vec<u8> {
     hash(&state.config.password_hash)
 }
 
-pub async fn session(headers: &HeaderMap, state: &AppState) -> Result<String> {
+pub(crate) async fn session(headers: &HeaderMap, state: &AppState) -> Result<String> {
     let token = session_token(headers, state)?;
     sqlx::query_scalar(
         "SELECT csrf_token FROM admin_session WHERE token_hash=? AND expires_at>? AND password_fp=?",
@@ -164,7 +164,7 @@ pub async fn session(headers: &HeaderMap, state: &AppState) -> Result<String> {
     .ok_or_else(AppError::unauthorized)
 }
 
-pub async fn require_admin(
+pub(crate) async fn require_admin(
     State(state): State<Arc<AppState>>,
     request: Request,
     next: Next,
@@ -187,7 +187,7 @@ pub async fn require_admin(
 
 #[derive(Deserialize)]
 #[serde(deny_unknown_fields)]
-pub struct Login {
+pub(crate) struct Login {
     password: String,
 }
 
@@ -204,7 +204,7 @@ pub struct Login {
 /// The client address is the socket peer, or, when `TRUSTED_PROXY_HOPS` is N > 0, the
 /// N-th `X-Forwarded-For` entry from the right (the address the outermost trusted proxy saw).
 /// IPv6 clients are grouped by /64. Requests without a usable address share one bucket.
-pub struct LoginLimiter {
+pub(crate) struct LoginLimiter {
     pub(crate) trusted_proxy_hops: usize,
     clients: HashMap<Option<IpAddr>, Window>,
     global: Window,
@@ -228,12 +228,12 @@ impl Window {
 }
 
 impl LoginLimiter {
-    pub const WINDOW_SECS: i64 = 60;
-    pub const CLIENT_FAILURES: u32 = 5;
-    pub const GLOBAL_FAILURES: u32 = 30;
-    pub const MAX_CLIENTS: usize = 4096;
+    pub(crate) const WINDOW_SECS: i64 = 60;
+    pub(crate) const CLIENT_FAILURES: u32 = 5;
+    pub(crate) const GLOBAL_FAILURES: u32 = 30;
+    pub(crate) const MAX_CLIENTS: usize = 4096;
 
-    pub fn new(trusted_proxy_hops: usize) -> Self {
+    pub(crate) fn new(trusted_proxy_hops: usize) -> Self {
         Self {
             trusted_proxy_hops,
             clients: HashMap::new(),
@@ -242,7 +242,7 @@ impl LoginLimiter {
     }
 
     /// The rate-limit key for a request.
-    pub fn client(&self, headers: &HeaderMap, peer: Option<SocketAddr>) -> Option<IpAddr> {
+    pub(crate) fn client(&self, headers: &HeaderMap, peer: Option<SocketAddr>) -> Option<IpAddr> {
         let address = if self.trusted_proxy_hops > 0 {
             let entries: Vec<&str> = headers
                 .get_all("x-forwarded-for")
@@ -266,7 +266,7 @@ impl LoginLimiter {
     }
 
     /// Reserves one failed attempt for `client`, or returns false when it is throttled.
-    pub fn begin(&mut self, client: Option<IpAddr>, now: i64) -> bool {
+    pub(crate) fn begin(&mut self, client: Option<IpAddr>, now: i64) -> bool {
         if self.global.current(now).failures >= Self::GLOBAL_FAILURES
             || self
                 .clients
@@ -298,7 +298,7 @@ impl LoginLimiter {
     }
 
     /// Releases the attempt reserved by `begin` and clears the client's failures.
-    pub fn succeeded(&mut self, client: Option<IpAddr>, now: i64) {
+    pub(crate) fn succeeded(&mut self, client: Option<IpAddr>, now: i64) {
         self.clients.remove(&client);
         let global = self.global.current(now);
         global.failures = global.failures.saturating_sub(1);
@@ -310,7 +310,7 @@ impl LoginLimiter {
     }
 }
 
-pub async fn login(
+pub(crate) async fn login(
     State(state): State<Arc<AppState>>,
     peer: Option<Extension<ConnectInfo<SocketAddr>>>,
     headers: HeaderMap,
@@ -324,7 +324,8 @@ pub async fn login(
         let mut oauth = state.oauth.lock().await;
         let client = oauth.login.client(&headers, peer.map(|p| p.0.0));
         if !oauth.login.begin(client, db::epoch()) {
-            return Err(AppError(
+            return Err(AppError::new(
+                ErrorKind::Request,
                 StatusCode::TOO_MANY_REQUESTS,
                 "rate_limit_error",
                 "Too many sign-in attempts. Wait one minute",
@@ -379,7 +380,10 @@ pub async fn login(
         .into_response())
 }
 
-pub async fn logout(State(state): State<Arc<AppState>>, headers: HeaderMap) -> Result<Response> {
+pub(crate) async fn logout(
+    State(state): State<Arc<AppState>>,
+    headers: HeaderMap,
+) -> Result<Response> {
     let token = session_token(&headers, &state)?;
     sqlx::query("DELETE FROM admin_session WHERE token_hash=?")
         .bind(hash(&token))
@@ -389,7 +393,7 @@ pub async fn logout(State(state): State<Arc<AppState>>, headers: HeaderMap) -> R
     Ok(([(header::SET_COOKIE, cookie)], StatusCode::NO_CONTENT).into_response())
 }
 
-pub async fn me(
+pub(crate) async fn me(
     State(state): State<Arc<AppState>>,
     headers: HeaderMap,
 ) -> Result<Json<serde_json::Value>> {

@@ -1,13 +1,13 @@
-pub mod admin;
-pub mod analytics;
-pub mod auth;
+pub(crate) mod admin;
+pub(crate) mod analytics;
+pub(crate) mod auth;
 pub mod config;
 pub mod db;
-pub mod error;
-pub mod oauth;
-pub mod policy;
-pub mod proxy;
-pub mod usage;
+pub(crate) mod error;
+pub(crate) mod oauth;
+pub(crate) mod policy;
+pub(crate) mod proxy;
+pub(crate) mod usage;
 
 use axum::{
     Router,
@@ -22,13 +22,17 @@ use tokio::sync::{Mutex, Semaphore, watch};
 
 /// Body limit for routes that do not declare their own.
 const DEFAULT_BODY_LIMIT_BYTES: usize = 64 * 1024;
+/// Anthropic API base URL that friend requests are relayed to.
+const UPSTREAM: &str = "https://api.anthropic.com";
+/// Anthropic OAuth token endpoint used for code exchange and refresh.
+const TOKEN_ENDPOINT: &str = "https://api.anthropic.com/v1/oauth/token";
 /// `/v1/messages` requests the router sends upstream at once, across all keys.
-pub const GLOBAL_CONCURRENCY: usize = 8;
+pub(crate) const GLOBAL_CONCURRENCY: usize = 8;
 /// `/v1/messages` requests one key may have in flight, so one friend cannot hold every
 /// global permit.
-pub const PER_KEY_CONCURRENCY: usize = 3;
+pub(crate) const PER_KEY_CONCURRENCY: usize = 3;
 /// Token counts use their own small pool so they never wait behind long streams.
-pub const COUNT_TOKENS_CONCURRENCY: usize = 4;
+pub(crate) const COUNT_TOKENS_CONCURRENCY: usize = 4;
 
 /// Where the server is in its lifecycle. `main` advances it on a shutdown signal.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -42,16 +46,16 @@ pub enum Phase {
 }
 
 pub struct AppState {
-    pub config: config::Config,
-    pub db: sqlx::SqlitePool,
-    pub client: reqwest::Client,
-    pub oauth: Mutex<oauth::OAuthState>,
-    pub admission: Arc<Semaphore>,
-    pub count_admission: Arc<Semaphore>,
+    pub(crate) config: config::Config,
+    pub(crate) db: sqlx::SqlitePool,
+    pub(crate) client: reqwest::Client,
+    pub(crate) oauth: Mutex<oauth::OAuthState>,
+    pub(crate) admission: Arc<Semaphore>,
+    pub(crate) count_admission: Arc<Semaphore>,
     /// Per-key admission, keyed by key id. Idle entries are pruned on use.
-    pub key_admission: std::sync::Mutex<HashMap<String, Arc<Semaphore>>>,
+    pub(crate) key_admission: std::sync::Mutex<HashMap<String, Arc<Semaphore>>>,
     /// Lifecycle phase. Subscribe to wait for a change; `main` sends the transitions.
-    pub phase: watch::Sender<Phase>,
+    pub(crate) phase: watch::Sender<Phase>,
     // Only tests inside this crate can replace destinations. No environment/config overrides.
     pub(crate) upstream: String,
     pub(crate) token_endpoint: String,
@@ -63,7 +67,19 @@ pub struct AppState {
 
 impl AppState {
     pub fn new(config: config::Config, db: sqlx::SqlitePool) -> anyhow::Result<Arc<Self>> {
-        Ok(Arc::new(Self {
+        Self::with_endpoints(config, db, UPSTREAM.into(), TOKEN_ENDPOINT.into()).map(Arc::new)
+    }
+
+    /// A state that is not shared yet and sends API and token requests to the given URLs.
+    /// Only the in-crate tests choose other destinations, and they may adjust other fields
+    /// before sharing the state.
+    fn with_endpoints(
+        config: config::Config,
+        db: sqlx::SqlitePool,
+        upstream: String,
+        token_endpoint: String,
+    ) -> anyhow::Result<Self> {
+        Ok(Self {
             oauth: Mutex::new(oauth::OAuthState::new(config.trusted_proxy_hops)),
             config,
             db,
@@ -72,16 +88,26 @@ impl AppState {
             count_admission: Arc::new(Semaphore::new(COUNT_TOKENS_CONCURRENCY)),
             key_admission: std::sync::Mutex::new(HashMap::new()),
             phase: watch::Sender::new(Phase::Serving),
-            upstream: "https://api.anthropic.com".into(),
-            token_endpoint: "https://api.anthropic.com/v1/oauth/token".into(),
+            upstream,
+            token_endpoint,
             client_send_timeout: proxy::CLIENT_SEND_TIMEOUT,
             max_stream_duration: proxy::MAX_STREAM_DURATION,
-        }))
+        })
     }
 
     /// The current lifecycle phase.
-    pub fn phase(&self) -> Phase {
+    pub(crate) fn phase(&self) -> Phase {
         *self.phase.borrow()
+    }
+
+    /// A receiver that observes every lifecycle phase change.
+    pub fn subscribe_phase(&self) -> watch::Receiver<Phase> {
+        self.phase.subscribe()
+    }
+
+    /// Advances the lifecycle phase. Only `main` calls this, on shutdown.
+    pub fn set_phase(&self, phase: Phase) {
+        self.phase.send_replace(phase);
     }
 }
 

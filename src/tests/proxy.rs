@@ -552,11 +552,9 @@ async fn saturated_admission_is_denied_before_upstream() {
 
 #[tokio::test]
 async fn a_client_that_stops_reading_is_interrupted_not_an_upstream_error() {
-    let mut h = Harness::new().await;
-    // The router holds the only other references to the state; rebuild it around the change.
-    h.router = Router::new();
-    Arc::get_mut(&mut h.state).unwrap().client_send_timeout = Duration::from_millis(50);
-    h.router = app(h.state.clone());
+    let h = Harness::new()
+        .await
+        .rebuilt(|state| state.client_send_timeout = Duration::from_millis(50));
     let response = h
         .request("/v1/messages", &h.key, message("hello", true))
         .await;
@@ -808,15 +806,12 @@ async fn invalid_upstream_replies_are_bad_gateways() {
 
 #[tokio::test]
 async fn an_unreachable_upstream_is_a_bad_gateway() {
-    let mut h = Harness::new().await;
+    let h = Harness::new().await;
     let closed = std::net::TcpListener::bind("127.0.0.1:0")
         .unwrap()
         .local_addr()
         .unwrap();
-    // The router holds the only other references to the state; rebuild it around the change.
-    h.router = Router::new();
-    Arc::get_mut(&mut h.state).unwrap().upstream = format!("http://{closed}");
-    h.router = app(h.state.clone());
+    let h = h.rebuilt(|state| state.upstream = format!("http://{closed}"));
     let response = h
         .request("/v1/messages", &h.key, message("hello", false))
         .await;
@@ -934,7 +929,7 @@ fn request_validation_rejects_each_unreviewed_shape() {
     for (body, counting, expected) in cases {
         let error = policy::validate(&body, counting).expect_err(expected);
         assert_eq!(
-            (error.0.as_u16(), error.1, error.2),
+            (error.status().as_u16(), error.error_type(), error.message()),
             (400, "invalid_request_error", expected)
         );
     }
@@ -954,7 +949,7 @@ fn request_validation_rejects_each_unreviewed_shape() {
             false,
         ),
     ] {
-        policy::validate(&body, counting).unwrap_or_else(|e| panic!("{body}: {}", e.2));
+        policy::validate(&body, counting).unwrap_or_else(|e| panic!("{body}: {}", e.message()));
     }
 
     // ToolMap::prepare runs after validation; these reach its own checks directly.
@@ -970,7 +965,7 @@ fn request_validation_rejects_each_unreviewed_shape() {
         ),
     ] {
         let error = policy::ToolMap::prepare(&mut body.clone()).expect_err(expected);
-        assert_eq!((error.0.as_u16(), error.2), (400, expected));
+        assert_eq!((error.status().as_u16(), error.message()), (400, expected));
     }
     let mut body = with("system", json!("be brief"));
     body["tools"] = json!([{"name":"lookup"}]);
