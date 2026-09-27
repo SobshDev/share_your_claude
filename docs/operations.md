@@ -140,7 +140,7 @@ It never falls back to other billing. Sign in, open **Claude connection**, and c
 
 **`/readyz` fails or the container is unhealthy.** `/readyz` runs one SQLite query. If nothing answers at all, the process did not start: check the logs for the first error. Common causes:
 
-- `PUBLIC_ORIGIN must be set`, `ENCRYPTION_KEY must contain 32 bytes encoded as base64`, `invalid admin password hash`, or `admin password must use Argon2id`: fix the environment value. The hash needs single quotes in Dokploy and `.env` so its `$` characters stay literal.
+- `PUBLIC_ORIGIN must be set`, `ENCRYPTION_KEY must contain 32 bytes encoded as base64`, `invalid admin password hash`, `admin password must use Argon2id`, or `TRUSTED_PROXY_HOPS must be a non-negative integer`: fix the environment value. The hash needs single quotes in Dokploy and `.env` so its `$` characters stay literal.
 - A permission or "unable to open database file" error: the files in the volume are not owned by UID 10001. Run the restore step 2 `chown` again.
 - A migration error after a downgrade: the database was migrated by a newer version. Deploy that version again, or restore a backup taken before the upgrade.
 

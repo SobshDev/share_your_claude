@@ -9,6 +9,7 @@ services:
       ADMIN_PASSWORD_HASH: ${ADMIN_PASSWORD_HASH:?Set ADMIN_PASSWORD_HASH to your Argon2id password hash}
       RUST_LOG: ${RUST_LOG:-shared_router=info}
       # Set to 1 behind Dokploy's Traefik so sign-in throttling sees each client's address.
+      # Must be a non-negative integer; any other value stops the router at startup.
       TRUSTED_PROXY_HOPS: ${TRUSTED_PROXY_HOPS:-0}
     volumes:
       - router_data:/data
