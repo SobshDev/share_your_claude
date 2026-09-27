@@ -11,17 +11,19 @@ This release needs operator action: it adds three migrations, a new setting for 
 ### Upgrade steps
 
 1. Back up the database (`bash scripts/backup.sh`, see the [operations runbook](docs/operations.md)).
-2. Behind Dokploy's Traefik, set `TRUSTED_PROXY_HOPS=1` in the Environment settings, so sign-in throttling can tell clients apart.
-3. Redeploy. Migrations `0003` to `0005` run automatically at startup. `0003` signs every dashboard session out once, so sign in again afterwards.
+2. Behind Dokploy's Traefik, set `TRUSTED_PROXY_HOPS=1` in the Environment settings, so sign-in throttling can tell clients apart. The value must be a non-negative integer; anything else stops the router at startup.
+3. Keep `stop_grace_period` at 30 seconds or more if you run your own Compose file; shutdown now takes up to 28 seconds.
+4. Redeploy. Migrations `0003` to `0005` run automatically at startup. `0003` signs every dashboard session out once, so sign in again afterwards.
 
 ### Security
 
 - Sign-in throttling counts failures per client address: five per minute for each address and 30 per minute in total, and a successful sign-in clears the caller's failures. A stranger can no longer lock the owner out by sending wrong passwords. The client address comes from `X-Forwarded-For` when the new `TRUSTED_PROXY_HOPS` setting is set (#1).
-- An upstream 401 no longer disconnects Claude for everyone. The router refreshes the token once, resends token counts, and answers `/v1/messages` with a retryable 503 instead of replaying it. The connection needs reconnecting only when the refresh is rejected or a 403 is an `authentication_error`; other 403s return `permission_error` (#2).
+- An upstream 401 no longer disconnects Claude for everyone. The router refreshes the token once, resends token counts, and answers `/v1/messages` with a retryable 503 instead of replaying it. **Refresh from Claude** in the dashboard also refreshes once and fetches the catalog page again. The connection needs reconnecting only when the refresh is rejected, the refreshed token is refused again, or a 403 is an `authentication_error`; other 403s return `permission_error` (#2).
 - Friend routes authenticate the router key from the headers before reading the request body, so unauthenticated requests cannot make the router buffer and parse up to 32 MiB. Other routes are limited to 64 KiB (#3).
 - Dashboard sessions are bound to the `ADMIN_PASSWORD_HASH` they were issued under, so changing it signs every session out (#6).
 - A stored Claude credential that cannot be decrypted, for example after an `ENCRYPTION_KEY` change, now marks the connection as needing reconnection and logs a fixed message, instead of failing every request with 500 while the dashboard shows it connected (#7).
 - Admission control is per key as well as global: each key may run 3 `/v1/messages` requests at once, all keys together 8, and token counts use a separate pool of 4. Busy responses are `429 rate_limit_error` with `retry-after: 1` (#8).
+- With an HTTPS `PUBLIC_ORIGIN`, every response carries `Strict-Transport-Security: max-age=31536000` (#54).
 - The database, its directory, and backups are created owner-only (files 600, directories 700) (#53). PKCE verifiers, authorization codes, token request bodies, and newly issued key secrets are wiped from memory after use (#46).
 
 ### Fable 5.1 hardening
@@ -33,7 +35,7 @@ This release needs operator action: it adds three migrations, a new setting for 
 ### Added
 
 - `shared-router healthcheck` requests `/readyz` on the configured port, and `shared-router help` (also `-h`, `--help`) prints usage (#57).
-- `TRUSTED_PROXY_HOPS` setting, forwarded by `compose.yaml` (default 0) (#1).
+- `TRUSTED_PROXY_HOPS` setting, forwarded by `compose.yaml` (default 0). With N greater than 0 the client address is the N-th `X-Forwarded-For` entry from the right; an invalid value stops startup (#1).
 - `scripts/restore.sh` replaces the database from a backup after saving the current one (#36).
 - `scripts/backup.sh` accepts `BACKUP_DIR` and `BACKUP_KEEP=N`, checks the copy with `sqlite3` when installed, and always removes its temporary snapshot from the data volume (#37).
 - `compose.local.yaml` publishes the router on `127.0.0.1:8080` for local testing (#40).
@@ -49,8 +51,12 @@ This release needs operator action: it adds three migrations, a new setting for 
 - **Breaking:** `shared-router hash-password` reads only piped input and refuses a terminal, where the password would be echoed. Commands with extra arguments now print usage and exit with status 2 instead of ignoring them (#57).
 - **Breaking:** the Docker image no longer contains `curl`; its health check runs `shared-router healthcheck`. Replace any `docker exec … curl` with `docker exec … shared-router healthcheck` (#68).
 - **Breaking:** migration `0003_admin_session_password.sql` deletes all existing dashboard sessions once (#6).
-- On SIGTERM the router reports `/readyz` as 503, drains open requests for up to 20 seconds, records the rest as `interrupted` with the shutdown time, and closes the database. Rows recovered after a crash keep an empty `finished_at` (#11).
-- Error responses use Anthropic's error types and JSON envelope, including unmatched routes and body-limit rejections (#9).
+- On SIGTERM the router reports `/readyz` as 503 and drains open requests for up to 20 seconds. Open streams then save their usage, are recorded as `interrupted`, and end; after 3 more seconds any request still open is recorded as `interrupted` with the shutdown time, and the database is closed within 5 seconds. Rows recovered after a crash keep an empty `finished_at` (#11).
+- The 30-minute limit on every upstream call is replaced by per-request limits: streams may run for 60 minutes and then end with a `timeout_error` event and an `interrupted` record, non-streaming `/v1/messages` calls time out after 600 seconds, token counts after 60 seconds, and each catalog page after 30 seconds (#12).
+- Dashboard assets are linked as `/assets/…?v=<hash>` and cached for a year; unversioned asset requests get `no-cache`, and pages and API responses stay `no-store` (#54).
+- Error responses use Anthropic's error types and JSON envelope, including unmatched routes and body-limit rejections. Rejected query strings say "Invalid query parameters", other malformed requests "Invalid request", and a non-streaming reply from an unexpected model "Claude answered with a different model than requested". Dashboard and sign-in pages render a small HTML 500 page when they cannot be displayed (#9).
+- Configuration errors name the variable at fault (#26).
+- Logs record a fixed category, the router request id, and the upstream status for each failed gateway request, and only the kind and result code of database errors, never their messages (#13).
 - The OAuth refresh no longer blocks requests whose token is still valid, backs off for 30 seconds after a transient failure, and keeps a rotated token in memory if saving it fails (#45).
 - Key `last_used_at` is written at most once a minute and never fails a request (#48).
 - `anthropic-beta` values are combined across header lines and deduplicated; the caller allowlist is `proxy::CLIENT_BETAS` (#49).
@@ -68,6 +74,7 @@ This release needs operator action: it adds three migrations, a new setting for 
 - Saving **Edit access** keeps grants for disabled models, and the form shows them (#16).
 - Dashboard: a double-click on Revoke no longer revokes a key without confirmation (#15); sign-in shows clear messages for wrong passwords, network, and parse failures (#17); re-renders keep keyboard focus and scroll position (#18); live regions, tables, and grant controls are accessible to screen readers (#19); the connection status refreshes after reauthentication errors (#60); an uncopied API key stays open on Escape and is selected when copying fails (#61).
 - Rebuilds pick up changed migrations (#14).
+- `scripts/bootstrap-secrets.sh` checks for the local image before asking for a password and runs its containers without network access (#41).
 
 ## [0.1.0] - 2026-09-15
 
