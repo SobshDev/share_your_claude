@@ -12,7 +12,7 @@ publish = false
 [dependencies]
 anyhow = "1"
 argon2 = "0.5"
-askama = "0.14"
+askama = "0.16"
 axum = { version = "0.8", features = ["macros"] }
 base64 = "0.22"
 bytes = "1"
