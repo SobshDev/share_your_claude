@@ -7,7 +7,7 @@ Shared Router is a single Rust binary built on Axum, with one SQLite database. I
 | Module | Responsibility |
 |---|---|
 | [`main.rs`](../src/main.rs) | CLI entry point. `serve` (default) loads config, opens the database, and runs the server; on Ctrl-C or SIGTERM it runs the shutdown sequence below. `generate-key`, `hash-password` (piped input only), `backup PATH`, `healthcheck`, and `help` are one-shot commands; stray arguments exit with status 2. |
-| [`lib.rs`](../src/lib.rs) | `AppState` (config, SQLite pool, HTTP client, OAuth state with the login throttle, and the admission semaphores with their limits) and the router: health probes, friend routes, admin routes, the 32 MiB body limit, and security headers on every response. |
+| [`lib.rs`](../src/lib.rs) | `AppState` (config, SQLite pool, HTTP client, OAuth state with the login throttle, and the admission semaphores with their limits) and the router: health probes, friend routes, admin routes, the 32 MiB body limit, and default security headers (`no-store`, `nosniff`, `no-referrer`, the CSP, and `Strict-Transport-Security: max-age=31536000` when `PUBLIC_ORIGIN` is HTTPS), which a handler may override. |
 | [`config.rs`](../src/config.rs) | Reads and validates environment variables at startup, and builds the upstream HTTP client with redirects and automatic retries disabled. |
 | [`db.rs`](../src/db.rs) | Creates the database file (mode 600) and missing parent directories (mode 700), opens SQLite in WAL mode, runs embedded migrations, and performs startup recovery: unfinished requests become `interrupted` with an empty `finished_at`, and expired admin sessions are deleted. Also writes owner-only `backup` copies. |
 | [`auth.rs`](../src/auth.rs) | Router key authentication (`x-api-key` or `Authorization: Bearer`, SHA-256 lookup), owner login with Argon2id and a login throttle, session cookies, the exact-origin check, and CSRF enforcement for admin mutations. |
@@ -16,7 +16,7 @@ Shared Router is a single Rust binary built on Axum, with one SQLite database. I
 | [`oauth.rs`](../src/oauth.rs) | Claude OAuth PKCE login and completion, token encryption with XChaCha20-Poly1305 under `ENCRYPTION_KEY`, serialized access-token refresh, the `needs_reauth` state, and the fixed upstream headers. |
 | [`usage.rs`](../src/usage.rs) | Per-request usage rows: start, allowlisted token checkpoints, final outcome, and a drop guard that records `interrupted` if a handler ends early. |
 | [`analytics.rs`](../src/analytics.rs) | Read-only usage reports for `/admin/api/usage` and `/admin/api/analytics`: filters, grouping, totals, and paginated request history. |
-| [`admin.rs`](../src/admin.rs) | Dashboard pages and static assets, `/readyz`, and the admin JSON API for people, keys, grants, the model catalog, and aliases. |
+| [`admin.rs`](../src/admin.rs) | Dashboard pages and static assets (`ASSET_VERSION` hashes the embedded assets; a request with the current `?v=` is cached for a year, any other gets `no-cache`), `/readyz`, and the admin JSON API for people, keys, grants, the model catalog, and aliases. |
 | [`error.rs`](../src/error.rs) | `AppError`, the Anthropic-style JSON error envelope, and the database error conversion that logs only a fixed message. |
 | [`tests/`](../src/tests/) | Integration tests against temporary SQLite databases and mock upstream servers: a shared harness (`harness.rs`), a mock Anthropic upstream (`mock_upstream.rs`), and one module per area. |
 

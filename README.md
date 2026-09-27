@@ -44,7 +44,7 @@ The router reads these environment variables at startup; `serve` refuses to star
 
 | Variable | Required | Default | Container | Notes |
 |---|---|---|---|---|
-| `PUBLIC_ORIGIN` | Yes | none | none | The exact browser origin, such as `https://router.example.com`: scheme, host, and port, with no path, query, or credentials. HTTPS is required except on `localhost`, `127.0.0.1`, and `[::1]`. Used for the Origin and CSRF checks; HTTPS also marks the session cookie `Secure`. |
+| `PUBLIC_ORIGIN` | Yes | none | none | The exact browser origin, such as `https://router.example.com`: scheme, host, and port, with no path, query, or credentials. HTTPS is required except on `localhost`, `127.0.0.1`, and `[::1]`. Used for the Origin and CSRF checks; HTTPS also marks the session cookie `Secure` and turns on `Strict-Transport-Security`. |
 | `ENCRYPTION_KEY` | Yes | none | none | 32 random bytes, base64-encoded (`shared-router generate-key`). Encrypts the stored Claude tokens; changing it makes them unreadable and requires reconnecting Claude. |
 | `ADMIN_PASSWORD_HASH` | Yes | none | none | Argon2id hash in PHC format (`shared-router hash-password`, password 12 to 1024 bytes). Quote it in `.env` and Dokploy so its `$` characters stay literal. Changing it signs out every dashboard session. |
 | `BIND_ADDRESS` | No | `127.0.0.1:8080` | `0.0.0.0:8080` | IP address and port to listen on; host names are not accepted. `healthcheck` probes the same port. |
@@ -74,6 +74,8 @@ The bootstrap script asks for a password and prints ready-to-paste environment e
 Generate the encryption key once, keep it stable across redeployments, and back it up securely. Replacing it makes saved Claude credentials unreadable. Keep production values out of the repository.
 
 Compose exposes port 8080 only to the container network, with no host-port bindings. Configure the domain in Dokploy's UI; it adds the required routing labels and network automatically. See [Dokploy Compose domains](https://docs.dokploy.com/docs/core/docker-compose/domains). Keep streaming responses unbuffered if you add any custom proxy middleware.
+
+When `PUBLIC_ORIGIN` is HTTPS, every response carries `Strict-Transport-Security: max-age=31536000`, so browsers use only HTTPS for that host for a year after their first visit. Serve the domain over HTTPS before deploying with an HTTPS origin, and keep it that way. Dashboard pages and API responses are never cached (`Cache-Control: no-store`). The pages link the stylesheet and scripts as `/assets/…?v=<hash>`, where the hash covers every embedded asset, so those URLs change with each release that changes an asset and are cached for a year (`public, max-age=31536000, immutable`). Any other asset request, such as a module imported without the version, gets `no-cache` and is revalidated.
 
 The router runs as UID 10001 with a read-only root filesystem and a persistent `router_data` volume at `/data`. Run **one router process/replica per database**: refresh coordination and admission control are process-local, and startup recovers unfinished requests. Preserve this volume across redeployments.
 
