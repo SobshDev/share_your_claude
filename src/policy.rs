@@ -84,6 +84,7 @@ pub(crate) fn validate(body: &Value, counting: bool) -> Result<()> {
                 "input_schema",
                 "cache_control",
                 "strict",
+                "eager_input_streaming",
                 "defer_loading",
                 "allowed_callers",
                 "max_uses",

@@ -59,6 +59,9 @@ pub(crate) const CLIENT_BETAS: &[&str] = &[
     "prompt-caching-2024-07-31",
     "interleaved-thinking-2025-05-14",
     "fine-grained-tool-streaming-2025-05-14",
+    // Sent by the AI SDK (opencode) for models with native structured outputs; it backs
+    // `strict` tools and `output_config.format`, which the policy already accepts.
+    "structured-outputs-2025-11-13",
     // Sent by Claude Code alongside `output_config.effort`.
     "effort-2025-11-24",
     // Sent by Claude Code; lets system-role entries appear inside `messages`, which the
