@@ -50,6 +50,7 @@ This release needs operator action: it adds four migrations, a new setting for d
 
 ### Changed
 
+- The caller's `system` prompt is sent to Claude at the start of the first user message, wrapped in `<system-reminder>`, instead of in `system`, which now holds only the router's identity block. Claude rejected opencode's system prompt with a 400 in `system` over the owner's subscription login, and accepts it in this position, as Claude Code sends it.
 - The dashboard is redesigned: a side rail with Overview, Requests, People & keys, Models, and Claude connection; one shared filter bar for person, model, and period; a daily chart with share and token mix breakdowns; key rows with model chips and a menu for model access, opencodex setup, and revocation; model switches; and a two-step Claude connection. A new key's sheet shows the secret once inside a ready opencodex configuration. The interface is white with an evergreen accent and uses Manrope and IBM Plex Mono when installed, falling back to system fonts.
 - **Breaking:** `shared-router hash-password` reads only piped input and refuses a terminal, where the password would be echoed. Commands with extra arguments now print usage and exit with status 2 instead of ignoring them (#57).
 - **Breaking:** the Docker image no longer contains `curl`; its health check runs `shared-router healthcheck`. Replace any `docker exec … curl` with `docker exec … shared-router healthcheck` (#68).
