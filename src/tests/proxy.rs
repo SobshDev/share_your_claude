@@ -306,6 +306,39 @@ async fn claude_code_betas_are_accepted() {
     );
 }
 
+/// opencode's `@ai-sdk/anthropic` provider marks every tool `eager_input_streaming` and sends
+/// the structured-outputs beta for current Claude models.
+#[tokio::test]
+async fn opencode_tool_requests_are_accepted() {
+    let h = Harness::new().await;
+    let mut body = message("hello", true);
+    body["tools"] = json!([{
+        "name": "bash",
+        "description": "Run a command",
+        "input_schema": {"type": "object", "properties": {"command": {"type": "string"}}},
+        "eager_input_streaming": true
+    }]);
+    body["tool_choice"] = json!({"type": "auto"});
+    let response = h
+        .send(
+            "POST",
+            "/v1/messages",
+            &[
+                ("content-type", "application/json"),
+                ("x-api-key", h.key.as_str()),
+                ("anthropic-beta", "structured-outputs-2025-11-13"),
+            ],
+            body.to_string(),
+        )
+        .await;
+    assert_eq!(response.status(), 200);
+    let captures = h.mock.captures.lock().await;
+    assert_eq!(
+        captures[0].headers.get("anthropic-beta").unwrap(),
+        &format!("{},structured-outputs-2025-11-13", oauth::BETA)
+    );
+}
+
 #[tokio::test]
 async fn unreviewed_betas_are_rejected_before_upstream() {
     let h = Harness::new().await;

@@ -46,6 +46,7 @@ This release needs operator action: it adds four migrations, a new setting for d
 - `CONTRIBUTING.md` and a pull request template (#72).
 - `cargo-about` configuration and a generated list of every bundled crate license (#70).
 - The `effort-2025-11-24` and `mid-conversation-system-2026-04-07` betas are accepted, so Claude Code can use the router directly with `ANTHROPIC_BASE_URL` and `ANTHROPIC_API_KEY`.
+- The `structured-outputs-2025-11-13` beta and the `eager_input_streaming` tool field are accepted, so opencode can use the router through its `@ai-sdk/anthropic` provider.
 
 ### Changed
 
