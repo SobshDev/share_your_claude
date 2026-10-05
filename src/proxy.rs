@@ -59,6 +59,11 @@ pub(crate) const CLIENT_BETAS: &[&str] = &[
     "prompt-caching-2024-07-31",
     "interleaved-thinking-2025-05-14",
     "fine-grained-tool-streaming-2025-05-14",
+    // Sent by Claude Code alongside `output_config.effort`.
+    "effort-2025-11-24",
+    // Sent by Claude Code; lets system-role entries appear inside `messages`, which the
+    // router passes through as data.
+    "mid-conversation-system-2026-04-07",
 ];
 
 type Chunk = std::result::Result<Bytes, io::Error>;
