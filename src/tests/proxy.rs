@@ -275,6 +275,37 @@ async fn reviewed_betas_are_normalized_and_sent_once() {
     );
 }
 
+/// Claude Code (2.1.x) pointed at the router with `ANTHROPIC_BASE_URL` sends these betas on
+/// `/v1/messages?beta=true`, even with `CLAUDE_CODE_DISABLE_EXPERIMENTAL_BETAS=1`.
+#[tokio::test]
+async fn claude_code_betas_are_accepted() {
+    let h = Harness::new().await;
+    let response = h
+        .send(
+            "POST",
+            "/v1/messages?beta=true",
+            &[
+                ("content-type", "application/json"),
+                ("x-api-key", h.key.as_str()),
+                (
+                    "anthropic-beta",
+                    "claude-code-20250219,interleaved-thinking-2025-05-14,mid-conversation-system-2026-04-07,effort-2025-11-24",
+                ),
+            ],
+            message("hello", false).to_string(),
+        )
+        .await;
+    assert_eq!(response.status(), 200);
+    let captures = h.mock.captures.lock().await;
+    assert_eq!(
+        captures[0].headers.get("anthropic-beta").unwrap(),
+        &format!(
+            "{},interleaved-thinking-2025-05-14,mid-conversation-system-2026-04-07,effort-2025-11-24",
+            oauth::BETA
+        )
+    );
+}
+
 #[tokio::test]
 async fn unreviewed_betas_are_rejected_before_upstream() {
     let h = Harness::new().await;

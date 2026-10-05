@@ -45,6 +45,7 @@ This release needs operator action: it adds four migrations, a new setting for d
 - An architecture overview (`docs/architecture.md`), the accepted request surface, a configuration reference, and a command reference in the README (#44, #69).
 - `CONTRIBUTING.md` and a pull request template (#72).
 - `cargo-about` configuration and a generated list of every bundled crate license (#70).
+- The `effort-2025-11-24` and `mid-conversation-system-2026-04-07` betas are accepted, so Claude Code can use the router directly with `ANTHROPIC_BASE_URL` and `ANTHROPIC_API_KEY`.
 
 ### Changed
 
