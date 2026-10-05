@@ -93,10 +93,19 @@ fn error(status: u16, kind: &str, message: &str) -> Response {
         .into_response()
 }
 
-/// The scenario selected by the first user message.
+/// The scenario selected by the first user message: its text, or the text of its last block
+/// when the router has put relocated system reminders in front of it.
 fn scenario(body: &Value) -> &str {
-    body.pointer("/messages/0/content")
+    let content = body.pointer("/messages/0/content");
+    content
         .and_then(Value::as_str)
+        .or_else(|| {
+            content
+                .and_then(Value::as_array)
+                .and_then(|blocks| blocks.last())
+                .and_then(|block| block.get("text"))
+                .and_then(Value::as_str)
+        })
         .unwrap_or("hello")
 }
 

@@ -237,14 +237,14 @@ impl ToolMap {
             .as_object_mut()
             .expect("validated body")
             .remove("system");
-        let mut blocks = vec![json!({"type":"text","text":oauth::SYSTEM})];
-        match system {
-            Some(Value::String(text)) => blocks.push(json!({"type":"text","text":text})),
-            Some(Value::Array(items)) => blocks.extend(items),
-            None => (),
+        let client_system = match system {
+            Some(Value::String(text)) => vec![json!({"type":"text","text":text})],
+            Some(Value::Array(items)) => items,
+            None => Vec::new(),
             _ => return Err(AppError::bad("system must be text or content blocks")),
-        }
-        body["system"] = blocks.into();
+        };
+        body["system"] = json!([{"type":"text","text":oauth::SYSTEM}]);
+        relocate_system(body, client_system);
         Ok(mapping)
     }
     pub(crate) fn restore(&self, value: &mut Value) {
@@ -266,4 +266,54 @@ impl ToolMap {
             }
         }
     }
+}
+
+/// Moves the caller's system blocks to the start of the first user message, each wrapped in
+/// `<system-reminder>` the way Claude Code sends its context. With subscription OAuth, Claude
+/// rejects some long third-party system prompts (opencode's, for example) with a 400, but
+/// accepts the same text in this position. Upstream `system` keeps only [`oauth::SYSTEM`].
+///
+/// Each block keeps its other keys, such as `cache_control`. Empty text blocks are dropped,
+/// since Claude refuses empty text in messages. When the conversation does not start with a
+/// user turn, one is inserted.
+fn relocate_system(body: &mut Value, client_system: Vec<Value>) {
+    let reminders: Vec<Value> = client_system
+        .into_iter()
+        .filter_map(|mut block| {
+            match block.get("text").and_then(Value::as_str) {
+                Some("") => return None,
+                Some(text) if block.get("type").and_then(Value::as_str) == Some("text") => {
+                    block["text"] = format!("<system-reminder>\n{text}\n</system-reminder>").into();
+                }
+                _ => (),
+            }
+            Some(block)
+        })
+        .collect();
+    if reminders.is_empty() {
+        return;
+    }
+    let Some(messages) = body.get_mut("messages").and_then(Value::as_array_mut) else {
+        return;
+    };
+    let first_is_user = messages
+        .first()
+        .and_then(|m| m.get("role"))
+        .and_then(Value::as_str)
+        == Some("user");
+    if !first_is_user {
+        messages.insert(0, json!({"role":"user","content":reminders}));
+        return;
+    }
+    let first = &mut messages[0];
+    let mut content = reminders;
+    match first.get_mut("content").map(Value::take) {
+        Some(Value::String(text)) if !text.is_empty() => {
+            content.push(json!({"type":"text","text":text}));
+        }
+        Some(Value::Array(blocks)) => content.extend(blocks),
+        Some(Value::String(_)) | None => (),
+        Some(other) => content.push(other),
+    }
+    first["content"] = content.into();
 }

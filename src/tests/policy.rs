@@ -81,6 +81,45 @@ fn tool_mapping_preserves_distinct_prefixed_names_and_payloads() {
 }
 
 #[test]
+fn client_system_moves_into_the_first_user_message() {
+    let mut body = message("hello", false);
+    body["system"] = json!([
+        {"type":"text","text":"You are OpenCode.","cache_control":{"type":"ephemeral"}},
+        {"type":"text","text":""}
+    ]);
+    body["messages"] = json!([{"role":"user","content":[{"type":"text","text":"hi","cache_control":{"type":"ephemeral"}}]}]);
+    policy::ToolMap::prepare(&mut body).unwrap();
+    assert_eq!(
+        body["system"],
+        json!([{"type":"text","text":crate::oauth::SYSTEM}])
+    );
+    assert_eq!(
+        body["messages"],
+        json!([{"role":"user","content":[
+            {"type":"text","text":"<system-reminder>\nYou are OpenCode.\n</system-reminder>","cache_control":{"type":"ephemeral"}},
+            {"type":"text","text":"hi","cache_control":{"type":"ephemeral"}}
+        ]}])
+    );
+
+    // A conversation that opens with an assistant turn gets a user turn for the reminder.
+    let mut body = message("hello", false);
+    body["system"] = json!("be brief");
+    body["messages"] =
+        json!([{"role":"assistant","content":"earlier"},{"role":"user","content":"next"}]);
+    policy::ToolMap::prepare(&mut body).unwrap();
+    assert_eq!(
+        body["messages"][0],
+        json!({"role":"user","content":[{"type":"text","text":"<system-reminder>\nbe brief\n</system-reminder>"}]})
+    );
+    assert_eq!(body["messages"].as_array().unwrap().len(), 3);
+
+    // Without client system text, messages are untouched.
+    let mut body = message("hello", false);
+    policy::ToolMap::prepare(&mut body).unwrap();
+    assert_eq!(body["messages"], message("hello", false)["messages"]);
+}
+
+#[test]
 fn builtin_tools_keep_their_names_through_history() {
     let mut body = message("hello", false);
     body["tools"] = json!([{"name":"str_replace_editor","type":"text_editor_20250124"}]);

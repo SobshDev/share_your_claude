@@ -1037,7 +1037,14 @@ fn request_validation_rejects_each_unreviewed_shape() {
     policy::ToolMap::prepare(&mut body).unwrap();
     assert_eq!(body["tool_choice"]["name"], body["tools"][0]["name"]);
     assert_eq!(body["system"][0]["text"], oauth::SYSTEM);
-    assert_eq!(body["system"][1]["text"], "be brief");
+    assert_eq!(body["system"].as_array().unwrap().len(), 1);
+    assert_eq!(
+        body["messages"][0]["content"],
+        json!([
+            {"type":"text","text":"<system-reminder>\nbe brief\n</system-reminder>"},
+            {"type":"text","text":"hello"}
+        ])
+    );
 }
 
 #[tokio::test]
