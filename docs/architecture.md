@@ -7,7 +7,7 @@ Shared Router is a single Rust binary built on Axum, with one SQLite database. I
 | Module | Responsibility |
 |---|---|
 | [`main.rs`](../src/main.rs) | CLI entry point. `serve` (default) loads config, opens the database, and runs the server; on Ctrl-C or SIGTERM it runs the shutdown sequence below. `generate-key`, `hash-password` (piped input only), `backup PATH`, `healthcheck`, and `help` are one-shot commands; stray arguments exit with status 2. |
-| [`lib.rs`](../src/lib.rs) | `AppState` (config, SQLite pool, HTTP client, OAuth state with the login throttle, and the admission semaphores with their limits) and the router: health probes, friend routes, admin routes, the 32 MiB body limit, and default security headers (`no-store`, `nosniff`, `no-referrer`, the CSP, and `Strict-Transport-Security: max-age=31536000` when `PUBLIC_ORIGIN` is HTTPS), which a handler may override. |
+| [`lib.rs`](../src/lib.rs) | `AppState` (config, SQLite pool, HTTP client, and OAuth state with the login throttle) and the router: health probes, friend routes, admin routes, the 32 MiB body limit, and default security headers (`no-store`, `nosniff`, `no-referrer`, the CSP, and `Strict-Transport-Security: max-age=31536000` when `PUBLIC_ORIGIN` is HTTPS), which a handler may override. |
 | [`config.rs`](../src/config.rs) | Reads and validates environment variables at startup, and builds the upstream HTTP client with redirects and automatic retries disabled. |
 | [`db.rs`](../src/db.rs) | Creates the database file (mode 600) and missing parent directories (mode 700), opens SQLite in WAL mode, runs embedded migrations, and performs startup recovery: unfinished requests become `interrupted` with an empty `finished_at`, and expired admin sessions are deleted. Also writes owner-only `backup` copies. |
 | [`auth.rs`](../src/auth.rs) | Router key authentication (`x-api-key` or `Authorization: Bearer`, SHA-256 lookup), owner login with Argon2id and a login throttle, session cookies, the exact-origin check, and CSRF enforcement for admin mutations. |
@@ -30,7 +30,6 @@ sequenceDiagram
     participant A as auth
     participant U as usage (SQLite)
     participant Pol as policy
-    participant S as Admission (3 per key, 8 global)
     participant O as oauth
     participant Up as api.anthropic.com
 
@@ -42,8 +41,6 @@ sequenceDiagram
     P->>Pol: validate(body), resolve(key, model), check anthropic-beta
     Pol-->>P: resolved model id, or 400/403 (row finished as denied)
     P->>Pol: ToolMap::prepare (hash custom tool names, set the identity system block, move caller system into the first user message)
-    P->>S: try_acquire key permit, then global permit (no waiting)
-    S-->>P: permits, or immediate 429 with retry-after: 1 (denied)
     P->>O: access()
     O->>O: lock, decrypt, refresh if expiring within 5 minutes
     O-->>P: access token, or 503 reconnect Claude
@@ -77,7 +74,7 @@ The steps in order:
 2. **Usage row.** `usage::start` records the attempt as `in_progress`. A `RequestGuard` ensures the row reaches a terminal outcome even if the handler is cancelled.
 3. **Policy.** `policy::validate` enforces the request field allowlists (see the README's accepted request surface). `policy::resolve` maps the requested ID or explicit alias to a reviewed, enabled model granted to this unrevoked key. Caller `anthropic-beta` values must all be in `proxy::CLIENT_BETAS` or the router's own `oauth::BETA`. Any failure finishes the row as `denied`.
 4. **Rewrite.** `ToolMap::prepare` renames custom tools and matching `tool_use` blocks to stable hashed `custom_` names and sets `system` to the required identity block, moving the caller's system blocks into the first user message as `<system-reminder>` blocks. Server tools keep their names.
-5. **Admission.** `proxy::acquire` takes the key's permit first (`PER_KEY_CONCURRENCY`, 3 per key) and then a global one (`GLOBAL_CONCURRENCY`, 8 across all keys). Token counts take a permit from their own pool (`COUNT_TOKENS_CONCURRENCY`, 4) instead. The router does not queue: when a pool is full the request is finished as `denied` and gets an immediate `429 rate_limit_error` with `retry-after: 1`, saying "This key has too many requests in progress" for the per-key limit and "The router is busy" otherwise. A streaming response holds its permits until the stream ends.
+5. **No admission limits.** The router does not cap concurrent requests per key or in total, and sets no token or request quotas. Every request is recorded in `request_usage` for reporting; Claude enforces the subscription limits, and its 429s are passed through.
 6. **Credential.** `oauth::access` decrypts the stored tokens. A token that expires more than 5 minutes from now is used without locking; otherwise one caller at a time refreshes it under the refresh lock, and a generation counter guards the write. A refresh rejected with 400, 401, or 403 marks the credential `needs_reauth`, and requests get `503` until the owner reconnects. A transient refresh failure starts a 30-second backoff, during which the current token is used while it is still valid. A credential that cannot be decrypted is also marked `needs_reauth`.
 7. **Upstream call.** The router sends one POST with the owner's token and fixed client headers. Incoming credentials are never forwarded. The HTTP client has retries and redirects disabled, and no code path replays a `/v1/messages` request, including after 429s, network errors, timeouts, or a 401. The client itself allows 15 seconds to connect and 120 seconds between reads, with no total timeout; each call sets its own limit instead. A non-streaming `/v1/messages` call times out after 600 seconds (`proxy::MESSAGE_TIMEOUT`, matching the `x-stainless-timeout` header sent upstream) and a token count after 60 seconds (`COUNT_TOKENS_TIMEOUT`); a timeout returns `502 api_error`. A stream may run for 60 minutes (`MAX_STREAM_DURATION`); a longer one ends with a `timeout_error` event and is recorded as `interrupted`. Catalog pages fetched by the dashboard time out after 30 seconds each (`admin::CATALOG_REQUEST_TIMEOUT`).
 8. **Upstream 401.** `oauth::force_refresh` refreshes the token once; if another request has already replaced that token generation, it reuses the newer token instead. A token count is sent again with the new token. A `/v1/messages` request is finished as `upstream_error` and its client gets a retryable `503 api_error` ("The router renewed its Claude session. Retry the request"). Only a rejected refresh, or a second 401 for the resent token count, marks the credential `needs_reauth`.
@@ -88,7 +85,7 @@ The steps in order:
 
 ## Process-local coordination
 
-Three pieces of state live in the process: the OAuth mutex that serializes login and refresh, the admission semaphores, and the login throttle (five failed sign-ins per client address and 30 in total per minute). The client address is the socket peer, or, when `TRUSTED_PROXY_HOPS` is N greater than 0, the N-th `X-Forwarded-For` entry from the right; `Config` reads the setting at startup and refuses to start when it is not a non-negative integer. Pending OAuth logins live there too. Startup recovery also assumes that no other process is writing `in_progress` rows. A second replica on the same database would double the admission limit, race refresh-token rotation, and mark the other replica's live requests as interrupted when it starts. Run exactly one router process per database.
+Two pieces of state live in the process: the OAuth mutex that serializes login and refresh, and the login throttle (five failed sign-ins per client address and 30 in total per minute). The client address is the socket peer, or, when `TRUSTED_PROXY_HOPS` is N greater than 0, the N-th `X-Forwarded-For` entry from the right; `Config` reads the setting at startup and refuses to start when it is not a non-negative integer. Pending OAuth logins live there too. Startup recovery also assumes that no other process is writing `in_progress` rows. A second replica on the same database would race refresh-token rotation, and mark the other replica's live requests as interrupted when it starts. Run exactly one router process per database.
 
 ## Shutdown
 

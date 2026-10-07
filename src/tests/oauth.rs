@@ -314,7 +314,7 @@ async fn transient_refresh_failure_stays_connected_and_backs_off() {
     let h = Harness::new().await;
     let (mock, state, router) = with_token_mock(&h, Reply::Unavailable).await;
     expire_at(&h, 0).await;
-    // Three concurrent requests: the per-key admission limit allows three at a time.
+    // Three concurrent requests on one key.
     let (a, b, c) = tokio::join!(
         ask(&router, &h.key),
         ask(&router, &h.key),
