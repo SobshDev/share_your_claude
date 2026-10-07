@@ -510,7 +510,7 @@ async fn malformed_bodies_and_content_types_are_invalid_requests() {
     assert_eq!(h.mock.requests.load(Ordering::SeqCst), 1);
 }
 
-/// Opens a `disconnect` stream on `key`; it holds its admission permits until the body drops.
+/// Opens a `disconnect` stream on `key` and keeps it open until the body drops.
 async fn hold_stream(h: &Harness, key: &str) -> Body {
     let response = h
         .request("/v1/messages", key, message("disconnect", true))
@@ -519,99 +519,33 @@ async fn hold_stream(h: &Harness, key: &str) -> Body {
     response.into_body()
 }
 
-/// Message when every global admission permit is taken.
-const ROUTER_BUSY: &str = "The router is busy";
-/// Message when one key has used all of its own admission permits.
-const KEY_BUSY: &str = "This key has too many requests in progress";
-
-async fn assert_busy(response: Response, message: &str) {
-    assert_eq!(response.headers()["retry-after"], "1");
-    assert_error(response, 429, "rate_limit_error", message).await;
-}
-
 fn count_body() -> Value {
     json!({"model":MODEL,"messages":[{"role":"user","content":"hello"}]})
 }
 
 #[tokio::test]
-async fn one_key_cannot_take_every_admission_permit() {
+async fn one_key_may_run_any_number_of_requests_at_once() {
     let h = Harness::new().await;
-    let sam = add_person(&h.state, "Sam").await;
-    let (_, other) = add_key(&h.state, &sam, "Desktop").await;
     let mut held = Vec::new();
-    for _ in 0..PER_KEY_CONCURRENCY {
+    for _ in 0..12 {
         held.push(hold_stream(&h, &h.key).await);
     }
-    assert_busy(
-        h.request("/v1/messages", &h.key, message("hello", false))
-            .await,
-        KEY_BUSY,
-    )
-    .await;
-    let counted = h
-        .request("/v1/messages/count_tokens", &h.key, count_body())
-        .await;
-    assert_eq!(counted.status(), 200);
-    let response = h
-        .request("/v1/messages", &other, message("hello", false))
-        .await;
-    assert_eq!(response.status(), 200);
-    drop(held);
-    // The stream tasks release their permits once they notice the disconnects.
-    tokio::time::timeout(Duration::from_secs(3), async {
-        while h.state.admission.available_permits() < GLOBAL_CONCURRENCY {
-            tokio::time::sleep(Duration::from_millis(10)).await;
-        }
-    })
-    .await
-    .unwrap();
     let response = h
         .request("/v1/messages", &h.key, message("hello", false))
         .await;
     assert_eq!(response.status(), 200);
-}
-
-#[tokio::test]
-async fn saturated_admission_is_denied_before_upstream() {
-    let h = Harness::new().await;
-    let messages = h
-        .state
-        .admission
-        .clone()
-        .try_acquire_many_owned(u32::try_from(GLOBAL_CONCURRENCY).unwrap())
-        .unwrap();
-    let counts = h
-        .state
-        .count_admission
-        .clone()
-        .try_acquire_many_owned(u32::try_from(COUNT_TOKENS_CONCURRENCY).unwrap())
-        .unwrap();
-    assert_busy(
-        h.request("/v1/messages", &h.key, message("hello", true))
-            .await,
-        ROUTER_BUSY,
-    )
-    .await;
-    assert_busy(
-        h.request("/v1/messages/count_tokens", &h.key, count_body())
-            .await,
-        ROUTER_BUSY,
-    )
-    .await;
-    drop((messages, counts));
-    let rows: Vec<(String, String, i64)> =
-        sqlx::query_as("SELECT endpoint,outcome,http_status FROM request_usage ORDER BY endpoint")
-            .fetch_all(&h.state.db)
+    let counted = h
+        .request("/v1/messages/count_tokens", &h.key, count_body())
+        .await;
+    assert_eq!(counted.status(), 200);
+    assert_eq!(h.mock.requests.load(Ordering::SeqCst), 14);
+    let denied: i64 =
+        sqlx::query_scalar("SELECT COUNT(*) FROM request_usage WHERE outcome='denied'")
+            .fetch_one(&h.state.db)
             .await
             .unwrap();
-    assert_eq!(
-        rows,
-        [
-            ("/v1/messages".into(), "denied".into(), 429),
-            ("/v1/messages/count_tokens".into(), "denied".into(), 429),
-        ]
-    );
-    assert_eq!(h.mock.requests.load(Ordering::SeqCst), 0);
+    assert_eq!(denied, 0);
+    drop(held);
 }
 
 #[tokio::test]

@@ -1,5 +1,5 @@
 use crate::{
-    AppState, PER_KEY_CONCURRENCY, auth,
+    AppState, auth,
     error::{self, AppError, ErrorKind, Result},
     oauth,
     policy::{self, ToolMap},
@@ -18,7 +18,7 @@ use futures_util::StreamExt;
 use serde_json::{Value, json};
 use sqlx::Row;
 use std::{io, sync::Arc, time::Duration};
-use tokio::sync::{OwnedSemaphorePermit, Semaphore, mpsc};
+use tokio::sync::mpsc;
 use tokio_stream::wrappers::ReceiverStream;
 
 /// Largest request body a friend may send to the two POST routes.
@@ -47,8 +47,6 @@ pub(crate) const COUNT_TOKENS_TIMEOUT: Duration = Duration::from_secs(60);
 pub(crate) const MAX_STREAM_DURATION: Duration = Duration::from_secs(60 * 60);
 /// How long the router tries to deliver the sanitized error event that ends a failed stream.
 const STREAM_ERROR_SEND_TIMEOUT: Duration = Duration::from_secs(5);
-/// Seconds a client should wait before retrying when admission is saturated.
-const BUSY_RETRY_AFTER_SECONDS: &str = "1";
 /// Error message when Claude serves a model other than the one the router resolved.
 const MODEL_MISMATCH: &str = "Claude answered with a different model than requested";
 /// Error message when upstream ends a stream with an `error` event.
@@ -217,11 +215,6 @@ struct Admitted {
     betas: Option<HeaderValue>,
 }
 
-/// Admission permits held until the upstream request, including any stream, ends.
-struct Permits {
-    _held: Vec<OwnedSemaphorePermit>,
-}
-
 /// Records the request's terminal outcome, then returns `error` to the client.
 async fn fail<T>(
     guard: &mut RequestGuard,
@@ -261,18 +254,6 @@ async fn forward(
         Ok(v) => v,
         Err(e) => return fail(&mut guard, "denied", e.status().as_u16(), true, e).await,
     };
-    let permits = match acquire(&state, &key, counting) {
-        Ok(v) => v,
-        Err(busy) => {
-            guard.finish("denied", Some(429), true).await?;
-            let mut response = busy.into_response();
-            response.headers_mut().insert(
-                header::RETRY_AFTER,
-                HeaderValue::from_static(BUSY_RETRY_AFTER_SECONDS),
-            );
-            return Ok(response);
-        }
-    };
     let mut access = match oauth::access(&state).await {
         Ok(v) => v,
         Err(e) => {
@@ -302,7 +283,7 @@ async fn forward(
         return handle_error_status(&state, &access, response, &mut guard).await;
     }
     if streaming {
-        return open_stream(state, id, response, admitted, permits, guard).await;
+        return open_stream(state, id, response, admitted, guard).await;
     }
     finish_json(&state, &id, response, admitted, counting, &mut guard).await
 }
@@ -332,49 +313,6 @@ async fn admit(
         model,
         mapping,
         betas,
-    })
-}
-
-/// Takes admission permits without waiting. `/v1/messages` takes the key's permit first and
-/// then a global one; token counts use their own pool.
-fn acquire(state: &AppState, key: &str, counting: bool) -> Result<Permits> {
-    let busy = |_| {
-        AppError::new(
-            ErrorKind::Request,
-            StatusCode::TOO_MANY_REQUESTS,
-            "rate_limit_error",
-            "The router is busy. Try again shortly",
-        )
-    };
-    if counting {
-        let permit = state.count_admission.clone().try_acquire_owned();
-        return Ok(Permits {
-            _held: vec![permit.map_err(busy)?],
-        });
-    }
-    let key_permit = {
-        let mut keys = state
-            .key_admission
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner);
-        // Acquired under the lock so pruning cannot drop a semaphore that is about to be used.
-        keys.retain(|_, semaphore| semaphore.available_permits() < PER_KEY_CONCURRENCY);
-        keys.entry(key.to_owned())
-            .or_insert_with(|| Arc::new(Semaphore::new(PER_KEY_CONCURRENCY)))
-            .clone()
-            .try_acquire_owned()
-            .map_err(|_| {
-                AppError::new(
-                    ErrorKind::Request,
-                    StatusCode::TOO_MANY_REQUESTS,
-                    "rate_limit_error",
-                    "This key has too many requests in progress. Try again shortly",
-                )
-            })?
-    };
-    let global = state.admission.clone().try_acquire_owned().map_err(busy)?;
-    Ok(Permits {
-        _held: vec![key_permit, global],
     })
 }
 
@@ -547,14 +485,13 @@ async fn handle_error_status(
     Ok(result)
 }
 
-/// Starts relaying an upstream event stream. A spawned task holds the admission permits until
-/// the stream ends, so the response is returned as soon as upstream headers arrive.
+/// Starts relaying an upstream event stream in a spawned task, so the response is returned as
+/// soon as upstream headers arrive.
 async fn open_stream(
     state: Arc<AppState>,
     id: String,
     response: reqwest::Response,
     admitted: Admitted,
-    permits: Permits,
     mut guard: RequestGuard,
 ) -> Result<Response> {
     if !response
@@ -576,7 +513,6 @@ async fn open_stream(
     }
     let (tx, rx) = mpsc::channel::<Chunk>(STREAM_CHANNEL_CAPACITY);
     tokio::spawn(async move {
-        let _permits = permits;
         let Admitted { model, mapping, .. } = admitted;
         let result = stream_response(&state, &id, &model, response, mapping, &tx, &mut guard).await;
         let (kind, outcome, status, category) = match result {

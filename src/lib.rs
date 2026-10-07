@@ -17,8 +17,8 @@ use axum::{
     response::Response,
     routing::{get, post},
 };
-use std::{collections::HashMap, sync::Arc};
-use tokio::sync::{Mutex, Semaphore, watch};
+use std::sync::Arc;
+use tokio::sync::{Mutex, watch};
 
 /// Body limit for routes that do not declare their own.
 const DEFAULT_BODY_LIMIT_BYTES: usize = 64 * 1024;
@@ -26,13 +26,6 @@ const DEFAULT_BODY_LIMIT_BYTES: usize = 64 * 1024;
 const UPSTREAM: &str = "https://api.anthropic.com";
 /// Anthropic OAuth token endpoint used for code exchange and refresh.
 const TOKEN_ENDPOINT: &str = "https://api.anthropic.com/v1/oauth/token";
-/// `/v1/messages` requests the router sends upstream at once, across all keys.
-pub(crate) const GLOBAL_CONCURRENCY: usize = 8;
-/// `/v1/messages` requests one key may have in flight, so one friend cannot hold every
-/// global permit.
-pub(crate) const PER_KEY_CONCURRENCY: usize = 3;
-/// Token counts use their own small pool so they never wait behind long streams.
-pub(crate) const COUNT_TOKENS_CONCURRENCY: usize = 4;
 
 /// Where the server is in its lifecycle. `main` advances it on a shutdown signal.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -50,10 +43,6 @@ pub struct AppState {
     pub(crate) db: sqlx::SqlitePool,
     pub(crate) client: reqwest::Client,
     pub(crate) oauth: Mutex<oauth::OAuthState>,
-    pub(crate) admission: Arc<Semaphore>,
-    pub(crate) count_admission: Arc<Semaphore>,
-    /// Per-key admission, keyed by key id. Idle entries are pruned on use.
-    pub(crate) key_admission: std::sync::Mutex<HashMap<String, Arc<Semaphore>>>,
     /// Lifecycle phase. Subscribe to wait for a change; `main` sends the transitions.
     pub(crate) phase: watch::Sender<Phase>,
     // Only tests inside this crate can replace destinations. No environment/config overrides.
@@ -84,9 +73,6 @@ impl AppState {
             config,
             db,
             client: config::http_client()?,
-            admission: Arc::new(Semaphore::new(GLOBAL_CONCURRENCY)),
-            count_admission: Arc::new(Semaphore::new(COUNT_TOKENS_CONCURRENCY)),
-            key_admission: std::sync::Mutex::new(HashMap::new()),
             phase: watch::Sender::new(Phase::Serving),
             upstream,
             token_endpoint,

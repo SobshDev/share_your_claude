@@ -23,7 +23,6 @@ This release needs operator action: it adds four migrations, a new setting for d
 - Friend routes authenticate the router key from the headers before reading the request body, so unauthenticated requests cannot make the router buffer and parse up to 32 MiB. Other routes are limited to 64 KiB (#3).
 - Dashboard sessions are bound to the `ADMIN_PASSWORD_HASH` they were issued under, so changing it signs every session out (#6).
 - A stored Claude credential that cannot be decrypted, for example after an `ENCRYPTION_KEY` change, now marks the connection as needing reconnection and logs a fixed message, instead of failing every request with 500 while the dashboard shows it connected (#7).
-- Admission control is per key as well as global: each key may run 3 `/v1/messages` requests at once, all keys together 8, and token counts use a separate pool of 4. Busy responses are `429 rate_limit_error` with `retry-after: 1` (#8).
 - With an HTTPS `PUBLIC_ORIGIN`, every response carries `Strict-Transport-Security: max-age=31536000` (#54).
 - The database, its directory, and backups are created owner-only (files 600, directories 700) (#53). PKCE verifiers, authorization codes, token request bodies, and newly issued key secrets are wiped from memory after use (#46).
 
